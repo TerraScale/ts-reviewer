@@ -1,3 +1,5 @@
 .env
 review-state.db
 /tmp/
+
+bin/
