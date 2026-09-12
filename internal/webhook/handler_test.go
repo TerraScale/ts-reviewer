@@ -8,3 +8,12 @@ func TestValidSignature(t *testing.T) {
 		t.Fatal("accepted invalid signature")
 	}
 }
+
+func TestParseCommand(t *testing.T) {
+	if got := parseCommand("please @terrascale-bot recheck", "terrascale-bot"); got != "recheck" {
+		t.Fatalf("command = %q", got)
+	}
+	if got := parseCommand("@other-bot review", "terrascale-bot"); got != "" {
+		t.Fatalf("unexpected command %q", got)
+	}
+}

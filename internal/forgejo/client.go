@@ -115,6 +115,10 @@ func (c *Client) Comments(ctx context.Context, owner, name string, n int) ([]Com
 func (c *Client) Comment(ctx context.Context, owner, name string, n int, body string) error {
 	return c.do(ctx, "POST", repo(owner, name)+"/issues/"+strconv.Itoa(n)+"/comments", map[string]string{"body": body}, nil)
 }
+
+func (c *Client) UpdateComment(ctx context.Context, id int64, body string) error {
+	return c.do(ctx, "PATCH", "/api/v1/repos/issues/comments/"+strconv.FormatInt(id, 10), map[string]string{"body": body}, nil)
+}
 func (c *Client) Review(ctx context.Context, owner, name string, n int, r Review) error {
 	return c.do(ctx, "POST", repo(owner, name)+"/pulls/"+strconv.Itoa(n)+"/reviews", r, nil)
 }

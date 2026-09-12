@@ -31,6 +31,9 @@ type event struct {
 	PullRequest struct {
 		Number int `json:"number"`
 	} `json:"pull_request"`
+	Comment struct {
+		Body string `json:"body"`
+	} `json:"comment"`
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -76,8 +79,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "opened", "synchronize", "reopened":
 		go h.review(e.Repository.Owner.Login, e.Repository.Name, n)
 	case "created":
-		if strings.Contains(strings.ToLower(string(body)), "@"+strings.ToLower(h.BotLogin)) {
-			go h.command(e.Repository.Owner.Login, e.Repository.Name, n)
+		if command := parseCommand(e.Comment.Body, h.BotLogin); command != "" {
+			go h.command(e.Repository.Owner.Login, e.Repository.Name, n, command)
 		}
 	}
 	w.WriteHeader(http.StatusAccepted)
@@ -122,7 +125,21 @@ func (h *Handler) review(owner, name string, n int) {
 		}
 	}
 	body := format(pr, result)
-	_ = h.Forgejo.Comment(ctx, owner, name, n, body)
+	existingComments, commentErr := h.Forgejo.Comments(ctx, owner, name, n)
+	updated := false
+	if commentErr == nil {
+		for _, existing := range existingComments {
+			if strings.EqualFold(existing.User.Login, h.BotLogin) && strings.HasPrefix(existing.Body, "<!-- ts-reviewer:") {
+				if h.Forgejo.UpdateComment(ctx, existing.ID, body) == nil {
+					updated = true
+				}
+				break
+			}
+		}
+	}
+	if !updated {
+		_ = h.Forgejo.Comment(ctx, owner, name, n, body)
+	}
 	event := "APPROVE"
 	state := "success"
 	desc := "No critical or high findings"
@@ -142,8 +159,28 @@ func (h *Handler) review(owner, name string, n int) {
 	}
 	_ = h.Forgejo.Status(ctx, owner, name, pr.Head.SHA, forgejo.Status{State: state, Context: "ts-reviewer", Description: desc})
 }
-func (h *Handler) command(owner, name string, n int) { /* comments are intentionally re-run against the newest PR head */
-	h.review(owner, name, n)
+func (h *Handler) command(owner, name string, n int, command string) {
+	switch command {
+	case "review", "recheck":
+		h.review(owner, name, n)
+	case "explain":
+		_ = h.Forgejo.Comment(context.Background(), owner, name, n, "ts-reviewer: the latest evidence and suggested fix are in the marked review comment. Use `@"+h.BotLogin+" recheck` after pushing a correction.")
+	case "dismiss":
+		_ = h.Forgejo.Comment(context.Background(), owner, name, n, "ts-reviewer: dismissals require a maintainer workflow and are not accepted from an unverified comment.")
+	}
+}
+func parseCommand(body, bot string) string {
+	words := strings.Fields(strings.ToLower(body))
+	mention := "@" + strings.ToLower(bot)
+	for i, word := range words {
+		if word == mention && i+1 < len(words) {
+			switch words[i+1] {
+			case "review", "recheck", "explain", "dismiss":
+				return words[i+1]
+			}
+		}
+	}
+	return ""
 }
 func (h *Handler) fileIssue(ctx context.Context, f review.Finding) {
 	parts := strings.SplitN(f.OwningRepository, "/", 2)
