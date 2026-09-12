@@ -1,0 +1,23 @@
+name: ts-reviewer CI
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+jobs:
+  checks:
+    runs-on: terrascale-builder
+    timeout-minutes: 20
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          github-server-url: "https://git.terrascale.tech"
+          ref: ${{ forgejo.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - run: go test ./...
+      - run: go vet ./...
+      - run: podman build --pull=missing --tag git.terrascale.tech/terrascale/ts-reviewer:${{ forgejo.sha }} -f Containerfile .
+      - run: |
+          test "$FORGEJO_EVENT_NAME" = "pull_request" || test "$FORGEJO_REF" = "refs/heads/main"
+          podman image inspect git.terrascale.tech/terrascale/ts-reviewer:${{ forgejo.sha }}
