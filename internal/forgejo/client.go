@@ -50,14 +50,21 @@ type ReviewComment struct {
 	Side string `json:"side"`
 }
 type Review struct {
-	Body, Event string
-	Comments    []ReviewComment
+	Body     string          `json:"body"`
+	Event    string          `json:"event"`
+	Comments []ReviewComment `json:"comments,omitempty"`
 }
 type Issue struct {
-	Number      int `json:"number"`
-	Title, Body string
+	Number int    `json:"number"`
+	Title  string `json:"title"`
+	Body   string `json:"body"`
 }
-type Status struct{ State, TargetURL, Description, Context string }
+type Status struct {
+	State       string `json:"state"`
+	TargetURL   string `json:"target_url,omitempty"`
+	Description string `json:"description"`
+	Context     string `json:"context"`
+}
 
 func New(base, token string) *Client {
 	return &Client{base: strings.TrimRight(base, "/"), token: token, http: http.DefaultClient}
