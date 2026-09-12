@@ -20,6 +20,7 @@ type Handler struct {
 	Engine                                *review.Engine
 	Organization, BotLogin, WebhookSecret string
 	ReviewTimeout                         time.Duration
+	Slots                                 chan struct{}
 }
 type event struct {
 	Action     string `json:"action"`
@@ -96,6 +97,10 @@ func validSignature(body []byte, signature, secret string) bool {
 	return hmac.Equal(got, mac.Sum(nil))
 }
 func (h *Handler) review(owner, name string, n int) {
+	if h.Slots != nil {
+		h.Slots <- struct{}{}
+		defer func() { <-h.Slots }()
+	}
 	timeout := h.ReviewTimeout
 	if timeout <= 0 {
 		timeout = 10 * time.Minute
@@ -113,6 +118,10 @@ func (h *Handler) review(owner, name string, n int) {
 	result, err := h.Engine.Run(ctx, pr, files)
 	if err != nil {
 		_ = h.Forgejo.Status(ctx, owner, name, pr.Head.SHA, forgejo.Status{State: "error", Context: "ts-reviewer", Description: "review incomplete: " + err.Error()})
+		return
+	}
+	latest, err := h.Forgejo.Pull(ctx, owner, name, n)
+	if err != nil || !strings.EqualFold(latest.Head.SHA, pr.Head.SHA) {
 		return
 	}
 	critical := false

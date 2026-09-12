@@ -27,6 +27,7 @@ func main() {
 	f := forgejo.New(c.ForgejoURL, c.ForgejoToken)
 	e := &review.Engine{URL: c.ProxyURL, Token: c.ProxyToken, Model: c.Model, HTTP: http.DefaultClient, MaxConcurrent: c.MaxConcurrent, MaxDiffBytes: c.MaxDiffBytes}
 	h := &webhook.Handler{Forgejo: f, Engine: e, Organization: c.Organization, BotLogin: c.BotLogin, WebhookSecret: os.Getenv("TS_REVIEWER_WEBHOOK_SECRET"), ReviewTimeout: c.ReviewTimeout}
+	h.Slots = make(chan struct{}, c.MaxConcurrent)
 	mux := http.NewServeMux()
 	mux.Handle("POST /webhook", h)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
