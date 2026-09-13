@@ -173,8 +173,19 @@ internal sealed class ContextStore
     private void Initialize(SqliteConnection connection)
     {
         using var command = connection.CreateCommand();
-            command.CommandText = $"PRAGMA journal_mode = WAL; CREATE TABLE IF NOT EXISTS commits(repository TEXT NOT NULL, commit_sha TEXT NOT NULL, indexed_at TEXT NOT NULL, status TEXT NOT NULL, chunk_count INTEGER NOT NULL, PRIMARY KEY(repository, commit_sha)); CREATE TABLE IF NOT EXISTS chunks(id INTEGER PRIMARY KEY, repository TEXT NOT NULL, commit_sha TEXT NOT NULL, path TEXT NOT NULL, start_line INTEGER NOT NULL, end_line INTEGER NOT NULL, symbol TEXT NOT NULL, content TEXT NOT NULL); CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(chunk_id UNINDEXED, content, path, symbol); CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vectors USING vec0(chunk_id INTEGER PRIMARY KEY, embedding FLOAT[{_options.ContextEmbeddingDimensions}] distance_metric=cosine);";
+        command.CommandText = $"PRAGMA journal_mode = WAL; CREATE TABLE IF NOT EXISTS context_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS commits(repository TEXT NOT NULL, commit_sha TEXT NOT NULL, indexed_at TEXT NOT NULL, status TEXT NOT NULL, chunk_count INTEGER NOT NULL, PRIMARY KEY(repository, commit_sha)); CREATE TABLE IF NOT EXISTS chunks(id INTEGER PRIMARY KEY, repository TEXT NOT NULL, commit_sha TEXT NOT NULL, path TEXT NOT NULL, start_line INTEGER NOT NULL, end_line INTEGER NOT NULL, symbol TEXT NOT NULL, content TEXT NOT NULL); CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(chunk_id UNINDEXED, content, path, symbol); CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vectors USING vec0(chunk_id INTEGER PRIMARY KEY, embedding FLOAT[{_options.ContextEmbeddingDimensions}] distance_metric=cosine);";
         command.ExecuteNonQuery();
+        using var metadata = connection.CreateCommand();
+        metadata.CommandText = "SELECT value FROM context_meta WHERE key = 'embedding_dimensions'";
+        var existing = metadata.ExecuteScalar()?.ToString();
+        if (existing is not null && !string.Equals(existing, _options.ContextEmbeddingDimensions.ToString(), StringComparison.Ordinal))
+            throw new InvalidOperationException($"context database uses {existing}-dimension vectors; configure the same embedding dimensions or delete the database");
+        if (existing is null)
+        {
+            metadata.CommandText = "INSERT INTO context_meta(key, value) VALUES ('embedding_dimensions', $dimensions)";
+            metadata.Parameters.AddWithValue("$dimensions", _options.ContextEmbeddingDimensions);
+            metadata.ExecuteNonQuery();
+        }
     }
 
     private static ContextHit ReadHit(SqliteDataReader reader, string repository, string commit, double score) =>

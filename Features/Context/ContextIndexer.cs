@@ -12,7 +12,7 @@ public sealed class ContextIndexer : BackgroundService
     private readonly ContextEmbeddingClient _embeddings;
     private readonly ReviewerOptions _options;
     private readonly ILogger<ContextIndexer> _logger;
-    private readonly Channel<IndexRequest> _queue = Channel.CreateBounded<IndexRequest>(new BoundedChannelOptions(128) { FullMode = BoundedChannelFullMode.Wait, SingleReader = true });
+    private readonly Channel<IndexRequest> _queue = Channel.CreateUnbounded<IndexRequest>(new UnboundedChannelOptions { SingleReader = true, AllowSynchronousContinuations = false });
     private readonly ConcurrentDictionary<string, TaskCompletionSource<bool>> _pending = new(StringComparer.OrdinalIgnoreCase);
 
     internal ContextIndexer(ForgejoClient forgejo, ContextStore store, ContextEmbeddingClient embeddings, ReviewerOptions options, ILogger<ContextIndexer> logger) =>
@@ -70,26 +70,27 @@ public sealed class ContextIndexer : BackgroundService
         var repository = request.Owner + "/" + request.Name;
         var tree = await _forgejo.TreeAsync(request.Owner, request.Name, request.Commit, ct);
         var files = tree.Where(x => x.Type == "blob" && x.Size is > 0 and <= 1_000_000 && IsSourceFile(x.Path)).Take(_options.ContextMaxFiles).ToList();
-        var chunks = new List<CodeChunk>();
-        foreach (var file in files)
+        var chunks = new ConcurrentBag<CodeChunk>();
+        await Parallel.ForEachAsync(files, new ParallelOptions { MaxDegreeOfParallelism = Math.Min(_options.MaxConcurrent, 16), CancellationToken = ct }, async (file, token) =>
         {
-            var content = await _forgejo.FileAsync(request.Owner, request.Name, request.Commit, file.Path, ct);
-            chunks.AddRange(CodeChunker.Split(file.Path, content));
-        }
-        if (chunks.Count == 0)
+            var content = await _forgejo.FileAsync(request.Owner, request.Name, request.Commit, file.Path, token);
+            foreach (var chunk in CodeChunker.Split(file.Path, content)) chunks.Add(chunk);
+        });
+        var orderedChunks = chunks.OrderBy(x => x.Path, StringComparer.Ordinal).ThenBy(x => x.StartLine).ToList();
+        if (orderedChunks.Count == 0)
         {
             await _store.ReplaceCommitAsync(repository, request.Commit, [], ct);
             return;
         }
         var all = new List<(CodeChunk Chunk, float[] Vector)>();
-        foreach (var batch in chunks.Chunk(64))
+        foreach (var batch in orderedChunks.Chunk(64))
         {
             var inputs = batch.Select(x => $"Repository: {repository}\nPath: {x.Path}\nSymbol: {x.Symbol}\nLines: {x.StartLine}-{x.EndLine}\n{x.Content}").ToArray();
             var vectors = await _embeddings.EmbedAsync(inputs, ct);
             all.AddRange(batch.Zip(vectors, (chunk, vector) => (chunk, vector)));
         }
         await _store.ReplaceCommitAsync(repository, request.Commit, all, ct);
-        _logger.LogInformation("indexed {Repository}@{Commit}: {Files} files, {Chunks} chunks", repository, request.Commit, files.Count, chunks.Count);
+        _logger.LogInformation("indexed {Repository}@{Commit}: {Files} files, {Chunks} chunks", repository, request.Commit, files.Count, orderedChunks.Count);
     }
 
     private void Complete(string key, bool result, Exception? error = null)
