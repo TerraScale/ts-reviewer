@@ -27,7 +27,17 @@ type PullRequest struct {
 		} `json:"repo"`
 		SHA string `json:"sha"`
 	} `json:"base"`
-	Head struct{ SHA, Ref string } `json:"head"`
+	Head PRBranch `json:"head"`
+}
+type PRBranch struct {
+	SHA  string `json:"sha"`
+	Ref  string `json:"ref"`
+	Repo struct {
+		Owner struct {
+			Login string `json:"login"`
+		} `json:"owner"`
+		Name string `json:"name"`
+	} `json:"repo"`
 }
 type File struct {
 	Filename  string `json:"filename"`
@@ -44,14 +54,16 @@ type Comment struct {
 	} `json:"user"`
 }
 type ReviewComment struct {
-	Body string `json:"body"`
-	Path string `json:"path"`
-	Line int    `json:"line"`
-	Side string `json:"side"`
+	Body        string `json:"body"`
+	Path        string `json:"path"`
+	NewPosition int    `json:"new_position"`
+	OldPosition int    `json:"old_position,omitempty"`
+	ExtraLines  int    `json:"extra_lines_count,omitempty"`
 }
 type Review struct {
 	Body     string          `json:"body"`
 	Event    string          `json:"event"`
+	CommitID string          `json:"commit_id"`
 	Comments []ReviewComment `json:"comments,omitempty"`
 }
 type Issue struct {
@@ -114,6 +126,30 @@ func (c *Client) Files(ctx context.Context, owner, name string, n int) ([]File, 
 	err := c.do(ctx, "GET", repo(owner, name)+"/pulls/"+strconv.Itoa(n)+"/files?limit=100", nil, &f)
 	return f, err
 }
+func (c *Client) Diff(ctx context.Context, owner, name string, n int) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", c.base+repo(owner, name)+"/pulls/"+strconv.Itoa(n)+".diff", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "token "+c.token)
+	res, err := c.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
+		return "", fmt.Errorf("forgejo diff: status %d: %s", res.StatusCode, strings.TrimSpace(string(b)))
+	}
+	b, err := io.ReadAll(io.LimitReader(res.Body, 8<<20+1))
+	if err != nil {
+		return "", err
+	}
+	if len(b) > 8<<20 {
+		return "", fmt.Errorf("pull request diff exceeds limit")
+	}
+	return string(b), nil
+}
 func (c *Client) Comments(ctx context.Context, owner, name string, n int) ([]Comment, error) {
 	var v []Comment
 	err := c.do(ctx, "GET", repo(owner, name)+"/issues/"+strconv.Itoa(n)+"/comments?limit=100", nil, &v)
@@ -123,8 +159,8 @@ func (c *Client) Comment(ctx context.Context, owner, name string, n int, body st
 	return c.do(ctx, "POST", repo(owner, name)+"/issues/"+strconv.Itoa(n)+"/comments", map[string]string{"body": body}, nil)
 }
 
-func (c *Client) UpdateComment(ctx context.Context, id int64, body string) error {
-	return c.do(ctx, "PATCH", "/api/v1/repos/issues/comments/"+strconv.FormatInt(id, 10), map[string]string{"body": body}, nil)
+func (c *Client) UpdateComment(ctx context.Context, owner, name string, id int64, body string) error {
+	return c.do(ctx, "PATCH", repo(owner, name)+"/issues/comments/"+strconv.FormatInt(id, 10), map[string]string{"body": body}, nil)
 }
 func (c *Client) Review(ctx context.Context, owner, name string, n int, r Review) error {
 	return c.do(ctx, "POST", repo(owner, name)+"/pulls/"+strconv.Itoa(n)+"/reviews", r, nil)

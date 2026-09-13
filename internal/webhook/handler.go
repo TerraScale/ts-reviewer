@@ -115,6 +115,21 @@ func (h *Handler) review(owner, name string, n int) {
 	if err != nil {
 		return
 	}
+	needsDiff := len(files) == 0
+	for _, file := range files {
+		if file.Patch != "" {
+			needsDiff = false
+			break
+		}
+	}
+	if needsDiff {
+		raw, diffErr := h.Forgejo.Diff(ctx, owner, name, n)
+		if diffErr != nil {
+			_ = h.Forgejo.Status(ctx, owner, name, pr.Head.SHA, forgejo.Status{State: "error", Context: "ts-reviewer", Description: "could not retrieve patch: " + diffErr.Error()})
+			return
+		}
+		files = forgejo.ParseUnifiedDiff(raw)
+	}
 	result, err := h.Engine.Run(ctx, pr, files)
 	if err != nil {
 		_ = h.Forgejo.Status(ctx, owner, name, pr.Head.SHA, forgejo.Status{State: "error", Context: "ts-reviewer", Description: "review incomplete: " + err.Error()})
@@ -139,7 +154,7 @@ func (h *Handler) review(owner, name string, n int) {
 	if commentErr == nil {
 		for _, existing := range existingComments {
 			if strings.EqualFold(existing.User.Login, h.BotLogin) && strings.HasPrefix(existing.Body, "<!-- ts-reviewer:") {
-				if h.Forgejo.UpdateComment(ctx, existing.ID, body) == nil {
+				if h.Forgejo.UpdateComment(ctx, owner, name, existing.ID, body) == nil {
 					updated = true
 				}
 				break
@@ -160,11 +175,20 @@ func (h *Handler) review(owner, name string, n int) {
 	comments := make([]forgejo.ReviewComment, 0, len(result.Findings))
 	for _, f := range result.Findings {
 		if f.Path != "" && f.Line > 0 {
-			comments = append(comments, forgejo.ReviewComment{Body: f.Body + "\n\n**Fix:** " + f.Fix, Path: f.Path, Line: f.Line, Side: "RIGHT"})
+			position := 0
+			for _, file := range files {
+				if file.Filename == f.Path {
+					position = forgejo.ReviewPosition(file.Patch, f.Line)
+					break
+				}
+			}
+			if position > 0 {
+				comments = append(comments, forgejo.ReviewComment{Body: f.Body + "\n\n**Fix:** " + f.Fix, Path: f.Path, NewPosition: position})
+			}
 		}
 	}
 	if len(comments) > 0 {
-		_ = h.Forgejo.Review(ctx, owner, name, n, forgejo.Review{Body: "ts-reviewer findings are documented above.", Event: event, Comments: comments})
+		_ = h.Forgejo.Review(ctx, owner, name, n, forgejo.Review{Body: "ts-reviewer findings are documented above.", Event: event, CommitID: pr.Head.SHA, Comments: comments})
 	}
 	_ = h.Forgejo.Status(ctx, owner, name, pr.Head.SHA, forgejo.Status{State: state, Context: "ts-reviewer", Description: desc})
 }
