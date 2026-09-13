@@ -18,7 +18,13 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, R
         if (!HttpMethods.IsPost(request.Method)) return Results.StatusCode(StatusCodes.Status405MethodNotAllowed);
         if (request.ContentLength > MaxPayloadBytes) return Results.BadRequest("invalid payload");
         using var body = new MemoryStream();
-        await request.Body.CopyToAsync(body, cancellationToken);
+        var buffer = new byte[16 * 1024];
+        while (body.Length <= MaxPayloadBytes)
+        {
+            var read = await request.Body.ReadAsync(buffer, cancellationToken);
+            if (read == 0) break;
+            await body.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+        }
         if (body.Length > MaxPayloadBytes) return Results.BadRequest("invalid payload");
         var payload = body.ToArray();
         if (!string.IsNullOrEmpty(options.WebhookSecret) && !ValidSignature(payload, request.Headers["X-Forgejo-Signature"].ToString(), options.WebhookSecret))

@@ -14,5 +14,14 @@ public sealed record Finding(
     [property: JsonPropertyName("unrelated")] bool Unrelated,
     [property: JsonPropertyName("owning_repository")] string OwningRepository);
 
-public sealed record ReviewResult([property: JsonPropertyName("summary")] string Summary,
-    [property: JsonPropertyName("findings")] IReadOnlyList<Finding> Findings);
+public sealed record ReviewResult
+{
+    [JsonPropertyName("summary")]
+    public string Summary { get; init; } = string.Empty;
+
+    [JsonPropertyName("findings")]
+    public IReadOnlyList<Finding> Findings { get; init; } = [];
+
+    public ReviewResult() { }
+    public ReviewResult(string summary, IReadOnlyList<Finding> findings) => (Summary, Findings) = (summary, findings);
+}
