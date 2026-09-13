@@ -3,11 +3,12 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using TerraScale.Reviewer.Features.Configuration;
+using TerraScale.Reviewer.Features.Context;
 using TerraScale.Reviewer.Features.Forgejo;
 
 namespace TerraScale.Reviewer.Features.Review;
 
-public sealed class ReviewEngine(HttpClient http, ReviewerOptions options)
+public sealed class ReviewEngine(HttpClient http, ReviewerOptions options, ContextIndexer context, ILogger<ReviewEngine> logger)
 {
     private static readonly Regex FencedJson = new("```(?:json)?\\s*(.*?)```", RegexOptions.Singleline | RegexOptions.Compiled);
     private readonly HttpClient _http = Configure(http, options);
@@ -25,16 +26,25 @@ public sealed class ReviewEngine(HttpClient http, ReviewerOptions options)
         foreach (var file in files)
             diff.Append("FILE ").Append(file.Filename).Append(" (").Append(file.Status).Append(" +").Append(file.Additions).Append(" -").Append(file.Deletions).Append(")\n").Append(file.Patch).Append("\n\n");
         if (Encoding.UTF8.GetByteCount(diff.ToString()) > _options.MaxDiffBytes) throw new InvalidOperationException("pull request diff exceeds review limit");
+        var repository = pr.Head.Repo.Owner.Login + "/" + pr.Head.Repo.Name;
+        var contextText = string.Empty;
+        try
+        {
+            await context.EnsureIndexedAsync(pr.Head.Repo.Owner.Login, pr.Head.Repo.Name, pr.Head.Sha, ct);
+            var hits = await context.SearchAsync(new ContextSearchRequest(repository, pr.Head.Sha, pr.Title + "\n" + string.Join('\n', files.Select(x => x.Filename)), 12), ct);
+            contextText = string.Join("\n\n", hits.Results.Select((hit, index) => $"CONTEXT [{index + 1}] {hit.Repository}:{hit.Path}:{hit.StartLine}-{hit.EndLine} ({hit.Symbol})\n{hit.Content}"));
+        }
+        catch (Exception ex) { logger.LogWarning(ex, "repository context unavailable for {Repository}@{Commit}", repository, pr.Head.Sha); }
         var passes = new[] { "correctness, data integrity, concurrency, and error handling", "security, authorization, secret exposure, and injection", "API contracts, migrations, compatibility, and operational behavior", "tests, observability, failure recovery, and adversarial edge cases" };
         using var semaphore = new SemaphoreSlim(Math.Max(1, _options.MaxConcurrent));
-        var tasks = passes.Select(async focus => { await semaphore.WaitAsync(ct); try { return await PassAsync(pr, diff.ToString(), focus, ct); } finally { semaphore.Release(); } });
+        var tasks = passes.Select(async focus => { await semaphore.WaitAsync(ct); try { return await PassAsync(pr, diff.ToString(), contextText, focus, ct); } finally { semaphore.Release(); } });
         var results = await Task.WhenAll(tasks);
         return await AdversarialPassAsync(Merge(results), diff.ToString(), ct);
     }
 
-    private async Task<ReviewResult> PassAsync(PullRequest pr, string diff, string focus, CancellationToken ct)
+    private async Task<ReviewResult> PassAsync(PullRequest pr, string diff, string contextText, string focus, CancellationToken ct)
     {
-        var prompt = $"You are a severe senior reviewer. Review only the supplied patch. Do not invent files, APIs, runtime behavior, or vulnerabilities. Trace callers and invariants mentally. Report only actionable findings supported by patch evidence. A finding must include an exact changed path and 1-based line when possible, impact, and a concrete fix or test. Severity is critical, high, medium, or low. Use unrelated=true only when the defect is proven independent of this patch; include owning_repository only then. Return JSON only: {{\"summary\":string,\"findings\":[{{\"id\":string,\"severity\":string,\"title\":string,\"body\":string,\"fix\":string,\"path\":string,\"line\":number,\"confidence\":number,\"unrelated\":boolean,\"owning_repository\":string}}]}}. Focus: {focus}\nPR: {pr.Title}\n{diff}";
+        var prompt = $"You are a severe senior reviewer. Review only the supplied patch. Use repository context only to trace callers, contracts, and invariants; never treat it as proof that a changed line is wrong. Do not invent files, APIs, runtime behavior, or vulnerabilities. Report only actionable findings supported by patch evidence. A finding must include an exact changed path and 1-based line when possible, impact, and a concrete fix or test. Severity is critical, high, medium, or low. Use unrelated=true only when the defect is proven independent of this patch; include owning_repository only then. Return JSON only: {{\"summary\":string,\"findings\":[{{\"id\":string,\"severity\":string,\"title\":string,\"body\":string,\"fix\":string,\"path\":string,\"line\":number,\"confidence\":number,\"unrelated\":boolean,\"owning_repository\":string}}]}}. Focus: {focus}\nPR: {pr.Title}\nPATCH:\n{diff}\nREPOSITORY CONTEXT:\n{contextText}";
         return await ChatAsync(prompt, ct);
     }
     private async Task<ReviewResult> AdversarialPassAsync(ReviewResult candidates, string diff, CancellationToken ct)

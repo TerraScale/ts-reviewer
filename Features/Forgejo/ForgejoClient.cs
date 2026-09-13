@@ -1,5 +1,6 @@
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.Text;
 using System.Text.Json;
 using TerraScale.Reviewer.Features.Configuration;
 
@@ -46,6 +47,17 @@ public sealed class ForgejoClient(HttpClient http, ReviewerOptions options)
         await SendAsync<ForgejoIssue>(HttpMethod.Post, $"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/issues", new { title, body, labels = labels ?? [] }, ct);
     public async Task<IReadOnlyList<ForgejoIssue>> IssuesAsync(string owner, string name, CancellationToken ct) =>
         await GetAsync<List<ForgejoIssue>>($"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/issues?state=all&limit=100", ct) ?? [];
+    public async Task<IReadOnlyList<RepositoryTreeEntry>> TreeAsync(string owner, string name, string sha, CancellationToken ct) =>
+        (await GetAsync<RepositoryTreeResponse>($"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/git/trees/{Uri.EscapeDataString(sha)}?recursive=true", ct))?.Tree ?? [];
+    public async Task<string> FileAsync(string owner, string name, string sha, string path, CancellationToken ct)
+    {
+        var content = await GetAsync<RepositoryContent>($"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/contents/{EscapePath(path)}?ref={Uri.EscapeDataString(sha)}", ct)
+            ?? throw new InvalidOperationException($"Forgejo returned no content for {path}");
+        if (!string.Equals(content.Type, "file", StringComparison.OrdinalIgnoreCase) || string.IsNullOrWhiteSpace(content.Content)) return string.Empty;
+        return string.Equals(content.Encoding, "base64", StringComparison.OrdinalIgnoreCase)
+            ? Encoding.UTF8.GetString(Convert.FromBase64String(content.Content.Replace("\n", string.Empty, StringComparison.Ordinal)))
+            : content.Content;
+    }
 
     private async Task<T?> GetAsync<T>(string path, CancellationToken ct)
     {
@@ -67,4 +79,6 @@ public sealed class ForgejoClient(HttpClient http, ReviewerOptions options)
         var detail = await response.Content.ReadAsStringAsync(ct);
         throw new HttpRequestException($"forgejo {path}: status {(int)response.StatusCode}: {detail.Trim()}");
     }
+
+    private static string EscapePath(string path) => string.Join('/', path.Split('/', StringSplitOptions.RemoveEmptyEntries).Select(Uri.EscapeDataString));
 }

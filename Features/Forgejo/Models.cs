@@ -23,3 +23,12 @@ public sealed record ForgejoIssue([property: JsonPropertyName("number")] int Num
     [property: JsonPropertyName("body")] string Body);
 public sealed record CommitStatus([property: JsonPropertyName("state")] string State, [property: JsonPropertyName("target_url")] string? TargetUrl,
     [property: JsonPropertyName("description")] string Description, [property: JsonPropertyName("context")] string Context);
+
+public sealed record RepositoryTreeEntry([property: JsonPropertyName("path")] string Path,
+    [property: JsonPropertyName("type")] string Type, [property: JsonPropertyName("size")] long Size,
+    [property: JsonPropertyName("sha")] string Sha);
+
+public sealed record RepositoryTreeResponse([property: JsonPropertyName("tree")] IReadOnlyList<RepositoryTreeEntry> Tree);
+
+public sealed record RepositoryContent([property: JsonPropertyName("content")] string? Content,
+    [property: JsonPropertyName("encoding")] string? Encoding, [property: JsonPropertyName("type")] string Type);

@@ -3,12 +3,13 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using TerraScale.Reviewer.Features.Configuration;
+using TerraScale.Reviewer.Features.Context;
 using TerraScale.Reviewer.Features.Forgejo;
 using TerraScale.Reviewer.Features.Review;
 
 namespace TerraScale.Reviewer.Features.Webhooks;
 
-public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, ReviewerOptions options, ILogger<WebhookHandler> logger)
+public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, ContextIndexer context, ReviewerOptions options, ILogger<WebhookHandler> logger)
 {
     private const int MaxPayloadBytes = 1 << 20;
     private readonly SemaphoreSlim _slots = new(options.MaxConcurrent, options.MaxConcurrent);
@@ -35,6 +36,11 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, R
         if (webhook is null || webhook.Repository is null || webhook.Repository.Owner is null ||
             !string.Equals(webhook.Repository.Owner.Login, options.Organization, StringComparison.OrdinalIgnoreCase)) return Results.NoContent();
         var repository = webhook.Repository;
+        if (!string.IsNullOrWhiteSpace(webhook.After) && webhook.Ref?.StartsWith("refs/heads/", StringComparison.Ordinal) == true)
+        {
+            var queued = context.Enqueue(repository.Owner.Login, repository.Name, webhook.After);
+            return queued ? Results.Accepted() : Results.BadRequest("invalid commit");
+        }
         var number = webhook.Number != 0 ? webhook.Number : webhook.PullRequest?.Number ?? 0;
         if (number < 1) return Results.NoContent();
         if (webhook.Action is "opened" or "synchronize" or "reopened")
@@ -116,7 +122,7 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, R
     private async Task FileIssueAsync(Finding finding, CancellationToken ct)
     { var parts = finding.OwningRepository.Split('/', 2); if (parts.Length != 2 || !string.Equals(parts[0], options.Organization, StringComparison.OrdinalIgnoreCase)) return; var issues = await forgejo.IssuesAsync(parts[0], parts[1], ct); var marker = "<!-- ts-reviewer:" + finding.Id + " -->"; if (issues.Any(x => x.Body.Contains(marker, StringComparison.Ordinal))) return; await forgejo.CreateIssueAsync(parts[0], parts[1], "[ts-reviewer] " + finding.Title, marker + "\n\n" + finding.Body + "\n\n**Suggested fix:** " + finding.Fix, null, ct); }
 
-    private sealed record WebhookEvent([property: JsonPropertyName("action")] string? Action, [property: JsonPropertyName("number")] int Number, [property: JsonPropertyName("repository")] WebhookRepository? Repository, [property: JsonPropertyName("pull_request")] WebhookPullRequest? PullRequest, [property: JsonPropertyName("comment")] WebhookComment? Comment);
+    private sealed record WebhookEvent([property: JsonPropertyName("action")] string? Action, [property: JsonPropertyName("number")] int Number, [property: JsonPropertyName("ref")] string? Ref, [property: JsonPropertyName("after")] string? After, [property: JsonPropertyName("repository")] WebhookRepository? Repository, [property: JsonPropertyName("pull_request")] WebhookPullRequest? PullRequest, [property: JsonPropertyName("comment")] WebhookComment? Comment);
     private sealed record WebhookRepository([property: JsonPropertyName("name")] string Name, [property: JsonPropertyName("owner")] Owner Owner);
     private sealed record WebhookPullRequest([property: JsonPropertyName("number")] int Number);
     private sealed record WebhookComment([property: JsonPropertyName("body")] string Body);
