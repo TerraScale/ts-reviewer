@@ -36,7 +36,7 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, C
         if (webhook is null || webhook.Repository is null || webhook.Repository.Owner is null ||
             !string.Equals(webhook.Repository.Owner.Login, options.Organization, StringComparison.OrdinalIgnoreCase)) return Results.NoContent();
         var repository = webhook.Repository;
-        if (!string.IsNullOrWhiteSpace(webhook.After) && webhook.Ref?.StartsWith("refs/heads/", StringComparison.Ordinal) == true)
+        if (!string.IsNullOrWhiteSpace(webhook.After) && !webhook.After.All(x => x == '0') && webhook.Ref?.StartsWith("refs/heads/", StringComparison.Ordinal) == true)
         {
             var queued = context.Enqueue(repository.Owner.Login, repository.Name, webhook.After);
             return queued ? Results.Accepted() : Results.BadRequest("invalid commit");
