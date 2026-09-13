@@ -3,3 +3,4 @@ review-state.db
 /tmp/
 
 bin/
+obj/

@@ -1,4 +1,4 @@
-namespace TerraScale.TsReviewer.Features.Forgejo;
+namespace TerraScale.Reviewer.Features.Forgejo;
 
 public static class UnifiedDiff
 {

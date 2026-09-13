@@ -1,6 +1,6 @@
 using System.Text.Json.Serialization;
 
-namespace TerraScale.TsReviewer.Features.Forgejo;
+namespace TerraScale.Reviewer.Features.Forgejo;
 
 public sealed record PullRequest([property: JsonPropertyName("number")] int Number, [property: JsonPropertyName("title")] string Title,
     [property: JsonPropertyName("body")] string Body, [property: JsonPropertyName("base")] Branch Base,

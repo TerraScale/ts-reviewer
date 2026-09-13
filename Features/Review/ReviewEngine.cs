@@ -2,10 +2,10 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
-using TerraScale.TsReviewer.Features.Configuration;
-using TerraScale.TsReviewer.Features.Forgejo;
+using TerraScale.Reviewer.Features.Configuration;
+using TerraScale.Reviewer.Features.Forgejo;
 
-namespace TerraScale.TsReviewer.Features.Review;
+namespace TerraScale.Reviewer.Features.Review;
 
 public sealed class ReviewEngine(HttpClient http, ReviewerOptions options)
 {

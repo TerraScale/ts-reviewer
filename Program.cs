@@ -1,7 +1,7 @@
-using TerraScale.TsReviewer.Features.Configuration;
-using TerraScale.TsReviewer.Features.Forgejo;
-using TerraScale.TsReviewer.Features.Review;
-using TerraScale.TsReviewer.Features.Webhooks;
+using TerraScale.Reviewer.Features.Configuration;
+using TerraScale.Reviewer.Features.Forgejo;
+using TerraScale.Reviewer.Features.Review;
+using TerraScale.Reviewer.Features.Webhooks;
 
 var options = ReviewerOptions.Load(args);
 var builder = WebApplication.CreateBuilder(args);

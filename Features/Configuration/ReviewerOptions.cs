@@ -1,4 +1,4 @@
-namespace TerraScale.TsReviewer.Features.Configuration;
+namespace TerraScale.Reviewer.Features.Configuration;
 
 public sealed record ReviewerOptions(
     string ListenUrl, string ForgejoUrl, string ForgejoToken, string ProxyUrl, string ProxyToken,

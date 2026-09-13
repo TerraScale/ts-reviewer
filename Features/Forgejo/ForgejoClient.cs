@@ -1,9 +1,9 @@
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
-using TerraScale.TsReviewer.Features.Configuration;
+using TerraScale.Reviewer.Features.Configuration;
 
-namespace TerraScale.TsReviewer.Features.Forgejo;
+namespace TerraScale.Reviewer.Features.Forgejo;
 
 public sealed class ForgejoClient(HttpClient http, ReviewerOptions options)
 {

@@ -16,8 +16,9 @@ jobs:
           ref: ${{ forgejo.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - run: go test ./...
-      - run: go vet ./...
+      - run: dotnet restore Tests/TerraScale.Reviewer.Tests.csproj
+      - run: dotnet build TerraScale.Reviewer.csproj --configuration Release --no-restore
+      - run: dotnet test Tests/TerraScale.Reviewer.Tests.csproj --configuration Release --no-restore
       - run: podman build --pull=missing --tag "git.terrascale.tech/terrascale/ts-reviewer:${TS_REVIEWER_SHA}" -f Containerfile .
       - run: |
           podman image inspect "git.terrascale.tech/terrascale/ts-reviewer:${TS_REVIEWER_SHA}"

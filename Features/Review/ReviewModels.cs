@@ -1,6 +1,6 @@
 using System.Text.Json.Serialization;
 
-namespace TerraScale.TsReviewer.Features.Review;
+namespace TerraScale.Reviewer.Features.Review;
 
 public sealed record Finding(
     [property: JsonPropertyName("id")] string Id,
