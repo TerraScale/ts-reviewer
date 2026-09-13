@@ -12,4 +12,8 @@ Never put tokens in the image, workflow YAML, or command-line arguments. The For
 
 ## Container release
 
-Build with `make image`. Tag PR images by immutable commit SHA. A protected main release may promote the exact tested digest to the Forgejo container registry; it must not rebuild the image. The eventual homelab deployment supplies the public webhook URL and secrets.
+Build with `podman build --pull=missing --tag <image>:<commit-sha> -f Containerfile .`.
+Tag PR images by immutable commit SHA. A protected main release may promote the
+exact tested digest to the Forgejo container registry; it must not rebuild the
+image. The eventual homelab deployment supplies the public webhook URL and
+secrets.
