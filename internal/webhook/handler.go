@@ -10,6 +10,7 @@ import (
 	"git.terrascale.tech/TerraScale/ts-reviewer/internal/forgejo"
 	"git.terrascale.tech/TerraScale/ts-reviewer/internal/review"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -26,8 +27,11 @@ type event struct {
 	Action     string `json:"action"`
 	Number     int    `json:"number"`
 	Repository struct {
-		Name, FullName string
-		Owner          struct{ Login string } `json:"owner"`
+		Name     string `json:"name"`
+		FullName string `json:"full_name"`
+		Owner    struct {
+			Login string `json:"login"`
+		} `json:"owner"`
 	} `json:"repository"`
 	PullRequest struct {
 		Number int `json:"number"`
@@ -97,6 +101,7 @@ func validSignature(body []byte, signature, secret string) bool {
 	return hmac.Equal(got, mac.Sum(nil))
 }
 func (h *Handler) review(owner, name string, n int) {
+	slog.Info("review started", "repository", owner+"/"+name, "pull_request", n)
 	if h.Slots != nil {
 		h.Slots <- struct{}{}
 		defer func() { <-h.Slots }()
@@ -109,34 +114,34 @@ func (h *Handler) review(owner, name string, n int) {
 	defer cancel()
 	pr, err := h.Forgejo.Pull(ctx, owner, name, n)
 	if err != nil {
+		slog.Error("load pull request failed", "error", err)
 		return
 	}
 	files, err := h.Forgejo.Files(ctx, owner, name, n)
 	if err != nil {
+		slog.Error("load pull request files failed", "error", err)
+		h.failStatus(owner, name, pr.Head.SHA, "review incomplete: could not load changed files: "+err.Error())
 		return
 	}
-	needsDiff := len(files) == 0
-	for _, file := range files {
-		if file.Patch != "" {
-			needsDiff = false
-			break
-		}
+	raw, diffErr := h.Forgejo.Diff(ctx, owner, name, n)
+	if diffErr != nil {
+		slog.Error("load pull request diff failed", "error", diffErr)
+		h.failStatus(owner, name, pr.Head.SHA, "could not retrieve patch: "+diffErr.Error())
+		return
 	}
-	if needsDiff {
-		raw, diffErr := h.Forgejo.Diff(ctx, owner, name, n)
-		if diffErr != nil {
-			_ = h.Forgejo.Status(ctx, owner, name, pr.Head.SHA, forgejo.Status{State: "error", Context: "ts-reviewer", Description: "could not retrieve patch: " + diffErr.Error()})
-			return
-		}
-		files = forgejo.ParseUnifiedDiff(raw)
+	parsed := forgejo.ParseUnifiedDiff(raw)
+	if len(parsed) > 0 {
+		files = parsed
 	}
 	result, err := h.Engine.Run(ctx, pr, files)
 	if err != nil {
-		_ = h.Forgejo.Status(ctx, owner, name, pr.Head.SHA, forgejo.Status{State: "error", Context: "ts-reviewer", Description: "review incomplete: " + err.Error()})
+		slog.Error("review model failed", "error", err)
+		h.failStatus(owner, name, pr.Head.SHA, "review incomplete: "+err.Error())
 		return
 	}
 	latest, err := h.Forgejo.Pull(ctx, owner, name, n)
 	if err != nil || !strings.EqualFold(latest.Head.SHA, pr.Head.SHA) {
+		slog.Info("review discarded as stale", "pull_request", n)
 		return
 	}
 	critical := false
@@ -162,7 +167,9 @@ func (h *Handler) review(owner, name string, n int) {
 		}
 	}
 	if !updated {
-		_ = h.Forgejo.Comment(ctx, owner, name, n, body)
+		if err := h.Forgejo.Comment(ctx, owner, name, n, body); err != nil {
+			slog.Error("post review summary failed", "error", err)
+		}
 	}
 	event := "APPROVE"
 	state := "success"
@@ -190,7 +197,17 @@ func (h *Handler) review(owner, name string, n int) {
 	if len(comments) > 0 {
 		_ = h.Forgejo.Review(ctx, owner, name, n, forgejo.Review{Body: "ts-reviewer findings are documented above.", Event: event, CommitID: pr.Head.SHA, Comments: comments})
 	}
-	_ = h.Forgejo.Status(ctx, owner, name, pr.Head.SHA, forgejo.Status{State: state, Context: "ts-reviewer", Description: desc})
+	if err := h.Forgejo.Status(ctx, owner, name, pr.Head.SHA, forgejo.Status{State: state, Context: "ts-reviewer", Description: desc}); err != nil {
+		slog.Error("publish review status failed", "error", err)
+	}
+	slog.Info("review completed", "repository", owner+"/"+name, "pull_request", n, "findings", len(result.Findings), "state", state)
+}
+func (h *Handler) failStatus(owner, name, sha, description string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := h.Forgejo.Status(ctx, owner, name, sha, forgejo.Status{State: "error", Context: "ts-reviewer", Description: description}); err != nil {
+		slog.Error("publish failed review status", "error", err)
+	}
 }
 func (h *Handler) command(owner, name string, n int, command string) {
 	switch command {

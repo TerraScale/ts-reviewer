@@ -17,17 +17,11 @@ type Client struct {
 	http        *http.Client
 }
 type PullRequest struct {
-	Number int    `json:"number"`
-	Title  string `json:"title"`
-	Body   string `json:"body"`
-	Base   struct {
-		Repo struct {
-			Owner string `json:"owner"`
-			Name  string `json:"name"`
-		} `json:"repo"`
-		SHA string `json:"sha"`
-	} `json:"base"`
-	Head PRBranch `json:"head"`
+	Number int      `json:"number"`
+	Title  string   `json:"title"`
+	Body   string   `json:"body"`
+	Base   PRBranch `json:"base"`
+	Head   PRBranch `json:"head"`
 }
 type PRBranch struct {
 	SHA  string `json:"sha"`
