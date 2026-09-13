@@ -9,6 +9,6 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="TUnit" Version="1.56.18" />
-    <ProjectReference Include="..\TerraScale.Reviewer.csproj" />
+    <ProjectReference Include="../../src/TerraScale.Reviewer/TerraScale.Reviewer.csproj" />
   </ItemGroup>
 </Project>
