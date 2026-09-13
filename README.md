@@ -12,7 +12,7 @@ Never put tokens in the image, workflow YAML, or command-line arguments. The For
 
 ## Container release
 
-The service targets .NET 10 and is built with the SDK project. Run local checks with `dotnet build TerraScale.Reviewer.csproj` and `dotnet test Tests/TerraScale.Reviewer.Tests.csproj`. Build the release image with `podman build --pull=missing --tag <image>:<commit-sha> -f Containerfile .`.
+The service targets .NET 10 and is built with the SDK project. Run local checks with `dotnet build TerraScale.Reviewer.csproj` and `dotnet test Tests/TerraScale.Reviewer.Tests.csproj`. Build the release image with `dotnet publish TerraScale.Reviewer.csproj --configuration Release --os linux --arch x64 -p:LocalRegistry=Podman /t:PublishContainer`.
 Tag PR images by immutable commit SHA. A protected main release may promote the
 exact tested digest to the Forgejo container registry; it must not rebuild the
 image. The eventual homelab deployment supplies the public webhook URL and
