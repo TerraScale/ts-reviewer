@@ -73,9 +73,18 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, C
 
     public static string Format(PullRequest pr, ReviewResult result)
     {
-        var builder = new StringBuilder($"<!-- ts-reviewer:{pr.Head.Sha} -->\n## ts-reviewer review\n\n{result.Summary}\n\n");
-        if (result.Findings.Count == 0) return builder.Append("✅ No evidence-backed findings met the reporting threshold.\n").ToString();
-        foreach (var finding in result.Findings) builder.Append("### ").Append(finding.Severity.ToUpperInvariant()).Append(" · ").Append(finding.Title).Append(" (`").Append(finding.Path).Append(':').Append(finding.Line).Append("`)\n").Append(finding.Body).Append("\n\n**Fix:** ").Append(finding.Fix).Append("\n\n");
+        var builder = new StringBuilder($"<!-- ts-reviewer:{pr.Head.Sha} -->\n## ts-reviewer review\n\n### Summary\n\n{result.Summary.Trim()}\n\n");
+        if (result.Findings.Count == 0) return builder.Append("### Result\n\n✅ No evidence-backed findings met the reporting threshold.\n").ToString();
+
+        builder.Append("### Findings (").Append(result.Findings.Count).Append(")\n\n");
+        foreach (var finding in result.Findings)
+        {
+            builder.Append("#### ").Append(finding.Severity.Trim().ToUpperInvariant()).Append(" · ").Append(finding.Title.Trim()).Append("\n\n")
+                .Append('`').Append(finding.Path).Append(':').Append(finding.Line).Append("`\n\n")
+                .Append(finding.Body.Trim()).Append("\n\n")
+                .Append("<details>\n<summary>Suggested fix</summary>\n\n")
+                .Append(finding.Fix.Trim()).Append("\n\n</details>\n\n");
+        }
         return builder.ToString();
     }
 
@@ -111,7 +120,11 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, C
         foreach (var comment in existing.Where(x => string.Equals(x.User.Login, options.BotLogin, StringComparison.OrdinalIgnoreCase) && x.Body.StartsWith("<!-- ts-reviewer:", StringComparison.Ordinal)))
         { await forgejo.UpdateCommentAsync(owner, name, comment.Id, body, ct); updated = true; break; }
         if (!updated) await forgejo.CommentAsync(owner, name, number, body, ct);
-        var comments = result.Findings.Select(f => (f, position: files.FirstOrDefault(x => x.Filename == f.Path) is { } file ? UnifiedDiff.ReviewPosition(file.Patch, f.Line) : 0)).Where(x => x.position > 0).Select(x => new ReviewComment(x.f.Body + "\n\n**Fix:** " + x.f.Fix, x.f.Path, x.position)).ToList();
+        var comments = result.Findings
+            .Select(f => (f, position: files.FirstOrDefault(x => x.Filename == f.Path) is { } file ? UnifiedDiff.ReviewPosition(file.Patch, f.Line) : 0))
+            .Where(x => x.position > 0)
+            .Select(x => new ReviewComment($"**{x.f.Severity.Trim().ToUpperInvariant()} · {x.f.Title.Trim()}**\n\n{x.f.Body.Trim()}\n\n**Suggested fix**\n{x.f.Fix.Trim()}", x.f.Path, x.position))
+            .ToList();
         if (comments.Count > 0) await forgejo.ReviewAsync(owner, name, number, new PullReview("ts-reviewer findings are documented above.", critical ? "REQUEST_CHANGES" : "APPROVE", pr.Head.Sha, comments), ct);
         await forgejo.StatusAsync(owner, name, pr.Head.Sha, new CommitStatus(critical ? "failure" : "success", null, critical ? "Critical/high findings require changes" : "No critical or high findings", "ts-reviewer"), ct);
     }

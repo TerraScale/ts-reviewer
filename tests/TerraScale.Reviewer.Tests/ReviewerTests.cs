@@ -74,6 +74,24 @@ public sealed class ReviewerTests
     }
 
     [Test]
+    public async Task ReviewCommentIsStructuredForFindingsAndCleanForEmptyReviews()
+    {
+        var repository = new Repository(new Owner("TerraScale"), "ts-reviewer");
+        var branch = new Branch("abc123", "main", repository);
+        var pullRequest = new PullRequest(14, "Improve review output", "", branch, branch);
+        var empty = WebhookHandler.Format(pullRequest, new ReviewResult("ignored", []));
+        await Assert.That(empty.Contains("### Summary")).IsTrue();
+        await Assert.That(empty.Contains("### Result")).IsTrue();
+        await Assert.That(empty.Contains("✅ No evidence-backed findings")).IsTrue();
+
+        var finding = new Finding("f-1", "high", "Unsafe fallback", "The fallback bypasses validation.", "Add a validation check before retrying.", "src/Worker.cs", 42, .99, false, "");
+        var formatted = WebhookHandler.Format(pullRequest, new ReviewResult("ignored", [finding]));
+        await Assert.That(formatted.Contains("### Findings (1)")).IsTrue();
+        await Assert.That(formatted.Contains("#### HIGH · Unsafe fallback")).IsTrue();
+        await Assert.That(formatted.Contains("<summary>Suggested fix</summary>")).IsTrue();
+    }
+
+    [Test]
     public async Task SqliteVecPersistsAndSearchesExactCommitContext()
     {
         var database = Path.Combine(Path.GetTempPath(), "ts-reviewer-" + Guid.NewGuid().ToString("N") + ".db");

@@ -39,7 +39,8 @@ public sealed class ReviewEngine(HttpClient http, ReviewerOptions options, Conte
         using var semaphore = new SemaphoreSlim(Math.Max(1, _options.MaxConcurrent));
         var tasks = passes.Select(async focus => { await semaphore.WaitAsync(ct); try { return await PassAsync(pr, diff.ToString(), contextText, focus, ct); } finally { semaphore.Release(); } });
         var results = await Task.WhenAll(tasks);
-        return await AdversarialPassAsync(Merge(results), diff.ToString(), ct);
+        var reviewed = await AdversarialPassAsync(Merge(results), diff.ToString(), ct);
+        return reviewed with { Summary = BuildSummary(reviewed.Findings) };
     }
 
     private async Task<ReviewResult> PassAsync(PullRequest pr, string diff, string contextText, string focus, CancellationToken ct)
@@ -71,10 +72,8 @@ public sealed class ReviewEngine(HttpClient http, ReviewerOptions options, Conte
     {
         var findings = new List<Finding>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var summary = new StringBuilder("Multi-pass review completed.");
         foreach (var result in results)
         {
-            if (!string.IsNullOrWhiteSpace(result.Summary)) summary.Append(' ').Append(result.Summary);
             foreach (var finding in result.Findings)
             {
                 var id = string.IsNullOrWhiteSpace(finding.Id) ? $"{finding.Path}:{finding.Line}:{finding.Title}" : finding.Id;
@@ -82,6 +81,17 @@ public sealed class ReviewEngine(HttpClient http, ReviewerOptions options, Conte
                 findings.Add(finding with { Id = id });
             }
         }
-        return new ReviewResult(summary.ToString(), findings);
+        return new ReviewResult(BuildSummary(findings), findings);
+    }
+
+    private static string BuildSummary(IReadOnlyCollection<Finding> findings)
+    {
+        if (findings.Count == 0) return "The patch passed the evidence threshold with no actionable findings.";
+
+        var counts = findings
+            .GroupBy(finding => finding.Severity.Trim().ToLowerInvariant())
+            .OrderBy(group => group.Key)
+            .Select(group => $"{group.Count()} {group.Key}");
+        return $"Found {findings.Count} actionable finding(s): {string.Join(", ", counts)}.";
     }
 }
