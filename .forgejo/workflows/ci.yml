@@ -1,23 +1,15 @@
 name: ts-reviewer CI
+
 on:
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
+
 jobs:
-  checks:
-    runs-on: terrascale-builder
-    timeout-minutes: 20
-    env:
-      TS_REVIEWER_SHA: ${{ forgejo.sha }}
-    steps:
-      - uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-        with:
-          github-server-url: "https://git.terrascale.tech"
-          ref: ${{ forgejo.sha }}
-          fetch-depth: 0
-          persist-credentials: false
-      - run: dotnet restore tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj --os linux --arch x64
-      - run: dotnet build src/TerraScale.Reviewer/TerraScale.Reviewer.csproj --configuration Release --no-restore
-      - run: dotnet test tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj --configuration Release --no-restore
-      - run: dotnet publish src/TerraScale.Reviewer/TerraScale.Reviewer.csproj --configuration Release --no-restore --os linux --arch x64 -p:ContainerImageTag="${TS_REVIEWER_SHA}" -p:LocalRegistry=Podman /t:PublishContainer
-      - run: podman image inspect "localhost/terrascale/ts-reviewer:${TS_REVIEWER_SHA}"
+  ci:
+    uses: TerraScale/ts-deploy/.forgejo/workflows/deploy.yml@main
+    with:
+      repo: ts-reviewer
+    secrets: inherit
