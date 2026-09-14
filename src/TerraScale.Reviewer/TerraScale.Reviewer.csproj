@@ -1,7 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
@@ -9,7 +8,7 @@
     <AssemblyName>TerraScale.Reviewer</AssemblyName>
     <RootNamespace>TerraScale.Reviewer</RootNamespace>
     <EnableSdkContainerSupport>true</EnableSdkContainerSupport>
-    <ContainerBaseImage>mcr.microsoft.com/dotnet/aspnet:10.0</ContainerBaseImage>
+    <ContainerBaseImage>mcr.microsoft.com/dotnet/aspnet:11.0-rc.1</ContainerBaseImage>
     <ContainerRepository>terrascale/ts-reviewer</ContainerRepository>
     <ContainerPort>8080</ContainerPort>
     <ContainerUser>1654</ContainerUser>

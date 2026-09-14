@@ -14,7 +14,7 @@ Never put tokens in the image, workflow YAML, or command-line arguments. The For
 
 ## Container release
 
-The service targets .NET 10 and is built from `src/TerraScale.Reviewer/TerraScale.Reviewer.csproj`. Feature slices live below that project directory, while tests are in `tests/TerraScale.Reviewer.Tests/`. Run local checks with `dotnet build src/TerraScale.Reviewer/TerraScale.Reviewer.csproj` and `dotnet test tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj`. Build the release image with `dotnet publish src/TerraScale.Reviewer/TerraScale.Reviewer.csproj --configuration Release --os linux --arch x64 -p:LocalRegistry=Podman /t:PublishContainer`.
+The service targets .NET 11 and is built from `src/TerraScale.Reviewer/TerraScale.Reviewer.csproj`. Feature slices live below that project directory, while tests are in `tests/TerraScale.Reviewer.Tests/`. Run local checks with `dotnet build src/TerraScale.Reviewer/TerraScale.Reviewer.csproj` and `dotnet test tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj`. Build the release image with `dotnet publish src/TerraScale.Reviewer/TerraScale.Reviewer.csproj --configuration Release --os linux --arch x64 -p:LocalRegistry=Podman /t:PublishContainer`.
 
 The context API accepts `POST /context/search` with `{ "repository": "TerraScale/ts-reviewer", "commit": "<sha>", "query": "Forgejo webhook authentication", "top_k": 8 }` and returns source snippets with repository, path, line range, symbol, and score metadata. Reviews automatically wait for the exact PR head to be indexed, then include the retrieved context in every model pass.
 Tag PR images by immutable commit SHA. A protected main release may promote the
