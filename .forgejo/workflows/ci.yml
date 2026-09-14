@@ -1,5 +1,7 @@
 name: ts-reviewer CI
 on:
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -21,3 +23,13 @@ jobs:
       - run: dotnet test tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj --configuration Release --no-restore
       - run: dotnet publish src/TerraScale.Reviewer/TerraScale.Reviewer.csproj --configuration Release --no-restore --os linux --arch x64 -p:ContainerImageTag="${TS_REVIEWER_SHA}" -p:LocalRegistry=Podman /t:PublishContainer
       - run: podman image inspect "localhost/terrascale/ts-reviewer:${TS_REVIEWER_SHA}"
+      - name: Publish immutable container to Harbor
+        if: forgejo.event_name == 'push' && forgejo.ref == 'refs/heads/main'
+        env:
+          HARBOR_IMAGE: registry.mariogk.com/homelab/ts-reviewer
+        run: |
+          set -eu
+          image="${HARBOR_IMAGE}:${TS_REVIEWER_SHA}"
+          podman tag "localhost/terrascale/ts-reviewer:${TS_REVIEWER_SHA}" "${image}"
+          podman push "${image}"
+          podman image inspect "${image}"
