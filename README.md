@@ -21,3 +21,10 @@ Tag PR images by immutable commit SHA. A protected main release may promote the
 exact tested digest to the Forgejo container registry; it must not rebuild the
 image. The eventual homelab deployment supplies the public webhook URL and
 secrets.
+
+Deploying the LiteDB-based image over a pre-LiteDB deployment: mount a
+persistent volume at the context database directory (the parent of
+`TS_REVIEWER_CONTEXT_DATABASE`, default `data/`) or every restart re-indexes
+from scratch, and delete any previous SQLite `reviewer-context.db` file in that
+directory first — LiteDB refuses the old file format and the service exits at
+startup.
