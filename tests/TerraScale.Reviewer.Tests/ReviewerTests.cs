@@ -10,10 +10,23 @@ using System.Text;
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging.Abstractions;
 
 public sealed class ReviewerTests
 {
+    private static readonly ContextEmbedder Embedder = new();
+
+    private static ReviewerOptions Options(string database) =>
+        new("http://+:8080", "https://forgejo.test", "forgejo", "https://proxy.test/v1", "proxy", "review", "TerraScale", "bot", 2, TimeSpan.FromMinutes(1), 100000, "", "", database, 100);
+
+    private static float[] UnitVector(int index)
+    {
+        var vector = new float[Embedder.Embed("dimension probe").Length];
+        vector[index] = 1;
+        return vector;
+    }
+
     [Test]
     public async Task SignatureAndCommandValidation()
     {
@@ -51,11 +64,10 @@ public sealed class ReviewerTests
     [Test]
     public async Task ConfigurationAcceptsExplicitArgumentsAndRejectsInvalidLimits()
     {
-        var options = ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy", "--forgejo-url=https://forgejo.test/", "--proxy-url=https://proxy.test/v1/", "--timeout=00:00:05", "--max-concurrent=3", "--context-embedding-dimensions=8"]);
+        var options = ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy", "--forgejo-url=https://forgejo.test/", "--proxy-url=https://proxy.test/v1/", "--timeout=00:00:05", "--max-concurrent=3"]);
         await Assert.That(options.ForgejoUrl).IsEqualTo("https://forgejo.test");
         await Assert.That(options.ProxyUrl).IsEqualTo("https://proxy.test/v1");
         await Assert.That(options.MaxConcurrent).IsEqualTo(3);
-        await Assert.That(options.ContextEmbeddingDimensions).IsEqualTo(8);
 
         var rejected = false;
         try { ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy", "--max-concurrent=0"]); }
@@ -92,35 +104,33 @@ public sealed class ReviewerTests
     }
 
     [Test]
-    public async Task SqliteVecPersistsAndSearchesExactCommitContext()
+    public async Task LiteDbPersistsAndSearchesExactCommitContext()
     {
         var database = Path.Combine(Path.GetTempPath(), "ts-reviewer-" + Guid.NewGuid().ToString("N") + ".db");
         try
         {
-            var options = new ReviewerOptions("http://+:8080", "https://forgejo.test", "forgejo", "https://proxy.test/v1", "proxy", "review", "embed", "TerraScale", "bot", 2, TimeSpan.FromMinutes(1), 100000, "", "", database, 100, 8);
-            var store = new ContextStore(options);
+            using var store = new ContextStore(Options(database));
             var chunk = new CodeChunk("src/Widget.cs", 10, 20, "CreateWidget", "public Widget CreateWidget() => new();");
-            await store.ReplaceCommitAsync("TerraScale/widgets", "abc123", [(chunk, new float[] { 1, 0, 0, 0, 0, 0, 0, 0 })], CancellationToken.None);
-            var results = await store.SearchAsync("TerraScale/widgets", "abc123", "CreateWidget", 5, new float[] { 1, 0, 0, 0, 0, 0, 0, 0 }, CancellationToken.None);
+            store.ReplaceCommit("TerraScale/widgets", "abc123", [(chunk, UnitVector(0))]);
+            var results = store.Search("TerraScale/widgets", "abc123", UnitVector(0), 5);
             await Assert.That(results).IsNotEmpty();
             await Assert.That(results[0].Path).IsEqualTo("src/Widget.cs");
-            await Assert.That(await store.IsIndexedAsync("TerraScale/widgets", "abc123", CancellationToken.None)).IsTrue();
+            await Assert.That(store.IsIndexed("TerraScale/widgets", "abc123")).IsTrue();
         }
         finally { File.Delete(database); }
     }
 
     [Test]
-    public async Task SqliteContextSearchNeverLeaksAnotherCommit()
+    public async Task LiteDbContextSearchNeverLeaksAnotherCommit()
     {
         var database = Path.Combine(Path.GetTempPath(), "ts-reviewer-" + Guid.NewGuid().ToString("N") + ".db");
         try
         {
-            var options = new ReviewerOptions("http://+:8080", "https://forgejo.test", "forgejo", "https://proxy.test/v1", "proxy", "review", "embed", "TerraScale", "bot", 2, TimeSpan.FromMinutes(1), 100000, "", "", database, 100, 8);
-            var store = new ContextStore(options);
-            await store.ReplaceCommitAsync("TerraScale/widgets", "old", [(new CodeChunk("old.cs", 1, 1, "Old", "old implementation"), new float[] { 1, 0, 0, 0, 0, 0, 0, 0 })], CancellationToken.None);
-            await store.ReplaceCommitAsync("TerraScale/widgets", "new", [(new CodeChunk("new.cs", 1, 1, "New", "new implementation"), new float[] { 0, 1, 0, 0, 0, 0, 0, 0 })], CancellationToken.None);
-            var oldResults = await store.SearchAsync("TerraScale/widgets", "old", "implementation", 5, null, CancellationToken.None);
-            var newResults = await store.SearchAsync("TerraScale/widgets", "new", "implementation", 5, null, CancellationToken.None);
+            using var store = new ContextStore(Options(database));
+            store.ReplaceCommit("TerraScale/widgets", "old", [(new CodeChunk("old.cs", 1, 1, "Old", "old implementation"), UnitVector(0))]);
+            store.ReplaceCommit("TerraScale/widgets", "new", [(new CodeChunk("new.cs", 1, 1, "New", "new implementation"), UnitVector(1))]);
+            var oldResults = store.Search("TerraScale/widgets", "old", UnitVector(0), 5);
+            var newResults = store.Search("TerraScale/widgets", "new", UnitVector(1), 5);
             await Assert.That(oldResults.Count).IsEqualTo(1);
             await Assert.That(oldResults[0].Path).IsEqualTo("old.cs");
             await Assert.That(newResults.Count).IsEqualTo(1);
@@ -130,16 +140,15 @@ public sealed class ReviewerTests
     }
 
     [Test]
-    public async Task SqliteContextReplacementRemovesOldChunks()
+    public async Task LiteDbContextReplacementRemovesOldChunks()
     {
         var database = Path.Combine(Path.GetTempPath(), "ts-reviewer-" + Guid.NewGuid().ToString("N") + ".db");
         try
         {
-            var options = new ReviewerOptions("http://+:8080", "https://forgejo.test", "forgejo", "https://proxy.test/v1", "proxy", "review", "embed", "TerraScale", "bot", 2, TimeSpan.FromMinutes(1), 100000, "", "", database, 100, 8);
-            var store = new ContextStore(options);
-            await store.ReplaceCommitAsync("TerraScale/widgets", "same", [(new CodeChunk("before.cs", 1, 1, "Before", "before marker"), new float[] { 1, 0, 0, 0, 0, 0, 0, 0 })], CancellationToken.None);
-            await store.ReplaceCommitAsync("TerraScale/widgets", "same", [(new CodeChunk("after.cs", 1, 1, "After", "after marker"), new float[] { 1, 0, 0, 0, 0, 0, 0, 0 })], CancellationToken.None);
-            var results = await store.SearchAsync("TerraScale/widgets", "same", "marker", 5, null, CancellationToken.None);
+            using var store = new ContextStore(Options(database));
+            store.ReplaceCommit("TerraScale/widgets", "same", [(new CodeChunk("before.cs", 1, 1, "Before", "before marker"), UnitVector(0))]);
+            store.ReplaceCommit("TerraScale/widgets", "same", [(new CodeChunk("after.cs", 1, 1, "After", "after marker"), UnitVector(0))]);
+            var results = store.Search("TerraScale/widgets", "same", UnitVector(0), 5);
             await Assert.That(results.Count).IsEqualTo(1);
             await Assert.That(results[0].Path).IsEqualTo("after.cs");
         }
@@ -147,20 +156,19 @@ public sealed class ReviewerTests
     }
 
     [Test]
-    public async Task ContextIndexerFetchesExactCommitAndEmbedsChunks()
+    public async Task ContextIndexerFetchesExactCommitAndEmbedsChunksLocally()
     {
         var database = Path.Combine(Path.GetTempPath(), "ts-reviewer-" + Guid.NewGuid().ToString("N") + ".db");
-        var options = new ReviewerOptions("http://+:8080", "https://forgejo.test", "forgejo", "https://proxy.test/v1", "proxy", "review", "embed", "TerraScale", "bot", 2, TimeSpan.FromMinutes(1), 100000, "", "", database, 100, 8);
+        var options = Options(database);
         var handler = new ContextFakeHandler();
         var forgejo = new ForgejoClient(new HttpClient(handler), options);
-        var embeddings = new ContextEmbeddingClient(new HttpClient(handler), options);
-        var store = new ContextStore(options);
-        var indexer = new ContextIndexer(forgejo, store, embeddings, options, NullLogger<ContextIndexer>.Instance);
+        using var store = new ContextStore(options);
+        var indexer = new ContextIndexer(forgejo, store, Embedder, options, NullLogger<ContextIndexer>.Instance);
         try
         {
             await indexer.StartAsync(CancellationToken.None);
             await indexer.EnsureIndexedAsync("TerraScale", "widgets", "abc123", CancellationToken.None);
-            var results = await store.SearchAsync("TerraScale/widgets", "abc123", "CreateWidget", 5, null, CancellationToken.None);
+            var results = store.Search("TerraScale/widgets", "abc123", Embedder.Embed("CreateWidget"), 5);
             await Assert.That(results.Count).IsEqualTo(1);
             await Assert.That(results[0].Path).IsEqualTo("src/Widget.cs");
             await Assert.That(handler.FileRequests).IsEqualTo(1);
@@ -169,29 +177,90 @@ public sealed class ReviewerTests
         finally { File.Delete(database); }
     }
 
+    [Test]
+    public async Task WebhookAddsEyesReactionWhenPullRequestOrCommandIsSeen()
+    {
+        var database = Path.Combine(Path.GetTempPath(), "ts-reviewer-" + Guid.NewGuid().ToString("N") + ".db");
+        var options = Options(database);
+        var handler = new AcknowledgeFakeHandler();
+        var forgejo = new ForgejoClient(new HttpClient(handler), options);
+        using var store = new ContextStore(options);
+        var indexer = new ContextIndexer(forgejo, store, Embedder, options, NullLogger<ContextIndexer>.Instance);
+        var engine = new ReviewEngine(new HttpClient(handler), options, indexer, NullLogger<ReviewEngine>.Instance);
+        var webhookHandler = new WebhookHandler(forgejo, engine, indexer, options, NullLogger<WebhookHandler>.Instance);
+        try
+        {
+            var result = await PostWebhookAsync(webhookHandler, new
+            {
+                action = "opened",
+                number = 14,
+                repository = new { name = "widgets", owner = new { login = "TerraScale" } },
+                pull_request = new { number = 14 },
+            });
+            await Assert.That(((IStatusCodeHttpResult)result).StatusCode).IsEqualTo(StatusCodes.Status202Accepted);
+            await WaitUntilAsync(() => handler.PullRequestReactions == 1);
+
+            await PostWebhookAsync(webhookHandler, new
+            {
+                action = "created",
+                number = 14,
+                repository = new { name = "widgets", owner = new { login = "TerraScale" } },
+                pull_request = new { number = 14 },
+                comment = new { id = 77, body = "@bot recheck" },
+            });
+            await WaitUntilAsync(() => handler.CommentReactions == 1);
+            await Assert.That(handler.PullRequestReactions).IsEqualTo(1);
+        }
+        finally { File.Delete(database); }
+    }
+
+    private static async Task<IResult> PostWebhookAsync(WebhookHandler handler, object payload)
+    {
+        var context = new DefaultHttpContext();
+        context.Request.Method = "POST";
+        context.Request.Body = new MemoryStream(JsonSerializer.SerializeToUtf8Bytes(payload));
+        return await handler.HandleAsync(context.Request, CancellationToken.None);
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        while (!condition() && !timeout.Token.IsCancellationRequested) await Task.Delay(25);
+        await Assert.That(condition()).IsTrue();
+    }
+
     private sealed class ContextFakeHandler : HttpMessageHandler
     {
         public int FileRequests { get; private set; }
 
-        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             if (request.Method == HttpMethod.Get && request.RequestUri?.AbsolutePath.Contains("/git/trees/", StringComparison.Ordinal) == true)
-                return Json(new { tree = new[] { new { path = "src/Widget.cs", type = "blob", size = 58, sha = "file-sha" } } });
+                return Task.FromResult(Json(new { tree = new[] { new { path = "src/Widget.cs", type = "blob", size = 58, sha = "file-sha" } } }));
             if (request.Method == HttpMethod.Get && request.RequestUri?.AbsolutePath.Contains("/contents/", StringComparison.Ordinal) == true)
             {
                 FileRequests++;
                 var content = Convert.ToBase64String(Encoding.UTF8.GetBytes("public class Widget { public Widget CreateWidget() => new(); }"));
-                return Json(new { content, encoding = "base64", type = "file" });
+                return Task.FromResult(Json(new { content, encoding = "base64", type = "file" }));
             }
-            if (request.Method == HttpMethod.Post && request.RequestUri?.AbsolutePath.EndsWith("/embeddings", StringComparison.Ordinal) == true)
-            {
-                var count = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(cancellationToken)).RootElement.GetProperty("input").GetArrayLength();
-                var data = Enumerable.Range(0, count).Select(index => new { index, embedding = new[] { 1f, 0f, 0f, 0f, 0f, 0f, 0f, 0f } });
-                return Json(new { data });
-            }
-            return new HttpResponseMessage(HttpStatusCode.NotFound);
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
         }
 
         private static HttpResponseMessage Json(object value) => new(HttpStatusCode.OK) { Content = JsonContent.Create(value) };
+    }
+
+    private sealed class AcknowledgeFakeHandler : HttpMessageHandler
+    {
+        public int PullRequestReactions { get; private set; }
+        public int CommentReactions { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            if (request.Method == HttpMethod.Post && request.RequestUri?.AbsolutePath.EndsWith("/issues/14/reactions", StringComparison.Ordinal) == true)
+                PullRequestReactions++;
+            if (request.Method == HttpMethod.Post && request.RequestUri?.AbsolutePath.EndsWith("/issues/comments/77/reactions", StringComparison.Ordinal) == true)
+                CommentReactions++;
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+        }
     }
 }

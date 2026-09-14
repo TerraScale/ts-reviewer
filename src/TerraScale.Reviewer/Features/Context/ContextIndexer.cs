@@ -9,19 +9,19 @@ public sealed class ContextIndexer : BackgroundService
 {
     private readonly ForgejoClient _forgejo;
     private readonly ContextStore _store;
-    private readonly ContextEmbeddingClient _embeddings;
+    private readonly ContextEmbedder _embeddings;
     private readonly ReviewerOptions _options;
     private readonly ILogger<ContextIndexer> _logger;
     private readonly Channel<IndexRequest> _queue = Channel.CreateUnbounded<IndexRequest>(new UnboundedChannelOptions { SingleReader = true, AllowSynchronousContinuations = false });
     private readonly ConcurrentDictionary<string, TaskCompletionSource<bool>> _pending = new(StringComparer.OrdinalIgnoreCase);
 
-    internal ContextIndexer(ForgejoClient forgejo, ContextStore store, ContextEmbeddingClient embeddings, ReviewerOptions options, ILogger<ContextIndexer> logger) =>
+    internal ContextIndexer(ForgejoClient forgejo, ContextStore store, ContextEmbedder embeddings, ReviewerOptions options, ILogger<ContextIndexer> logger) =>
         (_forgejo, _store, _embeddings, _options, _logger) = (forgejo, store, embeddings, options, logger);
 
     public async Task EnsureIndexedAsync(string owner, string name, string commit, CancellationToken ct)
     {
         var repository = owner + "/" + name;
-        if (await _store.IsIndexedAsync(repository, commit, ct)) return;
+        if (_store.IsIndexed(repository, commit)) return;
         var key = Key(repository, commit);
         var completion = _pending.GetOrAdd(key, _ => new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously));
         if (completion.Task.Status == TaskStatus.WaitingForActivation)
@@ -37,13 +37,14 @@ public sealed class ContextIndexer : BackgroundService
         return _queue.Writer.TryWrite(new IndexRequest(owner, name, commit));
     }
 
-    public async Task<ContextSearchResponse> SearchAsync(ContextSearchRequest request, CancellationToken ct)
+    public Task<ContextSearchResponse> SearchAsync(ContextSearchRequest request, CancellationToken ct)
     {
         var repository = request.Repository.Trim();
-        var indexed = await _store.IsIndexedAsync(repository, request.Commit, ct);
-        var vector = indexed && !string.IsNullOrWhiteSpace(request.Query) ? (await _embeddings.EmbedAsync([request.Query], ct))[0] : null;
-        var results = indexed ? await _store.SearchAsync(repository, request.Commit, request.Query, Math.Clamp(request.TopK, 1, 50), vector, ct) : [];
-        return new ContextSearchResponse(results, indexed);
+        if (!_store.IsIndexed(repository, request.Commit)) return Task.FromResult(new ContextSearchResponse([], false));
+        if (string.IsNullOrWhiteSpace(request.Query)) return Task.FromResult(new ContextSearchResponse([], true));
+        var vector = _embeddings.Embed(request.Query);
+        var results = _store.Search(repository, request.Commit, vector, Math.Clamp(request.TopK, 1, 50));
+        return Task.FromResult(new ContextSearchResponse(results, true));
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -53,7 +54,7 @@ public sealed class ContextIndexer : BackgroundService
             var key = Key(request.Owner + "/" + request.Name, request.Commit);
             try
             {
-                if (!await _store.IsIndexedAsync(request.Owner + "/" + request.Name, request.Commit, stoppingToken))
+                if (!_store.IsIndexed(request.Owner + "/" + request.Name, request.Commit))
                     await IndexAsync(request, stoppingToken);
                 Complete(key, true);
             }
@@ -77,19 +78,13 @@ public sealed class ContextIndexer : BackgroundService
             foreach (var chunk in CodeChunker.Split(file.Path, content)) chunks.Add(chunk);
         });
         var orderedChunks = chunks.OrderBy(x => x.Path, StringComparer.Ordinal).ThenBy(x => x.StartLine).ToList();
-        if (orderedChunks.Count == 0)
+        if (orderedChunks.Count > 0)
         {
-            await _store.ReplaceCommitAsync(repository, request.Commit, [], ct);
-            return;
+            var inputs = orderedChunks.Select(x => $"Repository: {repository}\nPath: {x.Path}\nSymbol: {x.Symbol}\nLines: {x.StartLine}-{x.EndLine}\n{x.Content}").ToArray();
+            var vectors = _embeddings.Embed(inputs);
+            _store.ReplaceCommit(repository, request.Commit, orderedChunks.Zip(vectors, (chunk, vector) => (chunk, vector)).ToList());
         }
-        var all = new List<(CodeChunk Chunk, float[] Vector)>();
-        foreach (var batch in orderedChunks.Chunk(64))
-        {
-            var inputs = batch.Select(x => $"Repository: {repository}\nPath: {x.Path}\nSymbol: {x.Symbol}\nLines: {x.StartLine}-{x.EndLine}\n{x.Content}").ToArray();
-            var vectors = await _embeddings.EmbedAsync(inputs, ct);
-            all.AddRange(batch.Zip(vectors, (chunk, vector) => (chunk, vector)));
-        }
-        await _store.ReplaceCommitAsync(repository, request.Commit, all, ct);
+        else _store.ReplaceCommit(repository, request.Commit, []);
         _logger.LogInformation("indexed {Repository}@{Commit}: {Files} files, {Chunks} chunks", repository, request.Commit, files.Count, orderedChunks.Count);
     }
 

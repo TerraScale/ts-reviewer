@@ -10,12 +10,12 @@ builder.WebHost.UseUrls(options.ListenUrl);
 builder.Services.AddSingleton(options);
 builder.Services.AddHttpClient<ForgejoClient>();
 builder.Services.AddHttpClient<ReviewEngine>();
-builder.Services.AddHttpClient<ContextEmbeddingClient>();
+builder.Services.AddSingleton<ContextEmbedder>();
 builder.Services.AddSingleton<ContextStore>();
 builder.Services.AddSingleton<ContextIndexer>(serviceProvider => new ContextIndexer(
     serviceProvider.GetRequiredService<ForgejoClient>(),
     serviceProvider.GetRequiredService<ContextStore>(),
-    serviceProvider.GetRequiredService<ContextEmbeddingClient>(),
+    serviceProvider.GetRequiredService<ContextEmbedder>(),
     serviceProvider.GetRequiredService<ReviewerOptions>(),
     serviceProvider.GetRequiredService<ILogger<ContextIndexer>>()));
 builder.Services.AddHostedService(serviceProvider => serviceProvider.GetRequiredService<ContextIndexer>());

@@ -37,6 +37,10 @@ public sealed class ForgejoClient(HttpClient http, ReviewerOptions options)
         await GetAsync<List<IssueComment>>($"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/issues/{number}/comments?limit=100", ct) ?? [];
     public Task CommentAsync(string owner, string name, int number, string body, CancellationToken ct) =>
         SendAsync(HttpMethod.Post, $"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/issues/{number}/comments", new { body }, ct);
+    public Task ReactToPullRequestAsync(string owner, string name, int number, CancellationToken ct) =>
+        SendAsync(HttpMethod.Post, $"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/issues/{number}/reactions", new { content = "eyes" }, ct);
+    public Task ReactToCommentAsync(string owner, string name, long commentId, CancellationToken ct) =>
+        SendAsync(HttpMethod.Post, $"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/issues/comments/{commentId}/reactions", new { content = "eyes" }, ct);
     public Task UpdateCommentAsync(string owner, string name, long id, string body, CancellationToken ct) =>
         SendAsync(HttpMethod.Patch, $"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/issues/comments/{id}", new { body }, ct);
     public Task ReviewAsync(string owner, string name, int number, PullReview review, CancellationToken ct) =>

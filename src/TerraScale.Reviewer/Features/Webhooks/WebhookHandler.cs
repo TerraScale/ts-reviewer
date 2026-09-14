@@ -44,9 +44,15 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, C
         var number = webhook.Number != 0 ? webhook.Number : webhook.PullRequest?.Number ?? 0;
         if (number < 1) return Results.NoContent();
         if (webhook.Action is "opened" or "synchronize" or "reopened")
+        {
+            _ = AcknowledgeAsync(repository.Owner.Login, repository.Name, number, null);
             _ = RunBoundedAsync(repository.Owner.Login, repository.Name, number);
+        }
         else if (webhook.Action == "created" && ParseCommand(webhook.Comment?.Body ?? string.Empty, options.BotLogin) is { } command)
+        {
+            _ = AcknowledgeAsync(repository.Owner.Login, repository.Name, number, webhook.Comment?.Id);
             _ = RunCommandAsync(repository.Owner.Login, repository.Name, number, command);
+        }
         return Results.Accepted();
     }
 
@@ -86,6 +92,17 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, C
                 .Append(finding.Fix.Trim()).Append("\n\n</details>\n\n");
         }
         return builder.ToString();
+    }
+
+    /// <summary>Adds a 👀 reaction to the pull request or the triggering comment so users see the bot picked it up.</summary>
+    private async Task AcknowledgeAsync(string owner, string name, int number, long? commentId)
+    {
+        try
+        {
+            if (commentId is > 0) await forgejo.ReactToCommentAsync(owner, name, commentId.Value, CancellationToken.None);
+            else await forgejo.ReactToPullRequestAsync(owner, name, number, CancellationToken.None);
+        }
+        catch (Exception ex) { logger.LogWarning(ex, "failed to acknowledge {Repository}#{Number}", owner + "/" + name, number); }
     }
 
     private async Task RunBoundedAsync(string owner, string name, int number)
@@ -138,5 +155,5 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, C
     private sealed record WebhookEvent([property: JsonPropertyName("action")] string? Action, [property: JsonPropertyName("number")] int Number, [property: JsonPropertyName("ref")] string? Ref, [property: JsonPropertyName("after")] string? After, [property: JsonPropertyName("repository")] WebhookRepository? Repository, [property: JsonPropertyName("pull_request")] WebhookPullRequest? PullRequest, [property: JsonPropertyName("comment")] WebhookComment? Comment);
     private sealed record WebhookRepository([property: JsonPropertyName("name")] string Name, [property: JsonPropertyName("owner")] Owner Owner);
     private sealed record WebhookPullRequest([property: JsonPropertyName("number")] int Number);
-    private sealed record WebhookComment([property: JsonPropertyName("body")] string Body);
+    private sealed record WebhookComment([property: JsonPropertyName("id")] long Id, [property: JsonPropertyName("body")] string Body);
 }

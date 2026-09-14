@@ -14,8 +14,7 @@
     <ContainerUser>1654</ContainerUser>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
-    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="3.0.5" />
-    <PackageReference Include="HiraokaHyperTools.sqlite-vec" Version="0.1.9" />
+    <PackageReference Include="LiteDB" Version="6.0.0-prerelease.181" />
+    <PackageReference Include="SmartComponents.LocalEmbeddings" Version="0.1.0-preview10148" />
   </ItemGroup>
 </Project>
