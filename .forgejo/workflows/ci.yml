@@ -10,6 +10,7 @@ on:
 jobs:
   ci:
     uses: TerraScale/ts-deploy/.forgejo/workflows/deploy.yml@main
+    runs-on: terrascale-builder
     with:
       repo: ts-reviewer
     secrets: inherit
