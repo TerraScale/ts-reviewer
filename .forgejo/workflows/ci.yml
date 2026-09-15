@@ -88,6 +88,10 @@ jobs:
           source_commit="${FORGEJO_SHA:?event SHA is required}"
           local_image="localhost/terrascale/ts-reviewer:${source_commit}"
           remote_image="git.terrascale.tech/terrascale/ts-reviewer:${source_commit}"
+          # The runner exports REGISTRY_AUTH_FILE as a bind-mounted file under
+          # /etc/containers; podman login rewrites its auth file via rename,
+          # which fails with EBUSY on a bind mount. Use a job-local auth file.
+          export REGISTRY_AUTH_FILE="${RUNNER_TEMP:-/tmp}/ts-reviewer-podman-auth.json"
           printf '%s\n' "${FORGEJO_TOKEN:?Forgejo job token is required}" | \
             podman login git.terrascale.tech --username terrascale-bot --password-stdin >/dev/null
           podman tag "${local_image}" "${remote_image}"
