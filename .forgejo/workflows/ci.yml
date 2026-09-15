@@ -9,9 +9,84 @@ on:
 
 jobs:
   ci:
-    name: Run ts-reviewer checks
-    uses: TerraScale/ts-deploy/.forgejo/workflows/deploy.yml@main
+    name: Check and build ts-reviewer
     runs-on: terrascale-builder
-    with:
-      repo: ts-reviewer
-    secrets: inherit
+    timeout-minutes: 30
+    env:
+      FORGEJO_SHA: ${{ forgejo.sha }}
+      NUGET_PACKAGES: ${{ runner.temp }}/ts-reviewer-nuget
+    steps:
+      - name: Check out the event revision
+        uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          github-server-url: "https://git.terrascale.tech"
+          ref: ${{ forgejo.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Restore reviewer tests
+        run: |
+          set -euo pipefail
+          mkdir -p -- "${NUGET_PACKAGES}"
+          exec nice -n 10 dotnet restore \
+            tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj \
+            --runtime linux-x64 --nologo
+
+      - name: Build reviewer tests and service
+        run: |
+          set -euo pipefail
+          exec nice -n 10 dotnet build \
+            tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj \
+            --configuration Release --no-restore --nologo
+
+      - name: Run reviewer tests
+        run: |
+          set -euo pipefail
+          exec nice -n 10 dotnet test \
+            tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj \
+            --configuration Release --no-build --no-restore --nologo -- \
+            --minimum-expected-tests 1
+
+      - name: Build and inspect the release image
+        run: |
+          set -euo pipefail
+
+          source_commit="$(git rev-parse HEAD)"
+          test "${source_commit}" = "${FORGEJO_SHA:?event SHA is required}"
+          mkdir -p -- artifacts/ci/container-publish
+          nice -n 19 dotnet publish \
+            src/TerraScale.Reviewer/TerraScale.Reviewer.csproj \
+            --configuration Release \
+            --runtime linux-x64 \
+            --self-contained true \
+            --no-restore \
+            --output artifacts/ci/container-publish \
+            --nologo \
+            -p:PublishSingleFile=true \
+            -p:IncludeNativeLibrariesForSelfExtract=true \
+            -p:DebugType=None
+          test -s artifacts/ci/container-publish/TerraScale.Reviewer
+          nice -n 19 podman build \
+            --pull=missing \
+            --platform linux/amd64 \
+            --tag "localhost/terrascale/ts-reviewer:${source_commit}" \
+            --file Containerfile .
+          image="localhost/terrascale/ts-reviewer:${source_commit}"
+          podman image inspect "${image}"
+          test "$(podman image inspect "${image}" --format '{{.Architecture}}')" = amd64
+          test "$(podman image inspect "${image}" --format '{{.Os}}')" = linux
+
+      - name: Publish immutable container on protected main
+        if: forgejo.event_name == 'push' && forgejo.ref == 'refs/heads/main'
+        env:
+          FORGEJO_TOKEN: ${{ forgejo.token }}
+        run: |
+          set -euo pipefail
+          source_commit="${FORGEJO_SHA:?event SHA is required}"
+          local_image="localhost/terrascale/ts-reviewer:${source_commit}"
+          remote_image="git.terrascale.tech/terrascale/ts-reviewer:${source_commit}"
+          printf '%s\n' "${FORGEJO_TOKEN:?Forgejo job token is required}" | \
+            podman login git.terrascale.tech --username terrascale-bot --password-stdin >/dev/null
+          podman tag "${local_image}" "${remote_image}"
+          podman push "${remote_image}"
+          podman image inspect "${remote_image}"
