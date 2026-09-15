@@ -83,6 +83,7 @@ jobs:
         if: forgejo.event_name == 'push' && forgejo.ref == 'refs/heads/main'
         env:
           FORGEJO_TOKEN: ${{ forgejo.token }}
+          TERRASCALE_BOT_TOKEN: ${{ secrets.TERRASCALE_BOT_TOKEN }}
         run: |
           set -euo pipefail
           source_commit="${FORGEJO_SHA:?event SHA is required}"
@@ -92,7 +93,10 @@ jobs:
           # /etc/containers; podman login rewrites its auth file via rename,
           # which fails with EBUSY on a bind mount. Use a job-local auth file.
           export REGISTRY_AUTH_FILE="${RUNNER_TEMP:-/tmp}/ts-reviewer-podman-auth.json"
-          printf '%s\n' "${FORGEJO_TOKEN:?Forgejo job token is required}" | \
+          # The job token authenticates but cannot write packages: the layer
+          # upload fails with 'authentication required'. The organization bot
+          # token carries the package write grant for the registry.
+          printf '%s\n' "${TERRASCALE_BOT_TOKEN:?organization bot token is required}" | \
             podman login git.terrascale.tech --username terrascale-bot --password-stdin >/dev/null
           podman tag "${local_image}" "${remote_image}"
           podman push "${remote_image}"
