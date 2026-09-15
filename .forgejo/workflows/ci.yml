@@ -14,7 +14,6 @@ jobs:
     timeout-minutes: 30
     env:
       FORGEJO_SHA: ${{ forgejo.sha }}
-      NUGET_PACKAGES: ${{ runner.temp }}/ts-reviewer-nuget
     steps:
       - name: Check out the event revision
         uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
@@ -27,6 +26,7 @@ jobs:
       - name: Restore reviewer tests
         run: |
           set -euo pipefail
+          export NUGET_PACKAGES="${RUNNER_TEMP:-/tmp}/ts-reviewer-nuget"
           mkdir -p -- "${NUGET_PACKAGES}"
           exec nice -n 10 dotnet restore \
             tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj \
@@ -35,6 +35,7 @@ jobs:
       - name: Build reviewer tests and service
         run: |
           set -euo pipefail
+          export NUGET_PACKAGES="${RUNNER_TEMP:-/tmp}/ts-reviewer-nuget"
           exec nice -n 10 dotnet build \
             tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj \
             --configuration Release --no-restore --nologo
@@ -42,6 +43,7 @@ jobs:
       - name: Run reviewer tests
         run: |
           set -euo pipefail
+          export NUGET_PACKAGES="${RUNNER_TEMP:-/tmp}/ts-reviewer-nuget"
           exec nice -n 10 dotnet test \
             tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj \
             --configuration Release --no-build --no-restore --nologo -- \
@@ -50,6 +52,7 @@ jobs:
       - name: Build and inspect the release image
         run: |
           set -euo pipefail
+          export NUGET_PACKAGES="${RUNNER_TEMP:-/tmp}/ts-reviewer-nuget"
 
           source_commit="$(git rev-parse HEAD)"
           test "${source_commit}" = "${FORGEJO_SHA:?event SHA is required}"
