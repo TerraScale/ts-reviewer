@@ -6,4 +6,7 @@ AI IS NOT ALLOWED TO EDIT THIS FILE ONLY HUMANS CAN!
 - The project must follow a feature sliced design so it is well organized and similar or dependant files and services are kept together
 
 # Libraries
-- We should use TUnit for tests
+
+## Tests
+- We MUST use TUnit for tests
+- Prefer using `dotnet run --project {project}` instead of `dotnet test` as using dotnet run for TUnit is faster
