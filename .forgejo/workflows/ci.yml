@@ -28,7 +28,7 @@ jobs:
           set -euo pipefail
           export NUGET_PACKAGES="${RUNNER_TEMP:-/tmp}/ts-reviewer-nuget"
           mkdir -p -- "${NUGET_PACKAGES}"
-          exec nice -n 10 dotnet restore \
+          exec dotnet restore \
             tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj \
             --runtime linux-x64 --nologo
 
@@ -36,7 +36,7 @@ jobs:
         run: |
           set -euo pipefail
           export NUGET_PACKAGES="${RUNNER_TEMP:-/tmp}/ts-reviewer-nuget"
-          exec nice -n 10 dotnet build \
+          exec dotnet build \
             tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj \
             --configuration Release --no-restore --nologo
 
@@ -44,7 +44,7 @@ jobs:
         run: |
           set -euo pipefail
           export NUGET_PACKAGES="${RUNNER_TEMP:-/tmp}/ts-reviewer-nuget"
-          exec nice -n 10 dotnet test \
+          exec dotnet test \
             tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj \
             --configuration Release --no-build --no-restore --nologo -- \
             --minimum-expected-tests 1
@@ -57,7 +57,7 @@ jobs:
           source_commit="$(git rev-parse HEAD)"
           test "${source_commit}" = "${FORGEJO_SHA:?event SHA is required}"
           mkdir -p -- artifacts/ci/container-publish
-          nice -n 19 dotnet publish \
+          dotnet publish \
             src/TerraScale.Reviewer/TerraScale.Reviewer.csproj \
             --configuration Release \
             --runtime linux-x64 \
@@ -69,7 +69,7 @@ jobs:
             -p:IncludeNativeLibrariesForSelfExtract=true \
             -p:DebugType=None
           test -s artifacts/ci/container-publish/TerraScale.Reviewer
-          nice -n 19 podman build \
+          podman build \
             --pull=missing \
             --platform linux/amd64 \
             --tag "localhost/terrascale/ts-reviewer:${source_commit}" \
