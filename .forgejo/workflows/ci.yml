@@ -89,6 +89,13 @@ jobs:
           source_commit="$(git rev-parse HEAD)"
           test "${source_commit}" = "${FORGEJO_SHA:?event SHA is required}"
           mkdir -p -- artifacts/ci/container-publish
+          # Re-restore the publish entrypoint with the exact RID: the runner
+          # workspace persists across runs, and a stale src obj/assets.json
+          # restored without a runtime makes publish --no-restore fail with
+          # NETSDK1047 even though the tests restore touched the project.
+          dotnet restore \
+            src/TerraScale.Reviewer/TerraScale.Reviewer.csproj \
+            --runtime linux-x64 --nologo
           dotnet publish \
             src/TerraScale.Reviewer/TerraScale.Reviewer.csproj \
             --configuration Release \
