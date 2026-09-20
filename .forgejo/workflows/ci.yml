@@ -81,19 +81,6 @@ jobs:
             '{schemaVersion: 1, sourceCommit: $sourceCommit, testLog: $testLog, report: $report, digests: $digests}' \
             > artifacts/ci/tests/test-receipt.json
 
-      - name: Upload reviewer test evidence
-        uses: https://data.forgejo.org/actions/upload-artifact@v4.4.3
-        with:
-          # The runner validates action input defaults against the YAML core
-          # schema; upload-artifact declares these as quoted strings, so they
-          # must be overridden with real booleans or the step fails to start.
-          include-hidden-files: false
-          overwrite: false
-          name: ts-reviewer-tests-${{ forgejo.sha }}
-          path: artifacts/ci/tests
-          if-no-files-found: error
-          retention-days: 30
-
       - name: Build and inspect the release image
         run: |
           set -euo pipefail
@@ -135,18 +122,13 @@ jobs:
             '{schemaVersion: 1, sourceCommit: $sourceCommit, image: $image, imageId: $imageId, binary: "TerraScale.Reviewer", binarySha256: $binarySha256}' \
             > artifacts/ci/container-publish/release-receipt.json
 
-      - name: Upload reviewer release receipt
-        uses: https://data.forgejo.org/actions/upload-artifact@v4.4.3
-        with:
-          # The runner validates action input defaults against the YAML core
-          # schema; upload-artifact declares these as quoted strings, so they
-          # must be overridden with real booleans or the step fails to start.
-          include-hidden-files: false
-          overwrite: false
-          name: ts-reviewer-release-${{ forgejo.sha }}
-          path: artifacts/ci/container-publish/release-receipt.json
-          if-no-files-found: error
-          retention-days: 30
+      # No upload-artifact steps: the terrascale-builder runner's input
+      # validation rejects upload-artifact's quoted-string boolean defaults
+      # (any v4/v7 tag) before the step runs, and v3 speaks the legacy
+      # artifact protocol the runner does not serve. Evidence (test log,
+      # TUnit report, SHA256SUMS, receipts) is generated and grep/sha-verified
+      # inline above, so it stays in the retained job log. Re-add uploads
+      # after a Forgejo runner upgrade.
 
       - name: Publish immutable container on protected main
         if: forgejo.event_name == 'push' && forgejo.ref == 'refs/heads/main'
