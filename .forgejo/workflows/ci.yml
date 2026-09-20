@@ -84,6 +84,11 @@ jobs:
       - name: Upload reviewer test evidence
         uses: https://data.forgejo.org/actions/upload-artifact@v4.4.3
         with:
+          # The runner validates action input defaults against the YAML core
+          # schema; upload-artifact declares these as quoted strings, so they
+          # must be overridden with real booleans or the step fails to start.
+          include-hidden-files: false
+          overwrite: false
           name: ts-reviewer-tests-${{ forgejo.sha }}
           path: artifacts/ci/tests
           if-no-files-found: error
@@ -133,6 +138,11 @@ jobs:
       - name: Upload reviewer release receipt
         uses: https://data.forgejo.org/actions/upload-artifact@v4.4.3
         with:
+          # The runner validates action input defaults against the YAML core
+          # schema; upload-artifact declares these as quoted strings, so they
+          # must be overridden with real booleans or the step fails to start.
+          include-hidden-files: false
+          overwrite: false
           name: ts-reviewer-release-${{ forgejo.sha }}
           path: artifacts/ci/container-publish/release-receipt.json
           if-no-files-found: error
