@@ -19,8 +19,6 @@ public sealed record ReviewComment([property: JsonPropertyName("body")] string B
     [property: JsonPropertyName("extra_lines_count")] int ExtraLines = 0);
 public sealed record PullReview([property: JsonPropertyName("body")] string Body, [property: JsonPropertyName("event")] string Event,
     [property: JsonPropertyName("commit_id")] string CommitId, [property: JsonPropertyName("comments")] IReadOnlyList<ReviewComment>? Comments = null);
-public sealed record ForgejoIssue([property: JsonPropertyName("number")] int Number, [property: JsonPropertyName("title")] string Title,
-    [property: JsonPropertyName("body")] string Body);
 public sealed record CommitStatus([property: JsonPropertyName("state")] string State, [property: JsonPropertyName("target_url")] string? TargetUrl,
     [property: JsonPropertyName("description")] string Description, [property: JsonPropertyName("context")] string Context);
 

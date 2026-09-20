@@ -9,10 +9,7 @@ public sealed record Finding(
     [property: JsonPropertyName("body")] string Body,
     [property: JsonPropertyName("fix")] string Fix,
     [property: JsonPropertyName("path")] string Path,
-    [property: JsonPropertyName("line")] int Line,
-    [property: JsonPropertyName("confidence")] double Confidence,
-    [property: JsonPropertyName("unrelated")] bool Unrelated,
-    [property: JsonPropertyName("owning_repository")] string OwningRepository);
+    [property: JsonPropertyName("line")] int Line);
 
 public sealed record ReviewResult
 {

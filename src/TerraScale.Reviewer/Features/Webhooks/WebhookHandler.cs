@@ -28,7 +28,7 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, C
         }
         if (body.Length > MaxPayloadBytes) return Results.BadRequest("invalid payload");
         var payload = body.ToArray();
-        if (!string.IsNullOrEmpty(options.WebhookSecret) && !ValidSignature(payload, request.Headers["X-Forgejo-Signature"].ToString(), options.WebhookSecret))
+        if (!ValidSignature(payload, request.Headers["X-Forgejo-Signature"].ToString(), options.WebhookSecret))
             return Results.Unauthorized();
         WebhookEvent? webhook;
         try { webhook = JsonSerializer.Deserialize<WebhookEvent>(payload); }
@@ -58,6 +58,7 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, C
 
     public static bool ValidSignature(ReadOnlySpan<byte> body, string signature, string secret)
     {
+        if (string.IsNullOrWhiteSpace(secret)) return false;
         signature = signature.StartsWith("sha256=", StringComparison.Ordinal) ? signature[7..] : signature;
         try
         {
@@ -73,13 +74,14 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, C
         var words = body.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         var mention = "@" + bot.ToLowerInvariant();
         for (var i = 0; i + 1 < words.Length; i++)
-            if (string.Equals(words[i], mention, StringComparison.OrdinalIgnoreCase) && words[i + 1].ToLowerInvariant() is "review" or "recheck" or "explain" or "dismiss") return words[i + 1].ToLowerInvariant();
+            if (string.Equals(words[i], mention, StringComparison.OrdinalIgnoreCase) && words[i + 1].ToLowerInvariant() is "review" or "recheck" or "explain" or "dismiss" or "escalate") return words[i + 1].ToLowerInvariant();
         return null;
     }
 
-    public static string Format(PullRequest pr, ReviewResult result)
+    public static string Format(PullRequest pr, ReviewResult result, string? model = null)
     {
-        var builder = new StringBuilder($"<!-- ts-reviewer:{pr.Head.Sha} -->\n## ts-reviewer review\n\n### Summary\n\n{result.Summary.Trim()}\n\n");
+        var header = model is null ? "## ts-reviewer review" : $"## ts-reviewer review · model `{model}`";
+        var builder = new StringBuilder($"<!-- ts-reviewer:{pr.Head.Sha} -->\n{header}\n\n### Summary\n\n{result.Summary.Trim()}\n\n");
         if (result.Findings.Count == 0) return builder.Append("### Result\n\n✅ No evidence-backed findings met the reporting threshold.\n").ToString();
 
         builder.Append("### Findings (").Append(result.Findings.Count).Append(")\n\n");
@@ -105,18 +107,18 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, C
         catch (Exception ex) { logger.LogWarning(ex, "failed to acknowledge {Repository}#{Number}", owner + "/" + name, number); }
     }
 
-    private async Task RunBoundedAsync(string owner, string name, int number)
+    private async Task RunBoundedAsync(string owner, string name, int number, string? model = null)
     {
         await _slots.WaitAsync();
-        try { await ReviewAsync(owner, name, number); }
+        try { await ReviewAsync(owner, name, number, model); }
         catch (Exception ex) { logger.LogError(ex, "review failed for {Repository}#{Number}", owner + "/" + name, number); }
         finally { _slots.Release(); }
     }
-    private async Task ReviewAsync(string owner, string name, int number)
+    private async Task ReviewAsync(string owner, string name, int number, string? model = null)
     {
         using var timeout = new CancellationTokenSource(options.ReviewTimeout);
         var ct = timeout.Token;
-        logger.LogInformation("review started for {Repository}#{Number}", owner + "/" + name, number);
+        logger.LogInformation("review started for {Repository}#{Number} with model {Model}", owner + "/" + name, number, model ?? options.Model);
         var pr = await forgejo.PullAsync(owner, name, number, ct) ?? throw new InvalidOperationException("pull request not found");
         var files = await forgejo.FilesAsync(owner, name, number, ct);
         string raw;
@@ -125,13 +127,12 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, C
         var parsed = UnifiedDiff.Parse(raw);
         if (parsed.Count > 0) files = parsed;
         ReviewResult result;
-        try { result = await engine.RunAsync(pr, files, ct); }
+        try { result = await engine.RunAsync(pr, ct, model); }
         catch (Exception ex) { await FailStatusAsync(owner, name, pr.Head.Sha, "review incomplete: " + ex.Message); return; }
         var latest = await forgejo.PullAsync(owner, name, number, ct);
         if (latest is null || !string.Equals(latest.Head.Sha, pr.Head.Sha, StringComparison.OrdinalIgnoreCase)) { logger.LogInformation("review discarded as stale for {Repository}#{Number}", owner + "/" + name, number); return; }
         var critical = result.Findings.Any(x => x.Severity is "critical" or "high");
-        foreach (var finding in result.Findings.Where(x => x.Unrelated && !string.IsNullOrWhiteSpace(x.OwningRepository))) await FileIssueAsync(finding, ct);
-        var body = Format(pr, result);
+        var body = Format(pr, result, model ?? options.Model);
         var existing = await forgejo.CommentsAsync(owner, name, number, ct);
         var updated = false;
         foreach (var comment in existing.Where(x => string.Equals(x.User.Login, options.BotLogin, StringComparison.OrdinalIgnoreCase) && x.Body.StartsWith("<!-- ts-reviewer:", StringComparison.Ordinal)))
@@ -148,9 +149,7 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, C
     private async Task FailStatusAsync(string owner, string name, string sha, string description)
     { using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15)); try { await forgejo.StatusAsync(owner, name, sha, new CommitStatus("error", null, description, "ts-reviewer"), timeout.Token); } catch (Exception ex) { logger.LogError(ex, "publish failed review status"); } }
     private async Task RunCommandAsync(string owner, string name, int number, string command)
-    { try { if (command is "review" or "recheck") await RunBoundedAsync(owner, name, number); else if (command == "explain") await forgejo.CommentAsync(owner, name, number, $"ts-reviewer: the latest evidence and suggested fix are in the marked review comment. Use `@{options.BotLogin} recheck` after pushing a correction.", CancellationToken.None); else if (command == "dismiss") await forgejo.CommentAsync(owner, name, number, "ts-reviewer: dismissals require a maintainer workflow and are not accepted from an unverified comment.", CancellationToken.None); } catch (Exception ex) { logger.LogError(ex, "command failed"); } }
-    private async Task FileIssueAsync(Finding finding, CancellationToken ct)
-    { var parts = finding.OwningRepository.Split('/', 2); if (parts.Length != 2 || !string.Equals(parts[0], options.Organization, StringComparison.OrdinalIgnoreCase)) return; var issues = await forgejo.IssuesAsync(parts[0], parts[1], ct); var marker = "<!-- ts-reviewer:" + finding.Id + " -->"; if (issues.Any(x => x.Body.Contains(marker, StringComparison.Ordinal))) return; await forgejo.CreateIssueAsync(parts[0], parts[1], "[ts-reviewer] " + finding.Title, marker + "\n\n" + finding.Body + "\n\n**Suggested fix:** " + finding.Fix, null, ct); }
+    { try { if (command is "review" or "recheck") await RunBoundedAsync(owner, name, number); else if (command == "escalate") await RunBoundedAsync(owner, name, number, options.EscalationModel); else if (command == "explain") await forgejo.CommentAsync(owner, name, number, $"ts-reviewer: the latest evidence and suggested fix are in the marked review comment. Use `@{options.BotLogin} recheck` after pushing a correction or `@{options.BotLogin} escalate` to re-review with {options.EscalationModel}.", CancellationToken.None); else if (command == "dismiss") await forgejo.CommentAsync(owner, name, number, "ts-reviewer: dismissals require a maintainer workflow and are not accepted from an unverified comment.", CancellationToken.None); } catch (Exception ex) { logger.LogError(ex, "command failed"); } }
 
     private sealed record WebhookEvent([property: JsonPropertyName("action")] string? Action, [property: JsonPropertyName("number")] int Number, [property: JsonPropertyName("ref")] string? Ref, [property: JsonPropertyName("after")] string? After, [property: JsonPropertyName("repository")] WebhookRepository? Repository, [property: JsonPropertyName("pull_request")] WebhookPullRequest? PullRequest, [property: JsonPropertyName("comment")] WebhookComment? Comment);
     private sealed record WebhookRepository([property: JsonPropertyName("name")] string Name, [property: JsonPropertyName("owner")] Owner Owner);

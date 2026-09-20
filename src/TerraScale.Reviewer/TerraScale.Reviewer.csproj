@@ -14,7 +14,7 @@
     <ContainerUser>1654</ContainerUser>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="LiteDB" Version="6.0.0-prerelease.181" />
+    <PackageReference Include="LiteDB" Version="6.0.0-prerelease.289" />
     <PackageReference Include="SmartComponents.LocalEmbeddings" Version="0.1.0-preview10148" />
   </ItemGroup>
 </Project>

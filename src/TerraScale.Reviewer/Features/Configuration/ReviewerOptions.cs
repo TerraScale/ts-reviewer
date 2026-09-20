@@ -3,8 +3,12 @@ namespace TerraScale.Reviewer.Features.Configuration;
 public sealed record ReviewerOptions(
     string ListenUrl, string ForgejoUrl, string ForgejoToken, string ProxyUrl, string ProxyToken,
     string Model, string Organization, string BotLogin, int MaxConcurrent, TimeSpan ReviewTimeout,
-    long MaxDiffBytes, string WebhookSecret, string ContextApiToken, string ContextDatabasePath, int ContextMaxFiles)
+    string WebhookSecret, string ContextApiToken, string ContextDatabasePath, int ContextMaxFiles,
+    int ContextMaxAttempts = 5, TimeSpan? ContextRetryBaseDelay = null, string OperatorToken = "",
+    string EscalationModel = "gpt-6-astra")
 {
+    public TimeSpan ContextRetryDelay => ContextRetryBaseDelay ?? TimeSpan.FromSeconds(1);
+
     public static ReviewerOptions Load(string[] args)
     {
         var values = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
@@ -14,16 +18,19 @@ public sealed record ReviewerOptions(
             ["forgejo-token"] = Environment.GetEnvironmentVariable("TS_REVIEWER_FORGEJO_TOKEN"),
             ["proxy-url"] = Environment.GetEnvironmentVariable("TS_REVIEWER_PROXY_URL") ?? "http://10.11.99.1:8317/v1",
             ["proxy-token"] = Environment.GetEnvironmentVariable("TS_REVIEWER_PROXY_TOKEN"),
-            ["model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_MODEL") ?? "glm-5.3-flash",
+            ["model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_MODEL") ?? "glm-5.3",
+            ["escalation-model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_ESCALATION_MODEL") ?? "gpt-6-astra",
             ["organization"] = Environment.GetEnvironmentVariable("TS_REVIEWER_ORGANIZATION") ?? "TerraScale",
             ["bot-login"] = Environment.GetEnvironmentVariable("TS_REVIEWER_BOT_LOGIN") ?? "terrascale-bot",
             ["max-concurrent"] = Environment.GetEnvironmentVariable("TS_REVIEWER_MAX_CONCURRENT") ?? "10",
             ["timeout"] = Environment.GetEnvironmentVariable("TS_REVIEWER_TIMEOUT") ?? "00:10:00",
-            ["max-diff-bytes"] = Environment.GetEnvironmentVariable("TS_REVIEWER_MAX_DIFF_BYTES") ?? (8L * 1024 * 1024).ToString(),
             ["webhook-secret"] = Environment.GetEnvironmentVariable("TS_REVIEWER_WEBHOOK_SECRET") ?? string.Empty,
             ["context-api-token"] = Environment.GetEnvironmentVariable("TS_REVIEWER_CONTEXT_API_TOKEN") ?? string.Empty,
             ["context-database"] = Environment.GetEnvironmentVariable("TS_REVIEWER_CONTEXT_DATABASE") ?? "data/reviewer-context.db",
-            ["context-max-files"] = Environment.GetEnvironmentVariable("TS_REVIEWER_CONTEXT_MAX_FILES") ?? "20000"
+            ["context-max-files"] = Environment.GetEnvironmentVariable("TS_REVIEWER_CONTEXT_MAX_FILES") ?? "20000",
+            ["context-max-attempts"] = Environment.GetEnvironmentVariable("TS_REVIEWER_CONTEXT_MAX_ATTEMPTS") ?? "5",
+            ["context-retry-base-delay"] = Environment.GetEnvironmentVariable("TS_REVIEWER_CONTEXT_RETRY_BASE_DELAY") ?? "00:00:01",
+            ["operator-token"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OPERATOR_TOKEN") ?? string.Empty
         };
         foreach (var arg in args)
         {
@@ -33,23 +40,28 @@ public sealed record ReviewerOptions(
         }
         var forgejoToken = Required(values, "forgejo-token", "TS_REVIEWER_FORGEJO_TOKEN");
         var proxyToken = Required(values, "proxy-token", "TS_REVIEWER_PROXY_TOKEN");
+        var webhookSecret = Required(values, "webhook-secret", "TS_REVIEWER_WEBHOOK_SECRET");
+        var contextApiToken = Required(values, "context-api-token", "TS_REVIEWER_CONTEXT_API_TOKEN");
+        var operatorToken = Required(values, "operator-token", "TS_REVIEWER_OPERATOR_TOKEN");
         var maxConcurrent = ParseInt(values, "max-concurrent");
         if (maxConcurrent is < 1 or > 100) throw new InvalidOperationException("max-concurrent must be between 1 and 100");
-        var maxDiffBytes = ParseLong(values, "max-diff-bytes");
-        if (maxDiffBytes <= 0) throw new InvalidOperationException("max-diff-bytes must be positive");
         if (!TimeSpan.TryParse(values["timeout"], out var reviewTimeout) || reviewTimeout <= TimeSpan.Zero)
             throw new InvalidOperationException("timeout must be positive");
         var contextMaxFiles = ParseInt(values, "context-max-files");
         if (contextMaxFiles is < 1 or > 100_000) throw new InvalidOperationException("context-max-files must be between 1 and 100000");
+        var contextMaxAttempts = ParseInt(values, "context-max-attempts");
+        if (contextMaxAttempts is < 1 or > 100) throw new InvalidOperationException("context-max-attempts must be between 1 and 100");
+        if (!TimeSpan.TryParse(values["context-retry-base-delay"], out var contextRetryBaseDelay)
+            || contextRetryBaseDelay <= TimeSpan.Zero || contextRetryBaseDelay > TimeSpan.FromMinutes(1))
+            throw new InvalidOperationException("context-retry-base-delay must be positive and at most one minute");
         return new ReviewerOptions(Trim(values["listen"]!), Trim(values["forgejo-url"]!), forgejoToken,
             Trim(values["proxy-url"]!), proxyToken, values["model"]!, values["organization"]!, values["bot-login"]!,
-            maxConcurrent, reviewTimeout, maxDiffBytes, values["webhook-secret"]!, values["context-api-token"]!, values["context-database"]!, contextMaxFiles);
+            maxConcurrent, reviewTimeout, webhookSecret, contextApiToken, values["context-database"]!, contextMaxFiles,
+            contextMaxAttempts, contextRetryBaseDelay, operatorToken, values["escalation-model"]!);
     }
     private static string Required(IReadOnlyDictionary<string, string?> values, string key, string environmentName) =>
         string.IsNullOrWhiteSpace(values[key]) ? throw new InvalidOperationException($"{environmentName} is required") : values[key]!;
     private static int ParseInt(IReadOnlyDictionary<string, string?> values, string key) =>
         int.TryParse(values[key], out var result) ? result : throw new InvalidOperationException($"{key} must be an integer");
-    private static long ParseLong(IReadOnlyDictionary<string, string?> values, string key) =>
-        long.TryParse(values[key], out var result) ? result : throw new InvalidOperationException($"{key} must be an integer");
     private static string Trim(string value) => value.TrimEnd('/');
 }

@@ -1,97 +1,196 @@
-using System.Net.Http.Headers;
-using System.Text;
+using System.ComponentModel;
+using System.Diagnostics;
 using System.Text.Json;
-using System.Text.RegularExpressions;
+using System.Text.Json.Serialization;
 using TerraScale.Reviewer.Features.Configuration;
-using TerraScale.Reviewer.Features.Context;
 using TerraScale.Reviewer.Features.Forgejo;
 
 namespace TerraScale.Reviewer.Features.Review;
 
-public sealed class ReviewEngine(HttpClient http, ReviewerOptions options, ContextIndexer context, ILogger<ReviewEngine> logger)
+/// <summary>
+/// Runs reviews through the OpenCodeReview CLI (alibaba/open-code-review).
+/// Each review clones the pull request, configures ocr's OpenAI-compatible
+/// endpoint through <c>OCR_LLM_*</c> environment variables pointing at the
+/// CLIProxy endpoint, invokes <c>ocr review</c> over the exact base..head
+/// range, and maps the returned comments to <see cref="Finding"/> records.
+/// </summary>
+public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> logger, string? ocrPath = null)
 {
-    private static readonly Regex FencedJson = new("```(?:json)?\\s*(.*?)```", RegexOptions.Singleline | RegexOptions.Compiled);
-    private readonly HttpClient _http = Configure(http, options);
-    private readonly ReviewerOptions _options = options;
-    private static HttpClient Configure(HttpClient client, ReviewerOptions options)
-    {
-        client.BaseAddress = new Uri(options.ProxyUrl + "/");
-        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", options.ProxyToken);
-        return client;
-    }
+    private readonly string _ocrPath = ocrPath ?? "ocr";
 
-    public async Task<ReviewResult> RunAsync(PullRequest pr, IReadOnlyList<ChangedFile> files, CancellationToken ct)
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+
+    public async Task<ReviewResult> RunAsync(PullRequest pr, CancellationToken ct, string? model = null)
     {
-        var diff = new StringBuilder();
-        foreach (var file in files)
-            diff.Append("FILE ").Append(file.Filename).Append(" (").Append(file.Status).Append(" +").Append(file.Additions).Append(" -").Append(file.Deletions).Append(")\n").Append(file.Patch).Append("\n\n");
-        if (Encoding.UTF8.GetByteCount(diff.ToString()) > _options.MaxDiffBytes) throw new InvalidOperationException("pull request diff exceeds review limit");
-        var repository = pr.Head.Repo.Owner.Login + "/" + pr.Head.Repo.Name;
-        var contextText = string.Empty;
+        var root = Path.Combine(Path.GetTempPath(), "ts-reviewer-" + Guid.NewGuid().ToString("N"));
+        var home = Path.Combine(root, "home");
+        var repository = Path.Combine(root, "repo");
+        var cloneUrl = $"{options.ForgejoUrl}/{pr.Head.Repo.Owner.Login}/{pr.Head.Repo.Name}.git";
+        Directory.CreateDirectory(home);
         try
         {
-            await context.EnsureIndexedAsync(pr.Head.Repo.Owner.Login, pr.Head.Repo.Name, pr.Head.Sha, ct);
-            var hits = await context.SearchAsync(new ContextSearchRequest(repository, pr.Head.Sha, pr.Title + "\n" + string.Join('\n', files.Select(x => x.Filename)), 12), ct);
-            contextText = string.Join("\n\n", hits.Results.Select((hit, index) => $"CONTEXT [{index + 1}] {hit.Repository}:{hit.Path}:{hit.StartLine}-{hit.EndLine} ({hit.Symbol})\n{hit.Content}"));
+            // Full (non-partial) clone: partial clones lean on promisor
+            // blob fetches that a misconfigured server rejects mid-review.
+            // --single-branch keeps only the default branch's objects; base
+            // and head arrive via the explicit refspec fetch below. The
+            // clone is ephemeral per-review disk — the biggest org repo
+            // (TerraBase) packs ~1.1 GiB, bounded by MaxConcurrent reviews.
+            await RunGitAsync(home, root, ct, "clone", "--quiet", "--no-checkout", "--single-branch", cloneUrl, repository);
+            await RunGitAsync(home, repository, ct, "fetch", "--quiet", "--no-tags", "origin",
+                $"+refs/heads/{pr.Base.Ref}:refs/base", $"+refs/pull/{pr.Number}/head:refs/pr-head");
+            var head = (await RunGitAsync(home, repository, ct, "rev-parse", "refs/pr-head")).Trim();
+            var @base = (await RunGitAsync(home, repository, ct, "rev-parse", "refs/base")).Trim();
+            if (!string.Equals(head, pr.Head.Sha, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("pull request head moved before the review started");
+            await RunGitAsync(home, repository, ct, "checkout", "--quiet", "--detach", head);
+            var output = Path.Combine(root, "review.json");
+            // ocr's --timeout bounds each concurrent subtask, not the whole
+            // run; the outer ReviewTimeout deadline is the hard backstop and
+            // a review that outlives it fails like any other engine error.
+            await RunOcrAsync(home, repository, model,
+                ["review", "--from", @base, "--to", head, "--concurrency", options.MaxConcurrent.ToString(),
+                 "--timeout", "5", "--format", "json", "--audience", "agent", "--color", "never", "--output", output], ct);
+            var review = JsonSerializer.Deserialize<OcrReview>(await File.ReadAllTextAsync(output, ct), JsonOptions)
+                ?? throw new InvalidOperationException("ocr returned no review");
+            var result = Map(review.Comments ?? []);
+            if (!string.Equals(review.Status, "complete", StringComparison.OrdinalIgnoreCase))
+            {
+                if (result.Findings.Count == 0) throw new InvalidOperationException($"ocr review failed: {review.Message}");
+                logger.LogWarning("ocr review finished {Status} for {CloneUrl}: {Message}", review.Status, cloneUrl, review.Message);
+                result = result with { Summary = result.Summary + " (partial review: some review groups failed — re-run for full coverage)" };
+            }
+            return result;
         }
-        catch (Exception ex) { logger.LogWarning(ex, "repository context unavailable for {Repository}@{Commit}", repository, pr.Head.Sha); }
-        var passes = new[] { "correctness, data integrity, concurrency, and error handling", "security, authorization, secret exposure, and injection", "API contracts, migrations, compatibility, and operational behavior", "tests, observability, failure recovery, and adversarial edge cases" };
-        using var semaphore = new SemaphoreSlim(Math.Max(1, _options.MaxConcurrent));
-        var tasks = passes.Select(async focus => { await semaphore.WaitAsync(ct); try { return await PassAsync(pr, diff.ToString(), contextText, focus, ct); } finally { semaphore.Release(); } });
-        var results = await Task.WhenAll(tasks);
-        var reviewed = await AdversarialPassAsync(Merge(results), diff.ToString(), ct);
-        return reviewed with { Summary = BuildSummary(reviewed.Findings) };
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+        }
     }
 
-    private async Task<ReviewResult> PassAsync(PullRequest pr, string diff, string contextText, string focus, CancellationToken ct)
-    {
-        var prompt = $"You are a severe senior reviewer. Review only the supplied patch. Use repository context only to trace callers, contracts, and invariants; never treat it as proof that a changed line is wrong. Do not invent files, APIs, runtime behavior, or vulnerabilities. Report only actionable findings supported by patch evidence. A finding must include an exact changed path and 1-based line when possible, impact, and a concrete fix or test. Severity is critical, high, medium, or low. Use unrelated=true only when the defect is proven independent of this patch; include owning_repository only then. Return JSON only: {{\"summary\":string,\"findings\":[{{\"id\":string,\"severity\":string,\"title\":string,\"body\":string,\"fix\":string,\"path\":string,\"line\":number,\"confidence\":number,\"unrelated\":boolean,\"owning_repository\":string}}]}}. Focus: {focus}\nPR: {pr.Title}\nPATCH:\n{diff}\nREPOSITORY CONTEXT:\n{contextText}";
-        return await ChatAsync(prompt, ct);
-    }
-    private async Task<ReviewResult> AdversarialPassAsync(ReviewResult candidates, string diff, CancellationToken ct)
-    {
-        var payload = JsonSerializer.Serialize(candidates);
-        var prompt = $"Act as the final adversarial reviewer. The candidate findings below came from several passes. Remove anything unsupported by the patch, duplicate, speculative, or merely stylistic. Preserve concrete correctness, security, data-integrity, and operational defects. Never invent a path or line. Return the same JSON schema and JSON only. Candidate findings: {payload}\nPATCH EVIDENCE:\n{diff}";
-        return Merge([await ChatAsync(prompt, ct)]);
-    }
-    private async Task<ReviewResult> ChatAsync(string prompt, CancellationToken ct)
-    {
-        var request = new { model = _options.Model, temperature = 0.1, max_tokens = 12000, messages = new[] { new { role = "system", content = "You are a code-review engine. Follow the requested JSON schema exactly." }, new { role = "user", content = prompt } } };
-        using var response = await _http.PostAsJsonAsync("chat/completions", request, ct);
-        var raw = await response.Content.ReadAsStringAsync(ct);
-        if (!response.IsSuccessStatusCode) throw new HttpRequestException($"cliproxy status {(int)response.StatusCode}: {raw.Trim()}");
-        using var document = JsonDocument.Parse(raw);
-        var content = document.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString()?.Trim();
-        if (string.IsNullOrWhiteSpace(content)) throw new InvalidOperationException("cliproxy returned no choices");
-        var fenced = FencedJson.Match(content);
-        if (fenced.Success) content = fenced.Groups[1].Value.Trim();
-        return JsonSerializer.Deserialize<ReviewResult>(content) ?? throw new JsonException("review JSON was empty");
-    }
-
-    public static ReviewResult Merge(IEnumerable<ReviewResult> results)
+    internal static ReviewResult Map(IReadOnlyList<OcrComment> comments)
     {
         var findings = new List<Finding>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var result in results)
+        foreach (var comment in comments)
         {
-            foreach (var finding in result.Findings)
-            {
-                var id = string.IsNullOrWhiteSpace(finding.Id) ? $"{finding.Path}:{finding.Line}:{finding.Title}" : finding.Id;
-                if (finding.Confidence < 0.72 || !seen.Add(id + finding.Path + finding.Line)) continue;
-                findings.Add(finding with { Id = id });
-            }
+            if (string.IsNullOrWhiteSpace(comment.Path) || string.IsNullOrWhiteSpace(comment.Content)) continue;
+            var severity = (comment.Severity ?? string.Empty).Trim().ToLowerInvariant();
+            if (severity.Length == 0) severity = "medium";
+            var id = comment.Path + ":" + comment.StartLine + ":" + comment.Content.GetHashCode(StringComparison.OrdinalIgnoreCase);
+            if (!seen.Add(id)) continue;
+            findings.Add(new Finding(id, severity, Title(comment.Content), comment.Content.Trim(), Fix(comment.SuggestionCode), comment.Path, comment.StartLine));
         }
         return new ReviewResult(BuildSummary(findings), findings);
     }
 
-    private static string BuildSummary(IReadOnlyCollection<Finding> findings)
+    private static string Title(string content)
     {
-        if (findings.Count == 0) return "The patch passed the evidence threshold with no actionable findings.";
+        var text = content.Trim();
+        var line = text.Split('\n', 2)[0].Trim();
+        if (line.Contains('.'))
+        {
+            var sentence = line.Split('.', 2)[0];
+            if (sentence.Length >= 20) line = sentence.TrimEnd() + ".";
+        }
+        if (line.Length <= 90) return line;
+        // Never split a UTF-16 surrogate pair at the cut.
+        var cut = 90;
+        if (char.IsHighSurrogate(line[cut - 1])) cut--;
+        return line[..cut].TrimEnd() + "…";
+    }
 
+    private static string Fix(string? suggestion) =>
+        string.IsNullOrWhiteSpace(suggestion) ? string.Empty : $"```\n{suggestion.Trim()}\n```";
+
+    internal static string BuildSummary(IReadOnlyCollection<Finding> findings)
+    {
+        if (findings.Count == 0) return "The patch passed the review with no actionable findings.";
         var counts = findings
             .GroupBy(finding => finding.Severity.Trim().ToLowerInvariant())
             .OrderBy(group => group.Key)
             .Select(group => $"{group.Count()} {group.Key}");
         return $"Found {findings.Count} actionable finding(s): {string.Join(", ", counts)}.";
     }
+
+    private Task<string> RunGitAsync(string home, string working, CancellationToken ct, params string[] arguments) =>
+        RunAsync("git", working, environment =>
+        {
+            // The Forgejo token rides in git's environment config, never in
+            // argv or on disk, so clones and fetches authenticate without
+            // leaking the credential to the process list or .git/config.
+            // HOME points at the empty per-review scratch dir, so no global
+            // git config (e.g. a planted /tmp/.gitconfig) is ever read.
+            environment["HOME"] = home;
+            environment["GIT_TERMINAL_PROMPT"] = "0";
+            environment["GIT_CONFIG_COUNT"] = "1";
+            environment["GIT_CONFIG_KEY_0"] = "http.extraHeader";
+            environment["GIT_CONFIG_VALUE_0"] = "Authorization: token " + options.ForgejoToken;
+        }, ct, arguments);
+
+    private Task<string> RunOcrAsync(string home, string repository, string? model, string[] arguments, CancellationToken ct) =>
+        RunAsync(_ocrPath, repository, environment =>
+        {
+            // ocr's env-only endpoint configuration (OCR_LLM_*): with no
+            // ~/.opencodereview/config.json in the scratch HOME, these four
+            // variables point it at the CLIProxy OpenAI-compatible endpoint
+            // and the proxy token never lands on disk. A command-triggered
+            // escalation swaps the model on the same endpoint.
+            environment["HOME"] = home;
+            environment["OCR_LLM_URL"] = options.ProxyUrl;
+            environment["OCR_LLM_TOKEN"] = options.ProxyToken;
+            environment["OCR_LLM_MODEL"] = model ?? options.Model;
+            environment["OCR_LLM_PROTOCOL"] = "openai";
+            environment["OCR_ENABLE_TELEMETRY"] = "false";
+        }, ct, arguments);
+
+    private static async Task<string> RunAsync(string fileName, string workingDirectory, Action<IDictionary<string, string?>> configureEnvironment, CancellationToken ct, string[] arguments)
+    {
+        using var process = new Process
+        {
+            StartInfo = new ProcessStartInfo
+            {
+                FileName = fileName,
+                WorkingDirectory = workingDirectory,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+            },
+        };
+        foreach (var argument in arguments) process.StartInfo.ArgumentList.Add(argument);
+        configureEnvironment(process.StartInfo.Environment);
+        process.Start();
+        var stdout = process.StandardOutput.ReadToEndAsync(ct);
+        var stderr = process.StandardError.ReadToEndAsync(ct);
+        using var registration = ct.Register(() => { try { process.Kill(entireProcessTree: true); } catch (InvalidOperationException) { } catch (Win32Exception) { } });
+        await process.WaitForExitAsync(ct);
+        var error = await stderr;
+        if (process.ExitCode != 0)
+            throw new InvalidOperationException($"{fileName} failed with exit code {process.ExitCode}: {Truncate(error)}");
+        return await stdout;
+    }
+
+    private static string Truncate(string value) => value.Length <= 500 ? value : value[^500..];
+}
+
+public sealed record OcrComment(
+    [property: JsonPropertyName("path")] string? Path,
+    [property: JsonPropertyName("content")] string? Content,
+    [property: JsonPropertyName("suggestion_code")] string? SuggestionCode,
+    [property: JsonPropertyName("existing_code")] string? ExistingCode,
+    [property: JsonPropertyName("start_line")] int StartLine,
+    [property: JsonPropertyName("end_line")] int EndLine,
+    [property: JsonPropertyName("category")] string? Category,
+    [property: JsonPropertyName("severity")] string? Severity);
+
+public sealed record OcrReview
+{
+    [JsonPropertyName("status")]
+    public string? Status { get; init; }
+
+    [JsonPropertyName("message")]
+    public string? Message { get; init; }
+
+    [JsonPropertyName("comments")]
+    public IReadOnlyList<OcrComment>? Comments { get; init; }
 }

@@ -47,10 +47,6 @@ public sealed class ForgejoClient(HttpClient http, ReviewerOptions options)
         SendAsync(HttpMethod.Post, $"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/pulls/{number}/reviews", review, ct);
     public Task StatusAsync(string owner, string name, string sha, CommitStatus status, CancellationToken ct) =>
         SendAsync(HttpMethod.Post, $"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/statuses/{Uri.EscapeDataString(sha)}", status, ct);
-    public async Task<ForgejoIssue?> CreateIssueAsync(string owner, string name, string title, string body, IReadOnlyList<int>? labels, CancellationToken ct) =>
-        await SendAsync<ForgejoIssue>(HttpMethod.Post, $"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/issues", new { title, body, labels = labels ?? [] }, ct);
-    public async Task<IReadOnlyList<ForgejoIssue>> IssuesAsync(string owner, string name, CancellationToken ct) =>
-        await GetAsync<List<ForgejoIssue>>($"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/issues?state=all&limit=100", ct) ?? [];
     public async Task<IReadOnlyList<RepositoryTreeEntry>> TreeAsync(string owner, string name, string sha, CancellationToken ct) =>
         (await GetAsync<RepositoryTreeResponse>($"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/git/trees/{Uri.EscapeDataString(sha)}?recursive=true", ct))?.Tree ?? [];
     public async Task<string> FileAsync(string owner, string name, string sha, string path, CancellationToken ct)

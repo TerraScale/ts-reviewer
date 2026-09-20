@@ -1,9 +1,29 @@
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:54df941ed0d06a1bd95ef5e0ce391fd8d9f94b64782dc9a60062727849ee3f97
+# Debian trixie rather than distroless: the OpenCodeReview engine needs a
+# shell-less static binary plus git (>= 2.41, trixie ships 2.47) on PATH.
+# The app itself is a self-contained single-file publish, so no dotnet base.
+# Base is digest-pinned like the distroless base before it — bump the digest
+# with each roll (security updates included in trixie-slim re-publishes).
+FROM docker.io/library/debian:trixie-slim@sha256:7792b1f7702a86946cd518db72b6a407302c3e9bc1635634368b878189e8221c
+
+# OpenCodeReview CLI (github.com/alibaba/open-code-review): the npm package is
+# just a launcher around this static Go binary, so fetch the platform package
+# directly (sha256-gated) and skip shipping Node.js entirely.
+ARG OCR_VERSION=1.12.7
+ARG OCR_SHA256=1514949445f4b1d39875b690677bb33d6a30c4414bd5088c5448cbe501c2fb83
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl git \
+ && curl -fsSL "https://registry.npmjs.org/@alibaba-group/ocr-linux-x64/-/ocr-linux-x64-${OCR_VERSION}.tgz" -o /tmp/ocr.tgz \
+ && echo "${OCR_SHA256}  /tmp/ocr.tgz" | sha256sum -c - \
+ && tar -xzf /tmp/ocr.tgz -C /tmp \
+ && install -m 0755 /tmp/package/bin/opencodereview /usr/local/bin/ocr \
+ && ocr version \
+ && rm -rf /var/lib/apt/lists/* /tmp/package /tmp/ocr.tgz
+
 COPY artifacts/ci/container-publish/TerraScale.Reviewer /ts-reviewer
 COPY artifacts/ci/container-publish/TerraScale.Reviewer.staticwebassets.endpoints.json /TerraScale.Reviewer.staticwebassets.endpoints.json
 COPY --chmod=644 artifacts/ci/container-publish/LocalEmbeddingsModel/default/model.onnx /LocalEmbeddingsModel/default/model.onnx
 COPY --chmod=644 artifacts/ci/container-publish/LocalEmbeddingsModel/default/vocab.txt /LocalEmbeddingsModel/default/vocab.txt
 WORKDIR /tmp
-ENV DOTNET_BUNDLE_EXTRACT_BASE_DIR=/tmp
+ENV DOTNET_BUNDLE_EXTRACT_BASE_DIR=/tmp HOME=/tmp
 USER 1654
 ENTRYPOINT ["/ts-reviewer"]

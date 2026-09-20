@@ -16,3 +16,10 @@ public sealed record ContextSearchResponse(IReadOnlyList<ContextHit> Results, bo
 internal sealed record IndexRequest(string Owner, string Name, string Commit);
 
 internal sealed record CodeChunk(string Path, int StartLine, int EndLine, string Symbol, string Content);
+
+internal sealed record IndexJob(string Owner, string Name, string Commit);
+
+internal sealed record IndexJobStatus(int Attempts, long NextAttemptAt, string? LastError, bool DeadLettered);
+
+public sealed record IndexDeadLetter(string Repository, string Commit, int Attempts, long EnqueuedAt,
+    string? LastError, long DeadAt);

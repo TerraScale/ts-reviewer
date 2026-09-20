@@ -32,6 +32,17 @@ jobs:
             tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj \
             --runtime linux-x64 --nologo
 
+      - name: Verify dependency audit failure handling
+        run: python3 -m unittest discover -s scripts -p test_check_nuget_vulnerabilities.py
+
+      - name: Fail closed on vulnerable NuGet packages
+        run: |
+          set -euo pipefail
+          export NUGET_PACKAGES="${RUNNER_TEMP:-/tmp}/ts-reviewer-nuget"
+          python3 scripts/check_nuget_vulnerabilities.py \
+            src/TerraScale.Reviewer/TerraScale.Reviewer.csproj \
+            tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj
+
       - name: Build reviewer tests and service
         run: |
           set -euo pipefail
@@ -44,10 +55,39 @@ jobs:
         run: |
           set -euo pipefail
           export NUGET_PACKAGES="${RUNNER_TEMP:-/tmp}/ts-reviewer-nuget"
-          exec dotnet test \
-            tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj \
-            --configuration Release --no-build --no-restore --nologo -- \
-            --minimum-expected-tests 1
+          mkdir -p -- artifacts/ci/tests
+          test_log="artifacts/ci/tests/reviewer-tests.log"
+          dotnet run \
+            --project tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj \
+            --configuration Release --no-build --no-restore -- \
+            --minimum-expected-tests 1 2>&1 | tee "${test_log}"
+          grep -Fq 'Test run summary: Passed!' "${test_log}"
+          grep -Eq 'failed: 0' "${test_log}"
+          report="$(find tests -type f -path '*/TestResults/*-report.html' -print -quit)"
+          test -n "${report}"
+          cp -- "${report}" artifacts/ci/tests/reviewer-tunit-report.html
+          # The multi-process qualification test emits its captured process logs,
+          # final queue state, and a self-validated receipt; fail closed if absent.
+          test -s artifacts/ci/tests/multiprocess/qualification-receipt.json
+          (cd artifacts/ci/tests && \
+            find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum) \
+            > artifacts/ci/tests/SHA256SUMS
+          (cd artifacts/ci/tests && sha256sum --check --strict SHA256SUMS)
+          jq -n \
+            --arg sourceCommit "${FORGEJO_SHA:?event SHA is required}" \
+            --arg testLog "reviewer-tests.log" \
+            --arg report "reviewer-tunit-report.html" \
+            --arg digests "SHA256SUMS" \
+            '{schemaVersion: 1, sourceCommit: $sourceCommit, testLog: $testLog, report: $report, digests: $digests}' \
+            > artifacts/ci/tests/test-receipt.json
+
+      - name: Upload reviewer test evidence
+        uses: https://data.forgejo.org/actions/upload-artifact@v7.0.1
+        with:
+          name: ts-reviewer-tests-${{ forgejo.sha }}
+          path: artifacts/ci/tests
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Build and inspect the release image
         run: |
@@ -78,6 +118,25 @@ jobs:
           podman image inspect "${image}"
           test "$(podman image inspect "${image}" --format '{{.Architecture}}')" = amd64
           test "$(podman image inspect "${image}" --format '{{.Os}}')" = linux
+          binary_sha256="$(sha256sum artifacts/ci/container-publish/TerraScale.Reviewer | awk '{print $1}')"
+          image_id="$(podman image inspect "${image}" --format '{{.Id}}')"
+          test "${#binary_sha256}" -eq 64
+          test "${image_id#sha256:}" != "${image_id}"
+          jq -n \
+            --arg sourceCommit "${source_commit}" \
+            --arg image "${image}" \
+            --arg imageId "${image_id}" \
+            --arg binarySha256 "${binary_sha256}" \
+            '{schemaVersion: 1, sourceCommit: $sourceCommit, image: $image, imageId: $imageId, binary: "TerraScale.Reviewer", binarySha256: $binarySha256}' \
+            > artifacts/ci/container-publish/release-receipt.json
+
+      - name: Upload reviewer release receipt
+        uses: https://data.forgejo.org/actions/upload-artifact@v7.0.1
+        with:
+          name: ts-reviewer-release-${{ forgejo.sha }}
+          path: artifacts/ci/container-publish/release-receipt.json
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Publish immutable container on protected main
         if: forgejo.event_name == 'push' && forgejo.ref == 'refs/heads/main'

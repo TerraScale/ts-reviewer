@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using TerraScale.Reviewer.Features.Forgejo;
 using TerraScale.Reviewer.Features.Configuration;
 using TerraScale.Reviewer.Features.Context;
@@ -18,7 +19,7 @@ public sealed class ReviewerTests
     private static readonly ContextEmbedder Embedder = new();
 
     private static ReviewerOptions Options(string database) =>
-        new("http://+:8080", "https://forgejo.test", "forgejo", "https://proxy.test/v1", "proxy", "review", "TerraScale", "bot", 2, TimeSpan.FromMinutes(1), 100000, "", "", database, 100);
+        new("http://+:8080", "https://forgejo.test", "forgejo", "https://proxy.test/v1", "proxy", "review", "TerraScale", "bot", 2, TimeSpan.FromMinutes(1), "webhook-test-secret", "context-test-token", database, 100, 5, null, "operator-test-token");
 
     private static float[] UnitVector(int index)
     {
@@ -36,6 +37,7 @@ public sealed class ReviewerTests
         await Assert.That(WebhookHandler.ParseCommand("please @terrascale-bot recheck", "terrascale-bot")).IsEqualTo("recheck");
         await Assert.That(WebhookHandler.ParseCommand("@other-bot review", "terrascale-bot")).IsNull();
         await Assert.That(WebhookHandler.ParseCommand("@terrascale-bot dismiss now", "terrascale-bot")).IsEqualTo("dismiss");
+        await Assert.That(WebhookHandler.ParseCommand("please @terrascale-bot escalate this", "terrascale-bot")).IsEqualTo("escalate");
     }
 
     [Test]
@@ -64,25 +66,43 @@ public sealed class ReviewerTests
     [Test]
     public async Task ConfigurationAcceptsExplicitArgumentsAndRejectsInvalidLimits()
     {
-        var options = ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy", "--forgejo-url=https://forgejo.test/", "--proxy-url=https://proxy.test/v1/", "--timeout=00:00:05", "--max-concurrent=3"]);
+        var options = ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy", "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token", "--operator-token=operator-test-token", "--forgejo-url=https://forgejo.test/", "--proxy-url=https://proxy.test/v1/", "--timeout=00:00:05", "--max-concurrent=3"]);
         await Assert.That(options.ForgejoUrl).IsEqualTo("https://forgejo.test");
         await Assert.That(options.ProxyUrl).IsEqualTo("https://proxy.test/v1");
         await Assert.That(options.MaxConcurrent).IsEqualTo(3);
+        await Assert.That(options.ContextMaxAttempts).IsEqualTo(5);
+        await Assert.That(options.ContextRetryDelay).IsEqualTo(TimeSpan.FromSeconds(1));
 
         var rejected = false;
-        try { ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy", "--max-concurrent=0"]); }
+        try { ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy", "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token", "--operator-token=operator-test-token", "--max-concurrent=0"]); }
         catch (InvalidOperationException) { rejected = true; }
         await Assert.That(rejected).IsTrue();
     }
 
     [Test]
-    public async Task MergeDropsLowConfidenceAndDuplicates()
+    public async Task OcrCommentsMapToFindingsAndDropDuplicates()
     {
-        var high = new Finding("a", "high", "title", "body", "fix", "x.go", 4, .99, false, "");
-        var low = high with { Id = "b", Confidence = .5 };
-        var other = high with { Id = "c", Confidence = .8 };
-        var result = ReviewEngine.Merge([new ReviewResult("one", [high, low]), new ReviewResult("two", [high, other])]);
+        var comment = new OcrComment("src/Worker.cs", "The fallback bypasses validation.", "Validate(input);", "return Fallback(input);", 42, 42, "bug", "high");
+        var duplicate = comment with { };
+        var other = comment with { Content = "Different defect.", StartLine = 7, Severity = "critical" };
+        var blank = comment with { Content = " " };
+        var result = ReviewEngine.Map([comment, duplicate, other, blank]);
         await Assert.That(result.Findings.Count).IsEqualTo(2);
+        var first = result.Findings[0];
+        await Assert.That(first.Severity).IsEqualTo("high");
+        await Assert.That(first.Path).IsEqualTo("src/Worker.cs");
+        await Assert.That(first.Line).IsEqualTo(42);
+        await Assert.That(first.Fix.Contains("Validate(input);")).IsTrue();
+        var second = result.Findings[1];
+        await Assert.That(second.Severity).IsEqualTo("critical");
+        await Assert.That(second.Line).IsEqualTo(7);
+    }
+
+    [Test]
+    public async Task OcrCommentWithoutSeverityDefaultsToMedium()
+    {
+        var result = ReviewEngine.Map([new OcrComment("a.cs", "content", null, null, 1, 1, "other", null)]);
+        await Assert.That(result.Findings.Single().Severity).IsEqualTo("medium");
     }
 
     [Test]
@@ -96,11 +116,134 @@ public sealed class ReviewerTests
         await Assert.That(empty.Contains("### Result")).IsTrue();
         await Assert.That(empty.Contains("✅ No evidence-backed findings")).IsTrue();
 
-        var finding = new Finding("f-1", "high", "Unsafe fallback", "The fallback bypasses validation.", "Add a validation check before retrying.", "src/Worker.cs", 42, .99, false, "");
+        var finding = new Finding("f-1", "high", "Unsafe fallback", "The fallback bypasses validation.", "Add a validation check before retrying.", "src/Worker.cs", 42);
         var formatted = WebhookHandler.Format(pullRequest, new ReviewResult("ignored", [finding]));
         await Assert.That(formatted.Contains("### Findings (1)")).IsTrue();
         await Assert.That(formatted.Contains("#### HIGH · Unsafe fallback")).IsTrue();
         await Assert.That(formatted.Contains("<summary>Suggested fix</summary>")).IsTrue();
+        await Assert.That(formatted.Contains("model")).IsFalse();
+
+        var escalated = WebhookHandler.Format(pullRequest, new ReviewResult("ignored", [finding]), "gpt-6-astra");
+        await Assert.That(escalated.Contains("model `gpt-6-astra`")).IsTrue();
+    }
+
+    [Test]
+    public async Task ReviewEngineRunsOcrOverAClonedPullRequestRange()
+    {
+        if (!ToolAvailable("git") || !ToolAvailable("chmod")) throw new TUnit.Core.Exceptions.SkipTestException("requires a POSIX host with git and chmod");
+
+        var root = Path.Combine(Path.GetTempPath(), "ts-reviewer-e2e-" + Guid.NewGuid().ToString("N"));
+        var stub = Path.Combine(root, "stub");
+        var database = Path.Combine(root, "context.db");
+        Directory.CreateDirectory(stub);
+        var work = Path.Combine(root, "work");
+        try
+        {
+            // A local bare "Forgejo" laid out like the real one: <root>/<owner>/<repo>.git
+            var remote = Path.Combine(root, "TerraScale", "widgets.git");
+            Directory.CreateDirectory(Path.GetDirectoryName(remote)!);
+            await RunGitAsync(root, "init", "--quiet", "-b", "main", "--bare", remote);
+            Directory.CreateDirectory(work);
+            await RunGitAsync(root, "clone", "--quiet", remote, work);
+            await RunGitAsync(work, "config", "user.email", "review@test");
+            await RunGitAsync(work, "config", "user.name", "review");
+            await File.WriteAllTextAsync(Path.Combine(work, "a.cs"), "class A {}\n");
+            await RunGitAsync(work, "add", ".");
+            await RunGitAsync(work, "commit", "--quiet", "-m", "base");
+            var baseSha = (await RunGitAsync(work, "rev-parse", "HEAD")).Trim();
+            await File.WriteAllTextAsync(Path.Combine(work, "a.cs"), "class A { public void B() { } }\n");
+            await RunGitAsync(work, "add", ".");
+            await RunGitAsync(work, "commit", "--quiet", "-m", "head");
+            var headSha = (await RunGitAsync(work, "rev-parse", "HEAD")).Trim();
+            await RunGitAsync(work, "push", "--quiet", "origin", baseSha + ":refs/heads/main", headSha + ":refs/pull/9/head");
+
+            // The ocr stub records its arguments AND the OCR_LLM_* endpoint
+            // environment the engine must export, then emits a fixed review.
+            var log = Path.Combine(stub, "ocr.log");
+            var review = Path.Combine(stub, "review.json");
+            await File.WriteAllTextAsync(Path.Combine(stub, "ocr"),
+                "#!/bin/sh\n" +
+                "printf '%s\\n' \"$*\" >> \"" + log + "\"\n" +
+                "printenv | grep '^OCR_LLM_\\|^OCR_ENABLE_TELEMETRY=' >> \"" + log + "\"\n" +
+                "out=\"\"; while [ $# -gt 0 ]; do case $1 in --output) out=$2 ;; esac; shift; done\n" +
+                "cat \"" + review + "\" > \"$out\"\n");
+            await File.WriteAllTextAsync(review, JsonSerializer.Serialize(new
+            {
+                status = "complete",
+                message = "Review complete: 1 finding(s) across 1 selected item(s).",
+                comments = new object[]
+                {
+                    new { path = "a.cs", content = "Empty method body hides the failure path.", suggestion_code = "public void B() { throw new NotSupportedException(); }", existing_code = "public void B() { }", start_line = 1, end_line = 1, category = "bug", severity = "high" },
+                },
+            }));
+            await RunChmodAsync(Path.Combine(stub, "ocr"));
+
+            var options = Options(database) with { ForgejoUrl = root };
+            var engine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, Path.Combine(stub, "ocr"));
+            var repository = new Repository(new Owner("TerraScale"), "widgets");
+            var pullRequest = new PullRequest(9, "Test change", "", new Branch(baseSha, "main", repository), new Branch(headSha, "feature", repository));
+            var result = await engine.RunAsync(pullRequest, CancellationToken.None);
+            await Assert.That(result.Findings.Count).IsEqualTo(1);
+            await Assert.That(result.Findings[0].Path).IsEqualTo("a.cs");
+            await Assert.That(result.Findings[0].Severity).IsEqualTo("high");
+            var recorded = await File.ReadAllTextAsync(log);
+            await Assert.That(recorded.Contains("--from " + baseSha)).IsTrue();
+            await Assert.That(recorded.Contains("--to " + headSha)).IsTrue();
+            await Assert.That(recorded.Contains("--format json")).IsTrue();
+            await Assert.That(recorded.Contains("OCR_LLM_URL=https://proxy.test/v1")).IsTrue();
+            await Assert.That(recorded.Contains("OCR_LLM_TOKEN=proxy")).IsTrue();
+            await Assert.That(recorded.Contains("OCR_LLM_MODEL=review")).IsTrue();
+            await Assert.That(recorded.Contains("OCR_LLM_PROTOCOL=openai")).IsTrue();
+            await Assert.That(recorded.Contains("OCR_ENABLE_TELEMETRY=false")).IsTrue();
+
+            // An escalated review re-runs the same head on the escalation model.
+            await engine.RunAsync(pullRequest, CancellationToken.None, "gpt-6-astra");
+            recorded = await File.ReadAllTextAsync(log);
+            await Assert.That(recorded.Contains("OCR_LLM_MODEL=gpt-6-astra")).IsTrue();
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+        }
+    }
+
+    private static bool ToolAvailable(string name)
+    {
+        foreach (var directory in (Environment.GetEnvironmentVariable("PATH") ?? string.Empty).Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        {
+            var candidate = Path.Combine(directory, name);
+            if (File.Exists(candidate)) return true;
+        }
+        return false;
+    }
+
+    private static async Task<string> RunGitAsync(string working, params string[] arguments)
+    {
+        using var process = new Process
+        {
+            StartInfo = new ProcessStartInfo
+            {
+                FileName = "git",
+                WorkingDirectory = working,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+            },
+        };
+        foreach (var argument in arguments) process.StartInfo.ArgumentList.Add(argument);
+        process.Start();
+        var output = await process.StandardOutput.ReadToEndAsync();
+        var error = await process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        if (process.ExitCode != 0) throw new InvalidOperationException($"git {arguments.FirstOrDefault()} failed: {error}");
+        return output;
+    }
+
+    private static async Task RunChmodAsync(string path)
+    {
+        using var process = Process.Start(new ProcessStartInfo { FileName = "chmod", Arguments = "+x " + path, UseShellExecute = false }) ?? throw new InvalidOperationException("chmod missing");
+        await process.WaitForExitAsync();
     }
 
     [Test]
@@ -156,6 +299,96 @@ public sealed class ReviewerTests
     }
 
     [Test]
+    public async Task LiteDbSupportsConcurrentProcessConnections()
+    {
+        var database = Path.Combine(Path.GetTempPath(), "ts-reviewer-" + Guid.NewGuid().ToString("N") + ".db");
+        try
+        {
+            using var first = new ContextStore(Options(database));
+            using var second = new ContextStore(Options(database));
+            first.EnqueueIndexJob("TerraScale", "widgets", "shared-a");
+            second.EnqueueIndexJob("TerraScale", "widgets", "shared-b");
+            await Assert.That(first.PendingIndexJobs()).Count().IsEqualTo(2);
+            await Assert.That(second.PendingIndexJobs()).Count().IsEqualTo(2);
+        }
+        finally { File.Delete(database); }
+    }
+
+    [Test]
+    public async Task FailedIndexJobsPersistBackoffAndDeadLetterState()
+    {
+        var database = Path.Combine(Path.GetTempPath(), "ts-reviewer-" + Guid.NewGuid().ToString("N") + ".db");
+        try
+        {
+            using var store = new ContextStore(Options(database));
+            store.EnqueueIndexJob("TerraScale", "widgets", "failing");
+            var first = store.RecordIndexFailure("TerraScale/widgets", "failing", "upstream unavailable", 3, TimeSpan.FromMilliseconds(10));
+            await Assert.That(first.DeadLettered).IsFalse();
+            var status = store.GetIndexJobStatus("TerraScale/widgets", "failing");
+            await Assert.That(status?.Attempts).IsEqualTo(1);
+            await Assert.That(status?.LastError).IsEqualTo("upstream unavailable");
+            await Assert.That(status?.NextAttemptAt > 0).IsTrue();
+
+            store.RecordIndexFailure("TerraScale/widgets", "failing", "still unavailable", 3, TimeSpan.FromMilliseconds(10));
+            var final = store.RecordIndexFailure("TerraScale/widgets", "failing", "permanent failure", 3, TimeSpan.FromMilliseconds(10));
+            await Assert.That(final.DeadLettered).IsTrue();
+            await Assert.That(store.GetIndexJobStatus("TerraScale/widgets", "failing")?.DeadLettered).IsTrue();
+            await Assert.That(store.PendingIndexJobs()).IsEmpty();
+            await Assert.That(store.DeadLetterJobs()).Count().IsEqualTo(1);
+            await Assert.That(store.DeadLetterJobs()[0].LastError).IsEqualTo("permanent failure");
+            await Assert.That(store.ReplayDeadLetter("TerraScale/widgets", "failing")).IsTrue();
+            await Assert.That(store.GetIndexJobStatus("TerraScale/widgets", "failing")?.DeadLettered).IsFalse();
+            await Assert.That(store.DeadLetterJobs()).IsEmpty();
+        }
+        finally { File.Delete(database); }
+    }
+
+    [Test]
+    public async Task IndexJobLeaseFencesCompetingWorkers()
+    {
+        var database = Path.Combine(Path.GetTempPath(), "ts-reviewer-" + Guid.NewGuid().ToString("N") + ".db");
+        try
+        {
+            using var first = new ContextStore(Options(database));
+            using var second = new ContextStore(Options(database));
+            first.EnqueueIndexJob("TerraScale", "widgets", "leased");
+            var token = first.TryClaimIndexJob("TerraScale/widgets", "leased", "worker-a", TimeSpan.FromMinutes(1));
+            await Assert.That(token).IsNotNull();
+            await Assert.That(second.TryClaimIndexJob("TerraScale/widgets", "leased", "worker-b", TimeSpan.FromMinutes(1))).IsNull();
+            first.ReleaseIndexJob("TerraScale/widgets", "leased", "worker-a", "wrong-token");
+            await Assert.That(second.TryClaimIndexJob("TerraScale/widgets", "leased", "worker-b", TimeSpan.FromMinutes(1))).IsNull();
+            first.ReleaseIndexJob("TerraScale/widgets", "leased", "worker-a", token!);
+            await Assert.That(second.TryClaimIndexJob("TerraScale/widgets", "leased", "worker-b", TimeSpan.FromMinutes(1))).IsNotNull();
+        }
+        finally { File.Delete(database); }
+    }
+
+    [Test]
+    public async Task IndexJobLeaseReclaimsAfterOwnerDisappears()
+    {
+        var database = Path.Combine(Path.GetTempPath(), "ts-reviewer-" + Guid.NewGuid().ToString("N") + ".db");
+        try
+        {
+            string token;
+            using (var first = new ContextStore(Options(database)))
+            {
+                first.EnqueueIndexJob("TerraScale", "widgets", "crashed");
+                token = first.TryClaimIndexJob("TerraScale/widgets", "crashed", "worker-crashed", TimeSpan.FromMilliseconds(25))!;
+                await Assert.That(token).IsNotNull();
+            }
+
+            await Task.Delay(50);
+
+            using var replacement = new ContextStore(Options(database));
+            var replacementToken = replacement.TryClaimIndexJob(
+                "TerraScale/widgets", "crashed", "worker-replacement", TimeSpan.FromMinutes(1));
+            await Assert.That(replacementToken).IsNotNull();
+            await Assert.That(replacementToken).IsNotEqualTo(token);
+        }
+        finally { File.Delete(database); }
+    }
+
+    [Test]
     public async Task ContextIndexerFetchesExactCommitAndEmbedsChunksLocally()
     {
         var database = Path.Combine(Path.GetTempPath(), "ts-reviewer-" + Guid.NewGuid().ToString("N") + ".db");
@@ -167,12 +400,41 @@ public sealed class ReviewerTests
         try
         {
             await indexer.StartAsync(CancellationToken.None);
+            await Assert.That(indexer.Enqueue("TerraScale", "widgets", "abc123")).IsTrue();
+            await Assert.That(indexer.Enqueue("TerraScale", "widgets", "abc123")).IsTrue();
             await indexer.EnsureIndexedAsync("TerraScale", "widgets", "abc123", CancellationToken.None);
             var results = store.Search("TerraScale/widgets", "abc123", Embedder.Embed("CreateWidget"), 5);
             await Assert.That(results.Count).IsEqualTo(1);
             await Assert.That(results[0].Path).IsEqualTo("src/Widget.cs");
             await Assert.That(handler.FileRequests).IsEqualTo(1);
             await indexer.StopAsync(CancellationToken.None);
+        }
+        finally { File.Delete(database); }
+    }
+
+    [Test]
+    public async Task ContextIndexJobsSurviveIndexerRestart()
+    {
+        var database = Path.Combine(Path.GetTempPath(), "ts-reviewer-" + Guid.NewGuid().ToString("N") + ".db");
+        var options = Options(database);
+        var handler = new ContextFakeHandler();
+        try
+        {
+            using (var firstStore = new ContextStore(options))
+            {
+                var firstIndexer = new ContextIndexer(new ForgejoClient(new HttpClient(handler), options), firstStore,
+                    Embedder, options, NullLogger<ContextIndexer>.Instance);
+                await Assert.That(firstIndexer.Enqueue("TerraScale", "widgets", "restart-commit")).IsTrue();
+                // The worker never starts: the persisted job is the recovery source.
+            }
+
+            using var recoveredStore = new ContextStore(options);
+            var recovered = new ContextIndexer(new ForgejoClient(new HttpClient(handler), options), recoveredStore,
+                Embedder, options, NullLogger<ContextIndexer>.Instance);
+            await recovered.StartAsync(CancellationToken.None);
+            await recovered.EnsureIndexedAsync("TerraScale", "widgets", "restart-commit", CancellationToken.None);
+            await Assert.That(handler.FileRequests).IsEqualTo(1);
+            await recovered.StopAsync(CancellationToken.None);
         }
         finally { File.Delete(database); }
     }
@@ -186,7 +448,7 @@ public sealed class ReviewerTests
         var forgejo = new ForgejoClient(new HttpClient(handler), options);
         using var store = new ContextStore(options);
         var indexer = new ContextIndexer(forgejo, store, Embedder, options, NullLogger<ContextIndexer>.Instance);
-        var engine = new ReviewEngine(new HttpClient(handler), options, indexer, NullLogger<ReviewEngine>.Instance);
+        var engine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance);
         var webhookHandler = new WebhookHandler(forgejo, engine, indexer, options, NullLogger<WebhookHandler>.Instance);
         try
         {
@@ -218,7 +480,10 @@ public sealed class ReviewerTests
     {
         var context = new DefaultHttpContext();
         context.Request.Method = "POST";
-        context.Request.Body = new MemoryStream(JsonSerializer.SerializeToUtf8Bytes(payload));
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(payload);
+        context.Request.Body = new MemoryStream(bytes);
+        context.Request.Headers["X-Forgejo-Signature"] = Convert.ToHexString(
+            HMACSHA256.HashData(Encoding.UTF8.GetBytes("webhook-test-secret"), bytes));
         return await handler.HandleAsync(context.Request, CancellationToken.None);
     }
 
@@ -261,6 +526,51 @@ public sealed class ReviewerTests
             if (request.Method == HttpMethod.Post && request.RequestUri?.AbsolutePath.EndsWith("/issues/comments/77/reactions", StringComparison.Ordinal) == true)
                 CommentReactions++;
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+        }
+    }
+
+    [Test]
+    public async Task IndexJobLeaseReclaimsAfterChildProcessIsKilled()
+    {
+        var database = Path.Combine(Path.GetTempPath(), "ts-reviewer-" + Guid.NewGuid().ToString("N") + ".db");
+        try
+        {
+            using (var setup = new ContextStore(Options(database)))
+            {
+                setup.EnqueueIndexJob("TerraScale", "widgets", "process-crash");
+            }
+
+            var childAssembly = Path.Combine(AppContext.BaseDirectory, "TerraScale.Reviewer.LeaseCrashChild.dll");
+            await Assert.That(File.Exists(childAssembly)).IsTrue();
+            var childStartInfo = new ProcessStartInfo
+            {
+                FileName = "dotnet",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            childStartInfo.ArgumentList.Add(childAssembly);
+            childStartInfo.ArgumentList.Add(database);
+            using var child = Process.Start(childStartInfo)
+                ?? throw new InvalidOperationException("Could not start the lease crash child.");
+
+            var claimed = await child.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            await Assert.That(claimed).IsNotNull();
+            await Assert.That(claimed).StartsWith("CLAIMED ");
+
+            child.Kill(entireProcessTree: true);
+            await child.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            await Task.Delay(150);
+
+            using var replacement = new ContextStore(Options(database));
+            var replacementToken = replacement.TryClaimIndexJob(
+                "TerraScale/widgets", "process-crash", "worker-replacement", TimeSpan.FromMinutes(1));
+            await Assert.That(replacementToken).IsNotNull();
+            await Assert.That(replacementToken).IsNotEqualTo(claimed!["CLAIMED ".Length..]);
+        }
+        finally
+        {
+            File.Delete(database);
         }
     }
 }
