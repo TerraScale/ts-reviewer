@@ -82,7 +82,7 @@ jobs:
             > artifacts/ci/tests/test-receipt.json
 
       - name: Upload reviewer test evidence
-        uses: https://data.forgejo.org/actions/upload-artifact@v7.0.1
+        uses: https://data.forgejo.org/actions/upload-artifact@v4.4.3
         with:
           name: ts-reviewer-tests-${{ forgejo.sha }}
           path: artifacts/ci/tests
@@ -131,7 +131,7 @@ jobs:
             > artifacts/ci/container-publish/release-receipt.json
 
       - name: Upload reviewer release receipt
-        uses: https://data.forgejo.org/actions/upload-artifact@v7.0.1
+        uses: https://data.forgejo.org/actions/upload-artifact@v4.4.3
         with:
           name: ts-reviewer-release-${{ forgejo.sha }}
           path: artifacts/ci/container-publish/release-receipt.json
