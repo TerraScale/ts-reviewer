@@ -120,7 +120,9 @@ jobs:
           binary_sha256="$(sha256sum artifacts/ci/container-publish/TerraScale.Reviewer | awk '{print $1}')"
           image_id="$(podman image inspect "${image}" --format '{{.Id}}')"
           test "${#binary_sha256}" -eq 64
-          test "${image_id#sha256:}" != "${image_id}"
+          # podman .Id is a bare hex digest (no sha256: prefix); normalize
+          # so the receipt always carries a fully qualified digest.
+          case "${image_id}" in sha256:*) ;; *) image_id="sha256:${image_id}" ;; esac
           jq -n \
             --arg sourceCommit "${source_commit}" \
             --arg image "${image}" \
