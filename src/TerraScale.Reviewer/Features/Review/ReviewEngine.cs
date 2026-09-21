@@ -29,13 +29,17 @@ public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> 
         Directory.CreateDirectory(home);
         try
         {
-            // Full (non-partial) clone: partial clones lean on promisor
-            // blob fetches that a misconfigured server rejects mid-review.
-            // --single-branch keeps only the default branch's objects; base
-            // and head arrive via the explicit refspec fetch below. The
-            // clone is ephemeral per-review disk — the biggest org repo
-            // (TerraBase) packs ~1.1 GiB, bounded by MaxConcurrent reviews.
-            await RunGitAsync(home, root, ct, "clone", "--quiet", "--no-checkout", "--single-branch", cloneUrl, repository);
+            // Initialize an empty repository and fetch only the two commit tips
+            // needed for this review. A full clone can unpack a multi-gigabyte
+            // history before ocr starts and exhaust the review container even
+            // when only one pull request is active.
+            Directory.CreateDirectory(repository);
+            await RunGitAsync(home, root, ct, "init", "--quiet", repository);
+            await RunGitAsync(home, repository, ct, "remote", "add", "origin", cloneUrl);
+            // ocr needs the merge-base between the base and PR tips. A depth-1
+            // fetch leaves unrelated tips shallow and makes valid PRs fail
+            // with "cannot find merge-base"; keep the two requested refs'
+            // ancestry while still avoiding a checked-out working tree.
             await RunGitAsync(home, repository, ct, "fetch", "--quiet", "--no-tags", "origin",
                 $"+refs/heads/{pr.Base.Ref}:refs/base", $"+refs/pull/{pr.Number}/head:refs/pr-head");
             var head = (await RunGitAsync(home, repository, ct, "rev-parse", "refs/pr-head")).Trim();
@@ -50,7 +54,7 @@ public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> 
             // is the hard backstop and a review that outlives it fails like
             // any other engine error.
             await RunOcrAsync(home, repository, model,
-                ["review", "--from", @base, "--to", head, "--concurrency", options.MaxConcurrent.ToString(),
+                ["review", "--from", @base, "--to", head, "--concurrency", options.OcrConcurrency.ToString(),
                  "--timeout", "15", "--format", "json", "--audience", "agent", "--color", "never", "--output", output], ct);
             var review = JsonSerializer.Deserialize<OcrReview>(await File.ReadAllTextAsync(output, ct), JsonOptions)
                 ?? throw new InvalidOperationException("ocr returned no review");
