@@ -128,7 +128,9 @@ public sealed class ReviewerTests
     }
 
     [Test]
-    public async Task ReviewEngineRunsOcrOverAClonedPullRequestRange()
+    [Arguments("high", "REQUEST_CHANGES", "failure")]
+    [Arguments("medium", "APPROVED", "success")]
+    public async Task ReviewEngineRunsOcrOverAClonedPullRequestRange(string severity, string expectedEvent, string expectedStatus)
     {
         if (!ToolAvailable("git") || !ToolAvailable("chmod")) throw new TUnit.Core.Exceptions.SkipTestException("requires a POSIX host with git and chmod");
 
@@ -173,7 +175,7 @@ public sealed class ReviewerTests
                 message = "Review complete: 1 finding(s) across 1 selected item(s).",
                 comments = new object[]
                 {
-                    new { path = "a.cs", content = "Empty method body hides the failure path.", suggestion_code = "public void B() { throw new NotSupportedException(); }", existing_code = "public void B() { }", start_line = 1, end_line = 1, category = "bug", severity = "high" },
+                    new { path = "a.cs", content = "Empty method body hides the failure path.", suggestion_code = "public void B() { throw new NotSupportedException(); }", existing_code = "public void B() { }", start_line = 1, end_line = 1, category = "bug", severity },
                 },
             }));
             await RunChmodAsync(Path.Combine(stub, "ocr"));
@@ -185,7 +187,7 @@ public sealed class ReviewerTests
             var result = await engine.RunAsync(pullRequest, CancellationToken.None);
             await Assert.That(result.Findings.Count).IsEqualTo(1);
             await Assert.That(result.Findings[0].Path).IsEqualTo("a.cs");
-            await Assert.That(result.Findings[0].Severity).IsEqualTo("high");
+            await Assert.That(result.Findings[0].Severity).IsEqualTo(severity);
             var recorded = await File.ReadAllTextAsync(log);
             await Assert.That(recorded.Contains("--from " + baseSha)).IsTrue();
             await Assert.That(recorded.Contains("--to " + headSha)).IsTrue();
@@ -201,6 +203,29 @@ public sealed class ReviewerTests
             await engine.RunAsync(pullRequest, CancellationToken.None, "gpt-6-astra");
             recorded = await File.ReadAllTextAsync(log);
             await Assert.That(recorded.Contains("OCR_LLM_MODEL=gpt-6-astra")).IsTrue();
+
+            // Exercise the real webhook-to-HTTP publication path. Forgejo uses
+            // APPROVED, not GitHub's APPROVE; the latter creates a pending draft.
+            var apiOptions = Options(database);
+            var transport = new ReviewPublicationHandler(pullRequest);
+            using var http = new HttpClient(transport);
+            var forgejo = new ForgejoClient(http, apiOptions);
+            using var store = new ContextStore(apiOptions);
+            var indexer = new ContextIndexer(forgejo, store, Embedder, apiOptions, NullLogger<ContextIndexer>.Instance);
+            var webhook = new WebhookHandler(forgejo, engine, indexer, apiOptions, NullLogger<WebhookHandler>.Instance);
+            await PostWebhookAsync(webhook, new
+            {
+                action = "created",
+                number = 9,
+                repository = new { name = "widgets", owner = new { login = "TerraScale" } },
+                comment = new { id = 77, body = "@bot recheck" },
+            });
+            var publishedStatus = await transport.Status.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            var publishedReview = await transport.Review.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            await Assert.That(publishedReview.GetProperty("event").GetString()).IsEqualTo(expectedEvent);
+            await Assert.That(publishedReview.GetProperty("commit_id").GetString()).IsEqualTo(headSha);
+            await Assert.That(publishedReview.GetProperty("comments").GetArrayLength()).IsEqualTo(1);
+            await Assert.That(publishedStatus.GetProperty("state").GetString()).IsEqualTo(expectedStatus);
         }
         finally
         {
@@ -540,6 +565,35 @@ public sealed class ReviewerTests
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         while (!condition() && !timeout.Token.IsCancellationRequested) await Task.Delay(25);
         await Assert.That(condition()).IsTrue();
+    }
+
+    private sealed class ReviewPublicationHandler(PullRequest pullRequest) : HttpMessageHandler
+    {
+        public TaskCompletionSource<JsonElement> Review { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<JsonElement> Status { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var path = request.RequestUri!.AbsolutePath;
+            if (request.Method == HttpMethod.Get)
+            {
+                if (path.EndsWith("/pulls/9", StringComparison.Ordinal))
+                    return new(HttpStatusCode.OK) { Content = JsonContent.Create(pullRequest) };
+                if (path.EndsWith("/pulls/9.diff", StringComparison.Ordinal))
+                    return new(HttpStatusCode.OK) { Content = new StringContent("diff --git a/a.cs b/a.cs\n@@ -1 +1 @@\n-class A {}\n+class A { public void B() { } }\n") };
+                if (path.EndsWith("/files", StringComparison.Ordinal) || path.EndsWith("/comments", StringComparison.Ordinal))
+                    return new(HttpStatusCode.OK) { Content = new StringContent("[]", Encoding.UTF8, "application/json") };
+            }
+            else if (request.Method == HttpMethod.Post)
+            {
+                if (path.EndsWith("/reviews", StringComparison.Ordinal))
+                    Review.TrySetResult(await request.Content!.ReadFromJsonAsync<JsonElement>(cancellationToken));
+                if (path.EndsWith("/statuses/" + pullRequest.Head.Sha, StringComparison.Ordinal))
+                    Status.TrySetResult(await request.Content!.ReadFromJsonAsync<JsonElement>(cancellationToken));
+                return new(HttpStatusCode.OK) { Content = JsonContent.Create(new { }) };
+            }
+            return new(HttpStatusCode.NotFound);
+        }
     }
 
     private sealed class ContextFakeHandler : HttpMessageHandler
