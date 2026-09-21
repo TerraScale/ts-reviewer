@@ -47,7 +47,7 @@ public sealed record ReviewerOptions(
         var maxConcurrent = ParseInt(values, "max-concurrent");
         if (maxConcurrent is < 1 or > 100) throw new InvalidOperationException("max-concurrent must be between 1 and 100");
         var ocrConcurrency = ParseInt(values, "ocr-concurrency");
-        if (ocrConcurrency is < 1 or > 4) throw new InvalidOperationException("ocr-concurrency must be between 1 and 4");
+        if (ocrConcurrency is < 1 or > 10) throw new InvalidOperationException("ocr-concurrency must be between 1 and 10");
         if (!TimeSpan.TryParse(values["timeout"], out var reviewTimeout) || reviewTimeout <= TimeSpan.Zero)
             throw new InvalidOperationException("timeout must be positive");
         var contextMaxFiles = ParseInt(values, "context-max-files");
