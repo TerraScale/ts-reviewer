@@ -46,12 +46,12 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, C
         if (webhook.Action is "opened" or "synchronize" or "reopened")
         {
             _ = AcknowledgeAsync(repository.Owner.Login, repository.Name, number, null);
-            _ = RunBoundedAsync(repository.Owner.Login, repository.Name, number);
+            _ = RunBoundedAsync(repository.Owner.Login, repository.Name, number, webhook.PullRequest?.Head?.Sha);
         }
         else if (webhook.Action == "created" && ParseCommand(webhook.Comment?.Body ?? string.Empty, options.BotLogin) is { } command)
         {
             _ = AcknowledgeAsync(repository.Owner.Login, repository.Name, number, webhook.Comment?.Id);
-            _ = RunCommandAsync(repository.Owner.Login, repository.Name, number, command);
+            _ = RunCommandAsync(repository.Owner.Login, repository.Name, number, command, webhook.PullRequest?.Head?.Sha);
         }
         return Results.Accepted();
     }
@@ -107,12 +107,42 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, C
         catch (Exception ex) { logger.LogWarning(ex, "failed to acknowledge {Repository}#{Number}", owner + "/" + name, number); }
     }
 
-    private async Task RunBoundedAsync(string owner, string name, int number, string? model = null)
+    private async Task RunBoundedAsync(string owner, string name, int number, string? requestedSha = null, string? model = null)
     {
-        await _slots.WaitAsync();
+        var sha = await PublishPendingAsync(owner, name, number, requestedSha);
+        var acquired = await _slots.WaitAsync(options.ReviewTimeout);
+        if (!acquired)
+        {
+            logger.LogWarning("review queue timed out for {Repository}#{Number}", owner + "/" + name, number);
+            if (sha is not null) await FailStatusAsync(owner, name, sha, $"review queue timed out after {options.ReviewTimeout}");
+            return;
+        }
         try { await ReviewAsync(owner, name, number, model); }
-        catch (Exception ex) { logger.LogError(ex, "review failed for {Repository}#{Number}", owner + "/" + name, number); }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "review failed for {Repository}#{Number}", owner + "/" + name, number);
+            if (sha is not null) await FailStatusAsync(owner, name, sha, "review failed: " + ex.Message);
+        }
         finally { _slots.Release(); }
+    }
+
+    private async Task<string?> PublishPendingAsync(string owner, string name, int number, string? requestedSha)
+    {
+        var sha = requestedSha;
+        if (string.IsNullOrWhiteSpace(sha))
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            try { sha = (await forgejo.PullAsync(owner, name, number, timeout.Token))?.Head.Sha; }
+            catch (Exception ex) { logger.LogWarning(ex, "could not load {Repository}#{Number} before queueing", owner + "/" + name, number); }
+        }
+        if (string.IsNullOrWhiteSpace(sha)) return null;
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            await forgejo.StatusAsync(owner, name, sha, new CommitStatus("pending", null, "Review queued", "ts-reviewer"), timeout.Token);
+        }
+        catch (Exception ex) { logger.LogWarning(ex, "could not publish pending review status for {Repository}#{Number}", owner + "/" + name, number); }
+        return sha;
     }
     private async Task ReviewAsync(string owner, string name, int number, string? model = null)
     {
@@ -150,11 +180,12 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, C
     }
     private async Task FailStatusAsync(string owner, string name, string sha, string description)
     { using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15)); try { await forgejo.StatusAsync(owner, name, sha, new CommitStatus("error", null, description, "ts-reviewer"), timeout.Token); } catch (Exception ex) { logger.LogError(ex, "publish failed review status"); } }
-    private async Task RunCommandAsync(string owner, string name, int number, string command)
-    { try { if (command is "review" or "recheck") await RunBoundedAsync(owner, name, number); else if (command == "escalate") await RunBoundedAsync(owner, name, number, options.EscalationModel); else if (command == "explain") await forgejo.CommentAsync(owner, name, number, $"ts-reviewer: the latest evidence and suggested fix are in the marked review comment. Use `@{options.BotLogin} recheck` after pushing a correction or `@{options.BotLogin} escalate` to re-review with {options.EscalationModel}.", CancellationToken.None); else if (command == "dismiss") await forgejo.CommentAsync(owner, name, number, "ts-reviewer: dismissals require a maintainer workflow and are not accepted from an unverified comment.", CancellationToken.None); } catch (Exception ex) { logger.LogError(ex, "command failed"); } }
+    private async Task RunCommandAsync(string owner, string name, int number, string command, string? requestedSha)
+    { try { if (command is "review" or "recheck") await RunBoundedAsync(owner, name, number, requestedSha); else if (command == "escalate") await RunBoundedAsync(owner, name, number, requestedSha, options.EscalationModel); else if (command == "explain") await forgejo.CommentAsync(owner, name, number, $"ts-reviewer: the latest evidence and suggested fix are in the marked review comment. Use `@{options.BotLogin} recheck` after pushing a correction or `@{options.BotLogin} escalate` to re-review with {options.EscalationModel}.", CancellationToken.None); else if (command == "dismiss") await forgejo.CommentAsync(owner, name, number, "ts-reviewer: dismissals require a maintainer workflow and are not accepted from an unverified comment.", CancellationToken.None); } catch (Exception ex) { logger.LogError(ex, "command failed"); } }
 
     private sealed record WebhookEvent([property: JsonPropertyName("action")] string? Action, [property: JsonPropertyName("number")] int Number, [property: JsonPropertyName("ref")] string? Ref, [property: JsonPropertyName("after")] string? After, [property: JsonPropertyName("repository")] WebhookRepository? Repository, [property: JsonPropertyName("pull_request")] WebhookPullRequest? PullRequest, [property: JsonPropertyName("comment")] WebhookComment? Comment);
     private sealed record WebhookRepository([property: JsonPropertyName("name")] string Name, [property: JsonPropertyName("owner")] Owner Owner);
-    private sealed record WebhookPullRequest([property: JsonPropertyName("number")] int Number);
+    private sealed record WebhookPullRequest([property: JsonPropertyName("number")] int Number, [property: JsonPropertyName("head")] WebhookBranch? Head);
+    private sealed record WebhookBranch([property: JsonPropertyName("sha")] string? Sha);
     private sealed record WebhookComment([property: JsonPropertyName("id")] long Id, [property: JsonPropertyName("body")] string Body);
 }

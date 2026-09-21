@@ -23,7 +23,7 @@ public sealed record ReviewerOptions(
             ["organization"] = Environment.GetEnvironmentVariable("TS_REVIEWER_ORGANIZATION") ?? "TerraScale",
             ["bot-login"] = Environment.GetEnvironmentVariable("TS_REVIEWER_BOT_LOGIN") ?? "terrascale-bot",
             ["max-concurrent"] = Environment.GetEnvironmentVariable("TS_REVIEWER_MAX_CONCURRENT") ?? "20",
-            ["timeout"] = Environment.GetEnvironmentVariable("TS_REVIEWER_TIMEOUT") ?? "00:30:00",
+            ["timeout"] = Environment.GetEnvironmentVariable("TS_REVIEWER_TIMEOUT") ?? "00:10:00",
             ["webhook-secret"] = Environment.GetEnvironmentVariable("TS_REVIEWER_WEBHOOK_SECRET") ?? string.Empty,
             ["context-api-token"] = Environment.GetEnvironmentVariable("TS_REVIEWER_CONTEXT_API_TOKEN") ?? string.Empty,
             ["context-database"] = Environment.GetEnvironmentVariable("TS_REVIEWER_CONTEXT_DATABASE") ?? "data/reviewer-context.db",

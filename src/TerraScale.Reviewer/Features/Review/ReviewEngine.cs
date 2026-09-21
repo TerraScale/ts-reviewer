@@ -57,6 +57,11 @@ public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> 
             var result = Map(review.Comments ?? []);
             if (!string.Equals(review.Status, "complete", StringComparison.OrdinalIgnoreCase))
             {
+                // OpenCodeReview reports a clean patch with no selected review
+                // groups as a skipped review. There is no failure to surface
+                // when it selected nothing, so preserve the empty result and
+                // publish the normal successful review status.
+                if (result.Findings.Count == 0 && IsNoItemsSelected(review.Message)) return result;
                 if (result.Findings.Count == 0) throw new InvalidOperationException($"ocr review failed: {review.Message}");
                 logger.LogWarning("ocr review finished {Status} for {CloneUrl}: {Message}", review.Status, cloneUrl, review.Message);
                 result = result with { Summary = result.Summary + " (partial review: some review groups failed — re-run for full coverage)" };
@@ -84,6 +89,9 @@ public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> 
         }
         return new ReviewResult(BuildSummary(findings), findings);
     }
+
+    internal static bool IsNoItemsSelected(string? message) =>
+        message?.Contains("no items were selected", StringComparison.OrdinalIgnoreCase) == true;
 
     private static string Title(string content)
     {
