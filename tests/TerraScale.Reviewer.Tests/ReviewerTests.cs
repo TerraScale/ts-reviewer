@@ -106,6 +106,14 @@ public sealed class ReviewerTests
     }
 
     [Test]
+    public async Task NoItemsSelectedIsRecognizedAsACleanReview()
+    {
+        await Assert.That(ReviewEngine.IsNoItemsSelected("Review skipped: no items were selected.")).IsTrue();
+        await Assert.That(ReviewEngine.IsNoItemsSelected("review failed: provider unavailable")).IsFalse();
+        await Assert.That(ReviewEngine.IsNoItemsSelected(null)).IsFalse();
+    }
+
+    [Test]
     public async Task ReviewCommentIsStructuredForFindingsAndCleanForEmptyReviews()
     {
         var repository = new Repository(new Owner("TerraScale"), "ts-reviewer");
@@ -220,8 +228,10 @@ public sealed class ReviewerTests
                 repository = new { name = "widgets", owner = new { login = "TerraScale" } },
                 comment = new { id = 77, body = "@bot recheck" },
             });
+            var pendingStatus = await transport.PendingStatus.Task.WaitAsync(TimeSpan.FromSeconds(30));
             var publishedStatus = await transport.Status.Task.WaitAsync(TimeSpan.FromSeconds(30));
             var publishedReview = await transport.Review.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            await Assert.That(pendingStatus.GetProperty("state").GetString()).IsEqualTo("pending");
             await Assert.That(publishedReview.GetProperty("event").GetString()).IsEqualTo(expectedEvent);
             await Assert.That(publishedReview.GetProperty("commit_id").GetString()).IsEqualTo(headSha);
             await Assert.That(publishedReview.GetProperty("comments").GetArrayLength()).IsEqualTo(1);
@@ -570,6 +580,7 @@ public sealed class ReviewerTests
     private sealed class ReviewPublicationHandler(PullRequest pullRequest) : HttpMessageHandler
     {
         public TaskCompletionSource<JsonElement> Review { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<JsonElement> PendingStatus { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource<JsonElement> Status { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
@@ -589,7 +600,11 @@ public sealed class ReviewerTests
                 if (path.EndsWith("/reviews", StringComparison.Ordinal))
                     Review.TrySetResult(await request.Content!.ReadFromJsonAsync<JsonElement>(cancellationToken));
                 if (path.EndsWith("/statuses/" + pullRequest.Head.Sha, StringComparison.Ordinal))
-                    Status.TrySetResult(await request.Content!.ReadFromJsonAsync<JsonElement>(cancellationToken));
+                {
+                    var status = await request.Content!.ReadFromJsonAsync<JsonElement>(cancellationToken);
+                    if (status.GetProperty("state").GetString() == "pending") PendingStatus.TrySetResult(status);
+                    else Status.TrySetResult(status);
+                }
                 return new(HttpStatusCode.OK) { Content = JsonContent.Create(new { }) };
             }
             return new(HttpStatusCode.NotFound);
