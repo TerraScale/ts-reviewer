@@ -66,10 +66,11 @@ public sealed class ReviewerTests
     [Test]
     public async Task ConfigurationAcceptsExplicitArgumentsAndRejectsInvalidLimits()
     {
-        var options = ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy", "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token", "--operator-token=operator-test-token", "--forgejo-url=https://forgejo.test/", "--proxy-url=https://proxy.test/v1/", "--timeout=00:00:05", "--max-concurrent=3"]);
+        var options = ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy", "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token", "--operator-token=operator-test-token", "--forgejo-url=https://forgejo.test/", "--proxy-url=https://proxy.test/v1/", "--timeout=00:00:05", "--max-concurrent=3", "--ocr-concurrency=2"]);
         await Assert.That(options.ForgejoUrl).IsEqualTo("https://forgejo.test");
         await Assert.That(options.ProxyUrl).IsEqualTo("https://proxy.test/v1");
         await Assert.That(options.MaxConcurrent).IsEqualTo(3);
+        await Assert.That(options.OcrConcurrency).IsEqualTo(2);
         await Assert.That(options.ContextMaxAttempts).IsEqualTo(5);
         await Assert.That(options.ContextRetryDelay).IsEqualTo(TimeSpan.FromSeconds(1));
 
@@ -200,6 +201,7 @@ public sealed class ReviewerTests
             await Assert.That(recorded.Contains("--from " + baseSha)).IsTrue();
             await Assert.That(recorded.Contains("--to " + headSha)).IsTrue();
             await Assert.That(recorded.Contains("--format json")).IsTrue();
+            await Assert.That(recorded.Contains("--concurrency 1")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_URL=https://proxy.test/v1")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_TOKEN=proxy")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_MODEL=review")).IsTrue();
