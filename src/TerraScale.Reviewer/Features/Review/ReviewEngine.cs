@@ -44,12 +44,14 @@ public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> 
                 throw new InvalidOperationException("pull request head moved before the review started");
             await RunGitAsync(home, repository, ct, "checkout", "--quiet", "--detach", head);
             var output = Path.Combine(root, "review.json");
-            // ocr's --timeout bounds each concurrent subtask, not the whole
-            // run; the outer ReviewTimeout deadline is the hard backstop and
-            // a review that outlives it fails like any other engine error.
+            // ocr's --timeout bounds each concurrent subtask in minutes, not
+            // the whole run; 15 accommodates 180s per-request LLM timeouts
+            // with the SDK's retry backoff. The outer ReviewTimeout deadline
+            // is the hard backstop and a review that outlives it fails like
+            // any other engine error.
             await RunOcrAsync(home, repository, model,
                 ["review", "--from", @base, "--to", head, "--concurrency", options.MaxConcurrent.ToString(),
-                 "--timeout", "5", "--format", "json", "--audience", "agent", "--color", "never", "--output", output], ct);
+                 "--timeout", "15", "--format", "json", "--audience", "agent", "--color", "never", "--output", output], ct);
             var review = JsonSerializer.Deserialize<OcrReview>(await File.ReadAllTextAsync(output, ct), JsonOptions)
                 ?? throw new InvalidOperationException("ocr returned no review");
             var result = Map(review.Comments ?? []);
@@ -140,6 +142,9 @@ public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> 
             environment["OCR_LLM_TOKEN"] = options.ProxyToken;
             environment["OCR_LLM_MODEL"] = model ?? options.Model;
             environment["OCR_LLM_PROTOCOL"] = "openai";
+            // 180s per LLM request: the upstream zai GLM API is slow and
+            // flaky; ocr's SDK default is a 5-minute timeout with 5 retries.
+            environment["OCR_LLM_TIMEOUT"] = "180";
             environment["OCR_ENABLE_TELEMETRY"] = "false";
         }, ct, arguments);
 
@@ -159,10 +164,13 @@ public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> 
         };
         foreach (var argument in arguments) process.StartInfo.ArgumentList.Add(argument);
         configureEnvironment(process.StartInfo.Environment);
+        // Registered before Start so a cancellation that lands between the two
+        // cannot leak a running child; killing a not-yet-started process is
+        // already swallowed by the InvalidOperationException catch.
+        using var registration = ct.Register(() => { try { process.Kill(entireProcessTree: true); } catch (InvalidOperationException) { } catch (Win32Exception) { } });
         process.Start();
         var stdout = process.StandardOutput.ReadToEndAsync(ct);
         var stderr = process.StandardError.ReadToEndAsync(ct);
-        using var registration = ct.Register(() => { try { process.Kill(entireProcessTree: true); } catch (InvalidOperationException) { } catch (Win32Exception) { } });
         await process.WaitForExitAsync(ct);
         var error = await stderr;
         if (process.ExitCode != 0)

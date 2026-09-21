@@ -194,12 +194,60 @@ public sealed class ReviewerTests
             await Assert.That(recorded.Contains("OCR_LLM_TOKEN=proxy")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_MODEL=review")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_PROTOCOL=openai")).IsTrue();
+            await Assert.That(recorded.Contains("OCR_LLM_TIMEOUT=180")).IsTrue();
             await Assert.That(recorded.Contains("OCR_ENABLE_TELEMETRY=false")).IsTrue();
 
             // An escalated review re-runs the same head on the escalation model.
             await engine.RunAsync(pullRequest, CancellationToken.None, "gpt-6-astra");
             recorded = await File.ReadAllTextAsync(log);
             await Assert.That(recorded.Contains("OCR_LLM_MODEL=gpt-6-astra")).IsTrue();
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+        }
+    }
+
+    [Test]
+    public async Task ReviewEngineKillsOcrAndPropagatesCancellationWhenTheDeadlinePasses()
+    {
+        if (!ToolAvailable("git") || !ToolAvailable("chmod")) throw new TUnit.Core.Exceptions.SkipTestException("requires a POSIX host with git and chmod");
+
+        var root = Path.Combine(Path.GetTempPath(), "ts-reviewer-cancel-" + Guid.NewGuid().ToString("N"));
+        var stub = Path.Combine(root, "stub");
+        Directory.CreateDirectory(stub);
+        var work = Path.Combine(root, "work");
+        try
+        {
+            var remote = Path.Combine(root, "TerraScale", "widgets.git");
+            Directory.CreateDirectory(Path.GetDirectoryName(remote)!);
+            await RunGitAsync(root, "init", "--quiet", "-b", "main", "--bare", remote);
+            Directory.CreateDirectory(work);
+            await RunGitAsync(root, "clone", "--quiet", remote, work);
+            await RunGitAsync(work, "config", "user.email", "review@test");
+            await RunGitAsync(work, "config", "user.name", "review");
+            await File.WriteAllTextAsync(Path.Combine(work, "a.cs"), "class A {}\n");
+            await RunGitAsync(work, "add", ".");
+            await RunGitAsync(work, "commit", "--quiet", "-m", "base");
+            var baseSha = (await RunGitAsync(work, "rev-parse", "HEAD")).Trim();
+            await File.WriteAllTextAsync(Path.Combine(work, "a.cs"), "class A { public void B() { } }\n");
+            await RunGitAsync(work, "add", ".");
+            await RunGitAsync(work, "commit", "--quiet", "-m", "head");
+            var headSha = (await RunGitAsync(work, "rev-parse", "HEAD")).Trim();
+            await RunGitAsync(work, "push", "--quiet", "origin", baseSha + ":refs/heads/main", headSha + ":refs/pull/9/head");
+
+            // The ocr stub blocks well past the deadline so the review cancels mid-run.
+            await File.WriteAllTextAsync(Path.Combine(stub, "ocr"), "#!/bin/sh\nsleep 60\n");
+            await RunChmodAsync(Path.Combine(stub, "ocr"));
+
+            var options = Options(Path.Combine(root, "context.db")) with { ForgejoUrl = root };
+            var engine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, Path.Combine(stub, "ocr"));
+            var repository = new Repository(new Owner("TerraScale"), "widgets");
+            var pullRequest = new PullRequest(9, "Test change", "", new Branch(baseSha, "main", repository), new Branch(headSha, "feature", repository));
+            var canceled = false;
+            try { using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10)); await engine.RunAsync(pullRequest, cts.Token); }
+            catch (OperationCanceledException) { canceled = true; }
+            await Assert.That(canceled).IsTrue();
         }
         finally
         {

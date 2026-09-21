@@ -33,13 +33,13 @@ jobs:
             --runtime linux-x64 --nologo
 
       - name: Verify dependency audit failure handling
-        run: python3 -m unittest discover -s scripts -p test_check_nuget_vulnerabilities.py
+        run: dotnet run scripts/check-nuget-vulnerabilities.tests.cs -- --minimum-expected-tests 13
 
       - name: Fail closed on vulnerable NuGet packages
         run: |
           set -euo pipefail
           export NUGET_PACKAGES="${RUNNER_TEMP:-/tmp}/ts-reviewer-nuget"
-          python3 scripts/check_nuget_vulnerabilities.py \
+          dotnet run scripts/check-nuget-vulnerabilities.cs \
             src/TerraScale.Reviewer/TerraScale.Reviewer.csproj \
             tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj
 

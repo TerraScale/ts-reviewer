@@ -128,6 +128,8 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, C
         if (parsed.Count > 0) files = parsed;
         ReviewResult result;
         try { result = await engine.RunAsync(pr, ct, model); }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        { await FailStatusAsync(owner, name, pr.Head.Sha, $"review timed out after {options.ReviewTimeout} — raise TS_REVIEWER_TIMEOUT if this recurs"); return; }
         catch (Exception ex) { await FailStatusAsync(owner, name, pr.Head.Sha, "review incomplete: " + ex.Message); return; }
         var latest = await forgejo.PullAsync(owner, name, number, ct);
         if (latest is null || !string.Equals(latest.Head.Sha, pr.Head.Sha, StringComparison.OrdinalIgnoreCase)) { logger.LogInformation("review discarded as stale for {Repository}#{Number}", owner + "/" + name, number); return; }
