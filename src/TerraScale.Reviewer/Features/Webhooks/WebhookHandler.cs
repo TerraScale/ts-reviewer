@@ -145,7 +145,7 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, C
             .Where(x => x.position > 0)
             .Select(x => new ReviewComment($"**{x.f.Severity.Trim().ToUpperInvariant()} · {x.f.Title.Trim()}**\n\n{x.f.Body.Trim()}\n\n**Suggested fix**\n{x.f.Fix.Trim()}", x.f.Path, x.position))
             .ToList();
-        if (comments.Count > 0) await forgejo.ReviewAsync(owner, name, number, new PullReview("ts-reviewer findings are documented above.", critical ? "REQUEST_CHANGES" : "APPROVE", pr.Head.Sha, comments), ct);
+        if (comments.Count > 0) await forgejo.ReviewAsync(owner, name, number, new PullReview("ts-reviewer findings are documented above.", critical ? "REQUEST_CHANGES" : "APPROVED", pr.Head.Sha, comments), ct);
         await forgejo.StatusAsync(owner, name, pr.Head.Sha, new CommitStatus(critical ? "failure" : "success", null, critical ? "Critical/high findings require changes" : "No critical or high findings", "ts-reviewer"), ct);
     }
     private async Task FailStatusAsync(string owner, string name, string sha, string description)
