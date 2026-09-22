@@ -81,6 +81,25 @@ public sealed class ReviewerTests
     }
 
     [Test]
+    public async Task ConfigurationDefaultsReviewTimeoutToOneHour()
+    {
+        const string environmentName = "TS_REVIEWER_TIMEOUT";
+        var previous = Environment.GetEnvironmentVariable(environmentName);
+        try
+        {
+            Environment.SetEnvironmentVariable(environmentName, null);
+            var options = ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy",
+                "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token",
+                "--operator-token=operator-test-token"]);
+            await Assert.That(options.ReviewTimeout).IsEqualTo(TimeSpan.FromHours(1));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(environmentName, previous);
+        }
+    }
+
+    [Test]
     public async Task OcrCommentsMapToFindingsAndDropDuplicates()
     {
         var comment = new OcrComment("src/Worker.cs", "The fallback bypasses validation.", "Validate(input);", "return Fallback(input);", 42, 42, "bug", "high");
