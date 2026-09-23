@@ -163,7 +163,7 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, C
         catch (Exception ex) { await FailStatusAsync(owner, name, pr.Head.Sha, "review incomplete: " + ex.Message); return; }
         var latest = await forgejo.PullAsync(owner, name, number, ct);
         if (latest is null || !string.Equals(latest.Head.Sha, pr.Head.Sha, StringComparison.OrdinalIgnoreCase)) { logger.LogInformation("review discarded as stale for {Repository}#{Number}", owner + "/" + name, number); return; }
-        var critical = result.Findings.Any(x => x.Severity is "critical" or "high");
+        var hasFindings = result.Findings.Count > 0;
         var body = Format(pr, result, model ?? options.Model);
         var existing = await forgejo.CommentsAsync(owner, name, number, ct);
         var updated = false;
@@ -175,8 +175,8 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, C
             .Where(x => x.position > 0)
             .Select(x => new ReviewComment($"**{x.f.Severity.Trim().ToUpperInvariant()} · {x.f.Title.Trim()}**\n\n{x.f.Body.Trim()}\n\n**Suggested fix**\n{x.f.Fix.Trim()}", x.f.Path, x.position))
             .ToList();
-        if (comments.Count > 0) await forgejo.ReviewAsync(owner, name, number, new PullReview("ts-reviewer findings are documented above.", critical ? "REQUEST_CHANGES" : "APPROVED", pr.Head.Sha, comments), ct);
-        await forgejo.StatusAsync(owner, name, pr.Head.Sha, new CommitStatus(critical ? "failure" : "success", null, critical ? "Critical/high findings require changes" : "No critical or high findings", "ts-reviewer"), ct);
+        if (hasFindings) await forgejo.ReviewAsync(owner, name, number, new PullReview("ts-reviewer findings are documented above.", "REQUEST_CHANGES", pr.Head.Sha, comments), ct);
+        await forgejo.StatusAsync(owner, name, pr.Head.Sha, new CommitStatus(hasFindings ? "failure" : "success", null, hasFindings ? "Findings require changes" : "No findings", "ts-reviewer"), ct);
     }
     private async Task FailStatusAsync(string owner, string name, string sha, string description)
     { using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15)); try { await forgejo.StatusAsync(owner, name, sha, new CommitStatus("error", null, description, "ts-reviewer"), timeout.Token); } catch (Exception ex) { logger.LogError(ex, "publish failed review status"); } }

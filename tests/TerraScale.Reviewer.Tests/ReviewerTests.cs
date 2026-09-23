@@ -157,7 +157,8 @@ public sealed class ReviewerTests
 
     [Test]
     [Arguments("high", "REQUEST_CHANGES", "failure")]
-    [Arguments("medium", "APPROVED", "success")]
+    [Arguments("medium", "REQUEST_CHANGES", "failure")]
+    [Arguments("low", "REQUEST_CHANGES", "failure")]
     public async Task ReviewEngineRunsOcrOverAClonedPullRequestRange(string severity, string expectedEvent, string expectedStatus)
     {
         if (!ToolAvailable("git") || !ToolAvailable("chmod")) throw new TUnit.Core.Exceptions.SkipTestException("requires a POSIX host with git and chmod");
