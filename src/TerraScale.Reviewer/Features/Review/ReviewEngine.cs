@@ -19,6 +19,7 @@ public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> 
     private readonly string _ocrPath = ocrPath ?? "ocr";
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(5);
 
     public async Task<ReviewResult> RunAsync(PullRequest pr, CancellationToken ct, string? model = null)
     {
@@ -54,9 +55,9 @@ public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> 
             for (var attempt = 1; ; attempt++)
             {
                 try { return await ReviewOnceAsync(home, repository, root, @base, head, model, cloneUrl, ct); }
-                catch (Exception ex) when (ex is InvalidOperationException or JsonException && attempt < options.OcrMaxAttempts)
+                catch (Exception ex) when (ex is InvalidOperationException or JsonException or IOException && attempt < options.OcrMaxAttempts)
                 {
-                    var delay = options.OcrRetryDelay * (1 << (attempt - 1));
+                    var delay = RetryDelay(options.OcrRetryDelay, attempt);
                     logger.LogWarning(ex, "ocr attempt {Attempt} of {MaxAttempts} failed for {CloneUrl}; retrying in {Delay}", attempt, options.OcrMaxAttempts, cloneUrl, delay);
                     await Task.Delay(delay, ct);
                 }
@@ -97,6 +98,10 @@ public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> 
         }
         return result;
     }
+
+    /// <summary>Exponential backoff from the base delay, capped at five minutes per retry.</summary>
+    internal static TimeSpan RetryDelay(TimeSpan baseDelay, int attempt) =>
+        TimeSpan.FromTicks(Math.Min(baseDelay.Ticks * (1L << Math.Clamp(attempt - 1, 0, 20)), MaxRetryDelay.Ticks));
 
     internal static ReviewResult Map(IReadOnlyList<OcrComment> comments)
     {
