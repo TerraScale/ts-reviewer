@@ -73,6 +73,8 @@ public sealed class ReviewerTests
         await Assert.That(options.OcrConcurrency).IsEqualTo(2);
         await Assert.That(options.ContextMaxAttempts).IsEqualTo(5);
         await Assert.That(options.ContextRetryDelay).IsEqualTo(TimeSpan.FromSeconds(1));
+        await Assert.That(options.OcrMaxAttempts).IsEqualTo(3);
+        await Assert.That(options.OcrRetryDelay).IsEqualTo(TimeSpan.FromSeconds(30));
 
         var rejected = false;
         try { ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy", "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token", "--operator-token=operator-test-token", "--max-concurrent=0"]); }
@@ -159,7 +161,8 @@ public sealed class ReviewerTests
     [Arguments("high", "REQUEST_CHANGES", "failure")]
     [Arguments("medium", "REQUEST_CHANGES", "failure")]
     [Arguments("low", "REQUEST_CHANGES", "failure")]
-    public async Task ReviewEngineRunsOcrOverAClonedPullRequestRange(string severity, string expectedEvent, string expectedStatus)
+    [Arguments(null, "APPROVED", "success")]
+    public async Task ReviewEngineRunsOcrOverAClonedPullRequestRange(string? severity, string expectedEvent, string expectedStatus)
     {
         if (!ToolAvailable("git") || !ToolAvailable("chmod")) throw new TUnit.Core.Exceptions.SkipTestException("requires a POSIX host with git and chmod");
 
@@ -201,12 +204,13 @@ public sealed class ReviewerTests
             await File.WriteAllTextAsync(review, JsonSerializer.Serialize(new
             {
                 status = "complete",
-                message = "Review complete: 1 finding(s) across 1 selected item(s).",
-                comments = new object[]
+                message = "Review complete.",
+                comments = severity is null ? [] : new object[]
                 {
                     new { path = "a.cs", content = "Empty method body hides the failure path.", suggestion_code = "public void B() { throw new NotSupportedException(); }", existing_code = "public void B() { }", start_line = 1, end_line = 1, category = "bug", severity },
                 },
             }));
+            var expectedFindings = severity is null ? 0 : 1;
             await RunChmodAsync(Path.Combine(stub, "ocr"));
 
             var options = Options(database) with { ForgejoUrl = root };
@@ -214,9 +218,12 @@ public sealed class ReviewerTests
             var repository = new Repository(new Owner("TerraScale"), "widgets");
             var pullRequest = new PullRequest(9, "Test change", "", new Branch(baseSha, "main", repository), new Branch(headSha, "feature", repository));
             var result = await engine.RunAsync(pullRequest, CancellationToken.None);
-            await Assert.That(result.Findings.Count).IsEqualTo(1);
-            await Assert.That(result.Findings[0].Path).IsEqualTo("a.cs");
-            await Assert.That(result.Findings[0].Severity).IsEqualTo(severity);
+            await Assert.That(result.Findings.Count).IsEqualTo(expectedFindings);
+            if (severity is not null)
+            {
+                await Assert.That(result.Findings[0].Path).IsEqualTo("a.cs");
+                await Assert.That(result.Findings[0].Severity).IsEqualTo(severity);
+            }
             var recorded = await File.ReadAllTextAsync(log);
             await Assert.That(recorded.Contains("--from " + baseSha)).IsTrue();
             await Assert.That(recorded.Contains("--to " + headSha)).IsTrue();
@@ -256,8 +263,71 @@ public sealed class ReviewerTests
             await Assert.That(pendingStatus.GetProperty("state").GetString()).IsEqualTo("pending");
             await Assert.That(publishedReview.GetProperty("event").GetString()).IsEqualTo(expectedEvent);
             await Assert.That(publishedReview.GetProperty("commit_id").GetString()).IsEqualTo(headSha);
-            await Assert.That(publishedReview.GetProperty("comments").GetArrayLength()).IsEqualTo(1);
+            await Assert.That(publishedReview.GetProperty("comments").GetArrayLength()).IsEqualTo(expectedFindings);
             await Assert.That(publishedStatus.GetProperty("state").GetString()).IsEqualTo(expectedStatus);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+        }
+    }
+
+    [Test]
+    public async Task ReviewEngineRetriesFailedOcrRuns()
+    {
+        if (!ToolAvailable("git") || !ToolAvailable("chmod")) throw new TUnit.Core.Exceptions.SkipTestException("requires a POSIX host with git and chmod");
+
+        var root = Path.Combine(Path.GetTempPath(), "ts-reviewer-retry-" + Guid.NewGuid().ToString("N"));
+        var stub = Path.Combine(root, "stub");
+        Directory.CreateDirectory(stub);
+        var work = Path.Combine(root, "work");
+        try
+        {
+            var remote = Path.Combine(root, "TerraScale", "widgets.git");
+            Directory.CreateDirectory(Path.GetDirectoryName(remote)!);
+            await RunGitAsync(root, "init", "--quiet", "-b", "main", "--bare", remote);
+            Directory.CreateDirectory(work);
+            await RunGitAsync(root, "clone", "--quiet", remote, work);
+            await RunGitAsync(work, "config", "user.email", "review@test");
+            await RunGitAsync(work, "config", "user.name", "review");
+            await File.WriteAllTextAsync(Path.Combine(work, "a.cs"), "class A {}\n");
+            await RunGitAsync(work, "add", ".");
+            await RunGitAsync(work, "commit", "--quiet", "-m", "base");
+            var baseSha = (await RunGitAsync(work, "rev-parse", "HEAD")).Trim();
+            await File.WriteAllTextAsync(Path.Combine(work, "a.cs"), "class A { public void B() { } }\n");
+            await RunGitAsync(work, "add", ".");
+            await RunGitAsync(work, "commit", "--quiet", "-m", "head");
+            var headSha = (await RunGitAsync(work, "rev-parse", "HEAD")).Trim();
+            await RunGitAsync(work, "push", "--quiet", "origin", baseSha + ":refs/heads/main", headSha + ":refs/pull/9/head");
+
+            // The first run fails like an exhausted LLM endpoint, the second
+            // reports a partial review with no findings, and the third succeeds.
+            var attempts = Path.Combine(stub, "attempts");
+            await File.WriteAllTextAsync(Path.Combine(stub, "ocr"),
+                "#!/bin/sh\n" +
+                "echo run >> \"" + attempts + "\"\n" +
+                "count=$(wc -l < \"" + attempts + "\")\n" +
+                "out=\"\"; while [ $# -gt 0 ]; do case $1 in --output) out=$2 ;; esac; shift; done\n" +
+                "if [ \"$count\" -eq 1 ]; then echo 'all 1 file review(s) failed' >&2; exit 1; fi\n" +
+                "if [ \"$count\" -eq 2 ]; then echo '{\"status\":\"partial\",\"message\":\"0 of 1 selected items reviewed\",\"comments\":[]}' > \"$out\"; exit 0; fi\n" +
+                "echo '{\"status\":\"complete\",\"message\":\"Review complete.\",\"comments\":[]}' > \"$out\"\n");
+            await RunChmodAsync(Path.Combine(stub, "ocr"));
+
+            var options = Options(Path.Combine(root, "context.db")) with { ForgejoUrl = root, OcrRetryBaseDelay = TimeSpan.FromMilliseconds(10) };
+            var engine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, Path.Combine(stub, "ocr"));
+            var repository = new Repository(new Owner("TerraScale"), "widgets");
+            var pullRequest = new PullRequest(9, "Test change", "", new Branch(baseSha, "main", repository), new Branch(headSha, "feature", repository));
+            var result = await engine.RunAsync(pullRequest, CancellationToken.None);
+            await Assert.That(result.Findings.Count).IsEqualTo(0);
+            await Assert.That((await File.ReadAllLinesAsync(attempts)).Length).IsEqualTo(3);
+
+            // Exhausting every attempt surfaces the last failure.
+            await File.WriteAllTextAsync(attempts, string.Empty);
+            var limited = new ReviewEngine(options with { OcrMaxAttempts = 1 }, NullLogger<ReviewEngine>.Instance, Path.Combine(stub, "ocr"));
+            var failed = false;
+            try { await limited.RunAsync(pullRequest, CancellationToken.None); }
+            catch (InvalidOperationException) { failed = true; }
+            await Assert.That(failed).IsTrue();
         }
         finally
         {

@@ -47,35 +47,55 @@ public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> 
             if (!string.Equals(head, pr.Head.Sha, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("pull request head moved before the review started");
             await RunGitAsync(home, repository, ct, "checkout", "--quiet", "--detach", head);
-            var output = Path.Combine(root, "review.json");
-            // ocr's --timeout bounds each concurrent subtask in minutes, not
-            // the whole run; 15 accommodates 180s per-request LLM timeouts
-            // with the SDK's retry backoff. The outer ReviewTimeout deadline
-            // is the hard backstop and a review that outlives it fails like
-            // any other engine error.
-            await RunOcrAsync(home, repository, model,
-                ["review", "--from", @base, "--to", head, "--concurrency", options.OcrConcurrency.ToString(),
-                 "--timeout", "15", "--format", "json", "--audience", "agent", "--color", "never", "--output", output], ct);
-            var review = JsonSerializer.Deserialize<OcrReview>(await File.ReadAllTextAsync(output, ct), JsonOptions)
-                ?? throw new InvalidOperationException("ocr returned no review");
-            var result = Map(review.Comments ?? []);
-            if (!string.Equals(review.Status, "complete", StringComparison.OrdinalIgnoreCase))
+            // The upstream LLM API fails whole ocr runs on rate limits and
+            // flaky responses; retry the run with exponential backoff before
+            // surfacing an incomplete review. The outer ReviewTimeout deadline
+            // still bounds every attempt combined.
+            for (var attempt = 1; ; attempt++)
             {
-                // OpenCodeReview reports a clean patch with no selected review
-                // groups as a skipped review. There is no failure to surface
-                // when it selected nothing, so preserve the empty result and
-                // publish the normal successful review status.
-                if (result.Findings.Count == 0 && IsNoItemsSelected(review.Message)) return result;
-                if (result.Findings.Count == 0) throw new InvalidOperationException($"ocr review failed: {review.Message}");
-                logger.LogWarning("ocr review finished {Status} for {CloneUrl}: {Message}", review.Status, cloneUrl, review.Message);
-                result = result with { Summary = result.Summary + " (partial review: some review groups failed — re-run for full coverage)" };
+                try { return await ReviewOnceAsync(home, repository, root, @base, head, model, cloneUrl, ct); }
+                catch (Exception ex) when (ex is InvalidOperationException or JsonException && attempt < options.OcrMaxAttempts)
+                {
+                    var delay = options.OcrRetryDelay * (1 << (attempt - 1));
+                    logger.LogWarning(ex, "ocr attempt {Attempt} of {MaxAttempts} failed for {CloneUrl}; retrying in {Delay}", attempt, options.OcrMaxAttempts, cloneUrl, delay);
+                    await Task.Delay(delay, ct);
+                }
             }
-            return result;
         }
         finally
         {
             try { Directory.Delete(root, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
         }
+    }
+
+    private async Task<ReviewResult> ReviewOnceAsync(string home, string repository, string root, string @base, string head, string? model, string cloneUrl, CancellationToken ct)
+    {
+        // A fresh output path per attempt so a failed run can never leave a
+        // stale review behind for the next attempt to read.
+        var output = Path.Combine(root, "review-" + Guid.NewGuid().ToString("N") + ".json");
+        // ocr's --timeout bounds each concurrent subtask in minutes, not
+        // the whole run; 15 accommodates 180s per-request LLM timeouts
+        // with the SDK's retry backoff. The outer ReviewTimeout deadline
+        // is the hard backstop and a review that outlives it fails like
+        // any other engine error.
+        await RunOcrAsync(home, repository, model,
+            ["review", "--from", @base, "--to", head, "--concurrency", options.OcrConcurrency.ToString(),
+             "--timeout", "15", "--format", "json", "--audience", "agent", "--color", "never", "--output", output], ct);
+        var review = JsonSerializer.Deserialize<OcrReview>(await File.ReadAllTextAsync(output, ct), JsonOptions)
+            ?? throw new InvalidOperationException("ocr returned no review");
+        var result = Map(review.Comments ?? []);
+        if (!string.Equals(review.Status, "complete", StringComparison.OrdinalIgnoreCase))
+        {
+            // OpenCodeReview reports a clean patch with no selected review
+            // groups as a skipped review. There is no failure to surface
+            // when it selected nothing, so preserve the empty result and
+            // publish the normal successful review status.
+            if (result.Findings.Count == 0 && IsNoItemsSelected(review.Message)) return result;
+            if (result.Findings.Count == 0) throw new InvalidOperationException($"ocr review failed: {review.Message}");
+            logger.LogWarning("ocr review finished {Status} for {CloneUrl}: {Message}", review.Status, cloneUrl, review.Message);
+            result = result with { Summary = result.Summary + " (partial review: some review groups failed — re-run for full coverage)" };
+        }
+        return result;
     }
 
     internal static ReviewResult Map(IReadOnlyList<OcrComment> comments)

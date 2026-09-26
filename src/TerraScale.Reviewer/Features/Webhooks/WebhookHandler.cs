@@ -175,7 +175,12 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, C
             .Where(x => x.position > 0)
             .Select(x => new ReviewComment($"**{x.f.Severity.Trim().ToUpperInvariant()} · {x.f.Title.Trim()}**\n\n{x.f.Body.Trim()}\n\n**Suggested fix**\n{x.f.Fix.Trim()}", x.f.Path, x.position))
             .ToList();
-        if (hasFindings) await forgejo.ReviewAsync(owner, name, number, new PullReview("ts-reviewer findings are documented above.", "REQUEST_CHANGES", pr.Head.Sha, comments), ct);
+        // Clean reviews are submitted as approvals so branch protection that
+        // requires an approving review can merge on a passing ts-reviewer run.
+        var review = hasFindings
+            ? new PullReview("ts-reviewer findings are documented above.", "REQUEST_CHANGES", pr.Head.Sha, comments)
+            : new PullReview("ts-reviewer found no issues.", "APPROVED", pr.Head.Sha, comments);
+        await forgejo.ReviewAsync(owner, name, number, review, ct);
         await forgejo.StatusAsync(owner, name, pr.Head.Sha, new CommitStatus(hasFindings ? "failure" : "success", null, hasFindings ? "Findings require changes" : "No findings", "ts-reviewer"), ct);
     }
     private async Task FailStatusAsync(string owner, string name, string sha, string description)
