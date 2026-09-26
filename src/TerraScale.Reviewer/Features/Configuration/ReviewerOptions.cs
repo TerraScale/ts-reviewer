@@ -5,9 +5,11 @@ public sealed record ReviewerOptions(
     string Model, string Organization, string BotLogin, int MaxConcurrent, TimeSpan ReviewTimeout,
     string WebhookSecret, string ContextApiToken, string ContextDatabasePath, int ContextMaxFiles,
     int ContextMaxAttempts = 5, TimeSpan? ContextRetryBaseDelay = null, string OperatorToken = "",
-    string EscalationModel = "gpt-6-astra", int OcrConcurrency = 1)
+    string EscalationModel = "gpt-6-astra", int OcrConcurrency = 1, int OcrMaxAttempts = 3,
+    TimeSpan? OcrRetryBaseDelay = null)
 {
     public TimeSpan ContextRetryDelay => ContextRetryBaseDelay ?? TimeSpan.FromSeconds(1);
+    public TimeSpan OcrRetryDelay => OcrRetryBaseDelay ?? TimeSpan.FromSeconds(30);
 
     public static ReviewerOptions Load(string[] args)
     {
@@ -24,6 +26,8 @@ public sealed record ReviewerOptions(
             ["bot-login"] = Environment.GetEnvironmentVariable("TS_REVIEWER_BOT_LOGIN") ?? "terrascale-bot",
             ["max-concurrent"] = Environment.GetEnvironmentVariable("TS_REVIEWER_MAX_CONCURRENT") ?? "1",
             ["ocr-concurrency"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_CONCURRENCY") ?? "1",
+            ["ocr-max-attempts"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_MAX_ATTEMPTS") ?? "3",
+            ["ocr-retry-base-delay"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_RETRY_BASE_DELAY") ?? "00:00:30",
             ["timeout"] = Environment.GetEnvironmentVariable("TS_REVIEWER_TIMEOUT") ?? "01:00:00",
             ["webhook-secret"] = Environment.GetEnvironmentVariable("TS_REVIEWER_WEBHOOK_SECRET") ?? string.Empty,
             ["context-api-token"] = Environment.GetEnvironmentVariable("TS_REVIEWER_CONTEXT_API_TOKEN") ?? string.Empty,
@@ -48,6 +52,11 @@ public sealed record ReviewerOptions(
         if (maxConcurrent is < 1 or > 100) throw new InvalidOperationException("max-concurrent must be between 1 and 100");
         var ocrConcurrency = ParseInt(values, "ocr-concurrency");
         if (ocrConcurrency is < 1 or > 10) throw new InvalidOperationException("ocr-concurrency must be between 1 and 10");
+        var ocrMaxAttempts = ParseInt(values, "ocr-max-attempts");
+        if (ocrMaxAttempts is < 1 or > 10) throw new InvalidOperationException("ocr-max-attempts must be between 1 and 10");
+        if (!TimeSpan.TryParse(values["ocr-retry-base-delay"], out var ocrRetryBaseDelay)
+            || ocrRetryBaseDelay <= TimeSpan.Zero || ocrRetryBaseDelay > TimeSpan.FromMinutes(5))
+            throw new InvalidOperationException("ocr-retry-base-delay must be positive and at most five minutes");
         if (!TimeSpan.TryParse(values["timeout"], out var reviewTimeout) || reviewTimeout <= TimeSpan.Zero)
             throw new InvalidOperationException("timeout must be positive");
         var contextMaxFiles = ParseInt(values, "context-max-files");
@@ -60,7 +69,8 @@ public sealed record ReviewerOptions(
         return new ReviewerOptions(Trim(values["listen"]!), Trim(values["forgejo-url"]!), forgejoToken,
             Trim(values["proxy-url"]!), proxyToken, values["model"]!, values["organization"]!, values["bot-login"]!,
             maxConcurrent, reviewTimeout, webhookSecret, contextApiToken, values["context-database"]!, contextMaxFiles,
-            contextMaxAttempts, contextRetryBaseDelay, operatorToken, values["escalation-model"]!, ocrConcurrency);
+            contextMaxAttempts, contextRetryBaseDelay, operatorToken, values["escalation-model"]!, ocrConcurrency,
+            ocrMaxAttempts, ocrRetryBaseDelay);
     }
     private static string Required(IReadOnlyDictionary<string, string?> values, string key, string environmentName) =>
         string.IsNullOrWhiteSpace(values[key]) ? throw new InvalidOperationException($"{environmentName} is required") : values[key]!;
