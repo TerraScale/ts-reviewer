@@ -7,6 +7,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: ts-reviewer-${{ forgejo.workflow }}-${{ forgejo.ref }}
+  cancel-in-progress: ${{ forgejo.ref != 'refs/heads/main' }}
+
 jobs:
   ci:
     name: Check and build ts-reviewer
@@ -16,45 +20,35 @@ jobs:
       FORGEJO_SHA: ${{ forgejo.sha }}
     steps:
       - name: Check out the event revision
-        uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           github-server-url: "https://git.terrascale.tech"
           ref: ${{ forgejo.sha }}
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: false
 
       - name: Restore reviewer tests
-        run: |
-          set -euo pipefail
-          export NUGET_PACKAGES="${RUNNER_TEMP:-/tmp}/ts-reviewer-nuget"
-          mkdir -p -- "${NUGET_PACKAGES}"
-          exec dotnet restore \
-            tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj \
-            --runtime linux-x64 --nologo
+        run: >-
+          dotnet restore tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj
+          --runtime linux-x64 --nologo
 
       - name: Verify dependency audit failure handling
         run: dotnet run scripts/check-nuget-vulnerabilities.tests.cs -- --minimum-expected-tests 13
 
       - name: Fail closed on vulnerable NuGet packages
-        run: |
-          set -euo pipefail
-          export NUGET_PACKAGES="${RUNNER_TEMP:-/tmp}/ts-reviewer-nuget"
-          dotnet run scripts/check-nuget-vulnerabilities.cs \
-            src/TerraScale.Reviewer/TerraScale.Reviewer.csproj \
-            tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj
+        run: >-
+          dotnet run scripts/check-nuget-vulnerabilities.cs
+          src/TerraScale.Reviewer/TerraScale.Reviewer.csproj
+          tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj
 
       - name: Build reviewer tests and service
-        run: |
-          set -euo pipefail
-          export NUGET_PACKAGES="${RUNNER_TEMP:-/tmp}/ts-reviewer-nuget"
-          exec dotnet build \
-            tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj \
-            --configuration Release --no-restore --nologo
+        run: >-
+          dotnet build tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj
+          --configuration Release --no-restore --nologo
 
       - name: Run reviewer tests
         run: |
           set -euo pipefail
-          export NUGET_PACKAGES="${RUNNER_TEMP:-/tmp}/ts-reviewer-nuget"
           mkdir -p -- artifacts/ci/tests
           test_log="artifacts/ci/tests/reviewer-tests.log"
           dotnet run \
@@ -84,8 +78,6 @@ jobs:
       - name: Build and inspect the release image
         run: |
           set -euo pipefail
-          export NUGET_PACKAGES="${RUNNER_TEMP:-/tmp}/ts-reviewer-nuget"
-
           source_commit="$(git rev-parse HEAD)"
           test "${source_commit}" = "${FORGEJO_SHA:?event SHA is required}"
           mkdir -p -- artifacts/ci/container-publish
