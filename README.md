@@ -14,13 +14,14 @@ Never put tokens in the image, workflow YAML, or command-line arguments. The For
 
 ## Container release
 
-The service targets .NET 11 and is built from `src/TerraScale.Reviewer/TerraScale.Reviewer.csproj`. Feature slices live below that project directory, while tests are in `tests/TerraScale.Reviewer.Tests/`. Run local checks with `dotnet build src/TerraScale.Reviewer/TerraScale.Reviewer.csproj` and `dotnet test tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj`. Build the release image with `dotnet publish src/TerraScale.Reviewer/TerraScale.Reviewer.csproj --configuration Release --os linux --arch x64 -p:LocalRegistry=Podman /t:PublishContainer`.
+The service targets .NET 11 and is built from `src/TerraScale.Reviewer/TerraScale.Reviewer.csproj`. Feature slices live below that project directory, while tests are in `tests/TerraScale.Reviewer.Tests/`. Run local checks with `dotnet build src/TerraScale.Reviewer/TerraScale.Reviewer.csproj` and `dotnet run --project tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj` (TUnit). The release image is built from `Containerfile` on Debian trixie-slim, which adds git and the sha256-pinned static `ocr` binary: first publish a self-contained single-file binary with `dotnet publish src/TerraScale.Reviewer/TerraScale.Reviewer.csproj --configuration Release --runtime linux-x64 --self-contained true --output artifacts/ci/container-publish -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=None`, then run `podman build --platform linux/amd64 --file Containerfile .`.
 
 The context API accepts `POST /context/search` with `{ "repository": "TerraScale/ts-reviewer", "commit": "<sha>", "query": "Forgejo webhook authentication", "top_k": 8 }` and returns source snippets with repository, path, line range, symbol, and cosine-score metadata. Search applies the repository/commit boundary before a bounded exact cosine ranking, preserving tenant/commit isolation while avoiding vector-index writes during request-time reads. Reviews automatically wait for the exact PR head to be indexed, then include the retrieved context in every model pass. Operators can inspect bounded dead-letter metadata with `GET /admin/context/dead-letter` and replay one job with `POST /admin/context/dead-letter/replay` using the separate operator bearer token; responses never expose lease tokens or indexed source content.
-Tag PR images by immutable commit SHA. A protected main release may promote the
-exact tested digest to the Forgejo container registry; it must not rebuild the
-image. The eventual homelab deployment supplies the public webhook URL and
-secrets.
+CI (`.forgejo/workflows/ci.yml`) tags the image by immutable commit SHA. Pull
+requests only build and inspect it; pushes to `main` push the image tested in
+the same job to `git.terrascale.tech/terrascale/ts-reviewer:<sha>` with the
+`TERRASCALE_BOT_TOKEN` organization secret. The homelab deployment supplies the
+public webhook URL and secrets.
 
 Deploying the LiteDB-based image over a pre-LiteDB deployment: mount a
 persistent volume at the context database directory (the parent of
