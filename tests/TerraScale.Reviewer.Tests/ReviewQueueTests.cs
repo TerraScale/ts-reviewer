@@ -4,6 +4,7 @@ using System.Net.Http.Json;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Web;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging.Abstractions;
 using TerraScale.Reviewer.Features.Configuration;
@@ -305,7 +306,7 @@ public sealed class ReviewQueueTests
             var path = request.RequestUri!.AbsolutePath;
             object body = path switch
             {
-                "/api/v1/repos/search" when request.RequestUri.Query.Contains("page=1&", StringComparison.Ordinal) => new
+                "/api/v1/repos/search" when HttpUtility.ParseQueryString(request.RequestUri.Query)["page"] == "1" => new
                 {
                     ok = true,
                     data = new object[]
@@ -319,7 +320,7 @@ public sealed class ReviewQueueTests
                 "/api/v1/repos/TerraScale/widgets/commits/pending-head/status" => Status(("ci", "success"), ("ts-reviewer", "pending")),
                 "/api/v1/repos/TerraScale/widgets/commits/reviewed-head/status" => Status(("ci", "pending"), ("ts-reviewer", "success")),
                 "/api/v1/repos/TerraScale/widgets/commits/unreviewed-head/status" => Status(("ci", "pending")),
-                _ => throw new InvalidOperationException("unexpected request " + path),
+                _ => throw new InvalidOperationException("unexpected request " + request.RequestUri.PathAndQuery),
             };
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = JsonContent.Create(body) });
         }
