@@ -4,13 +4,17 @@ using TerraScale.Reviewer.Features.Forgejo;
 namespace TerraScale.Reviewer.Features.Review;
 
 /// <summary>
-/// Re-queues reviews that a restart dropped. Queued and running reviews live
-/// only in memory, so after a deploy or crash their heads keep a pending
-/// <c>ts-reviewer</c> status that nothing will ever resolve. On startup this
-/// scans the organization's open pull requests and queues every one whose
-/// head still carries that pending status.
+/// Re-queues reviews that a restart dropped or never received. Queued and
+/// running reviews live only in memory, so after a deploy or crash their heads
+/// keep a pending <c>ts-reviewer</c> status that nothing will ever resolve, and
+/// a push delivered while the service was down leaves its head without any
+/// status. On startup this scans the organization's open pull requests and
+/// queues every one whose head is pending or was never reviewed. Heads whose
+/// review finished (<c>success</c>, <c>failure</c> or <c>error</c>) are left
+/// alone: their outcome is published, and re-running a persistently failing
+/// review on every restart would loop; a recheck comment retries them.
 /// </summary>
-public sealed class ReviewRecovery(ForgejoClient forgejo, ReviewQueue queue, ReviewerOptions options, ILogger<ReviewRecovery> logger) : BackgroundService
+public sealed class ReviewRecovery(ForgejoClient forgejo, ReviewQueue queue, PullRequestReviewer reviewer, ReviewerOptions options, ILogger<ReviewRecovery> logger) : BackgroundService
 {
     private const int PageSize = 50;
 
@@ -19,7 +23,7 @@ public sealed class ReviewRecovery(ForgejoClient forgejo, ReviewQueue queue, Rev
         try
         {
             var recovered = await RecoverAsync(stoppingToken);
-            logger.LogInformation("startup recovery re-queued {Count} pending review(s)", recovered);
+            logger.LogInformation("startup recovery queued {Count} pending or unreviewed pull request(s)", recovered);
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
         catch (Exception ex) { logger.LogWarning(ex, "startup recovery of pending reviews failed; re-trigger them with a recheck comment"); }
@@ -48,9 +52,11 @@ public sealed class ReviewRecovery(ForgejoClient forgejo, ReviewQueue queue, Rev
             foreach (var pull in pulls)
             {
                 var status = await forgejo.CombinedStatusAsync(owner, name, pull.Head.Sha, ct);
-                var reviewer = status?.Statuses?.FirstOrDefault(x => x.Context == PullRequestReviewer.StatusContext);
-                if (reviewer?.State != "pending") continue;
-                queue.Enqueue(new ReviewRequest(owner, name, pull.Number, pull.Head.Sha));
+                var current = status?.Statuses?.FirstOrDefault(x => x.Context == PullRequestReviewer.StatusContext);
+                if (current is not null && current.State != "pending") continue;
+                logger.LogInformation("recovering review for {Repository}#{Number} at {Head}: {Reason}", owner + "/" + name, pull.Number, pull.Head.Sha, current is null ? "head never reviewed" : "review was pending");
+                if (queue.Enqueue(new ReviewRequest(owner, name, pull.Number, pull.Head.Sha)) != ReviewAdmission.Duplicate)
+                    await reviewer.PublishStatusAsync(owner, name, pull.Head.Sha, "pending", "Review queued");
                 recovered++;
             }
             if (pulls.Count < PageSize) return recovered;
