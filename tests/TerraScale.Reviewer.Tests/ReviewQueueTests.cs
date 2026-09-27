@@ -217,13 +217,17 @@ public sealed class ReviewQueueTests
     public async Task StartupRecoveryQueuesOpenPullRequestsLeftPendingOrNeverReviewed()
     {
         var options = Options("unused.db");
-        var forgejo = new ForgejoClient(new HttpClient(new RecoveryHandler()), options);
+        var handler = new RecoveryHandler();
+        var forgejo = new ForgejoClient(new HttpClient(handler), options);
         var runner = new ScriptedRunner();
         var queue = new ReviewQueue(runner.RunAsync, workers: 1, NullLogger<ReviewQueue>.Instance);
-        var recovery = new ReviewRecovery(forgejo, queue, options, NullLogger<ReviewRecovery>.Instance);
+        var reviewer = new PullRequestReviewer(forgejo, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance), options, NullLogger<PullRequestReviewer>.Instance);
+        var recovery = new ReviewRecovery(forgejo, queue, reviewer, options, NullLogger<ReviewRecovery>.Instance);
 
         await Assert.That(await recovery.RecoverAsync(CancellationToken.None)).IsEqualTo(2);
         await Assert.That(queue.Snapshot()).IsEqualTo((2, 0));
+        // Recovered heads show they are queued, like webhook-queued reviews.
+        await Assert.That(string.Join(",", handler.QueuedHeads.Order())).IsEqualTo("pending-head,unreviewed-head");
         await queue.StartAsync(CancellationToken.None);
         try
         {
@@ -231,7 +235,8 @@ public sealed class ReviewQueueTests
             runner.Release(7, "pending-head");
             await runner.Started(9, "unreviewed-head").WaitAsync(Wait);
             runner.Release(9, "unreviewed-head");
-            await Assert.That(runner.Runs.Any(x => x.Number == 8)).IsFalse();
+            // Finished reviews are not re-run, whatever their outcome.
+            await Assert.That(runner.Runs.Any(x => x.Number is 8 or 10 or 11)).IsFalse();
         }
         finally { await queue.StopAsync(CancellationToken.None); }
     }
@@ -304,9 +309,17 @@ public sealed class ReviewQueueTests
 
     private sealed class RecoveryHandler : HttpMessageHandler
     {
-        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        public ConcurrentBag<string> QueuedHeads { get; } = [];
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             var path = request.RequestUri!.AbsolutePath;
+            if (request.Method == HttpMethod.Post && path.StartsWith("/api/v1/repos/TerraScale/widgets/statuses/", StringComparison.Ordinal))
+            {
+                var status = await request.Content!.ReadFromJsonAsync<JsonElement>(cancellationToken);
+                if (status.GetProperty("state").GetString() == "pending") QueuedHeads.Add(path[(path.LastIndexOf('/') + 1)..]);
+                return new HttpResponseMessage(HttpStatusCode.Created) { Content = JsonContent.Create(new { }) };
+            }
             object body = path switch
             {
                 "/api/v1/repos/search" when HttpUtility.ParseQueryString(request.RequestUri.Query)["page"] == "1" => new
@@ -319,13 +332,15 @@ public sealed class ReviewQueueTests
                         new { name = "elsewhere", owner = new { login = "someone-else" }, archived = false },
                     },
                 },
-                "/api/v1/repos/TerraScale/widgets/pulls" => new object[] { Pull(7, "pending-head"), Pull(8, "reviewed-head"), Pull(9, "unreviewed-head") },
+                "/api/v1/repos/TerraScale/widgets/pulls" => new object[] { Pull(7, "pending-head"), Pull(8, "reviewed-head"), Pull(9, "unreviewed-head"), Pull(10, "errored-head"), Pull(11, "rejected-head") },
                 "/api/v1/repos/TerraScale/widgets/commits/pending-head/status" => Status(("ci", "success"), ("ts-reviewer", "pending")),
                 "/api/v1/repos/TerraScale/widgets/commits/reviewed-head/status" => Status(("ci", "pending"), ("ts-reviewer", "success")),
                 "/api/v1/repos/TerraScale/widgets/commits/unreviewed-head/status" => Status(("ci", "pending")),
+                "/api/v1/repos/TerraScale/widgets/commits/errored-head/status" => Status(("ts-reviewer", "error")),
+                "/api/v1/repos/TerraScale/widgets/commits/rejected-head/status" => Status(("ts-reviewer", "failure")),
                 _ => throw new InvalidOperationException("unexpected request " + request.RequestUri.PathAndQuery),
             };
-            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = JsonContent.Create(body) });
+            return new HttpResponseMessage(HttpStatusCode.OK) { Content = JsonContent.Create(body) };
         }
 
         private static object Pull(int number, string head)
