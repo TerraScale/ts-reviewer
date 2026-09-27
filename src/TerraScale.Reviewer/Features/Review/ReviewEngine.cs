@@ -1,5 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Globalization;
+using System.Text.RegularExpressions;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using TerraScale.Reviewer.Features.Configuration;
@@ -14,12 +16,13 @@ namespace TerraScale.Reviewer.Features.Review;
 /// CLIProxy endpoint, invokes <c>ocr review</c> over the exact base..head
 /// range, and maps the returned comments to <see cref="Finding"/> records.
 /// </summary>
-public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> logger, string? ocrPath = null)
+public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> logger, string? ocrPath = null)
 {
     private readonly string _ocrPath = ocrPath ?? "ocr";
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
-    private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(10);
+    private const int FetchAttempts = 3;
 
     public async Task<ReviewResult> RunAsync(PullRequest pr, CancellationToken ct, string? model = null)
     {
@@ -41,27 +44,26 @@ public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> 
             // fetch leaves unrelated tips shallow and makes valid PRs fail
             // with "cannot find merge-base"; keep the two requested refs'
             // ancestry while still avoiding a checked-out working tree.
-            await RunGitAsync(home, repository, ct, "fetch", "--quiet", "--no-tags", "origin",
-                $"+refs/heads/{pr.Base.Ref}:refs/base", $"+refs/pull/{pr.Number}/head:refs/pr-head");
+            for (var attempt = 1; ; attempt++)
+            {
+                try
+                {
+                    await RunGitAsync(home, repository, ct, "fetch", "--quiet", "--no-tags", "origin",
+                        $"+refs/heads/{pr.Base.Ref}:refs/base", $"+refs/pull/{pr.Number}/head:refs/pr-head");
+                    break;
+                }
+                catch (InvalidOperationException ex) when (attempt < FetchAttempts)
+                {
+                    logger.LogWarning(ex, "fetch attempt {Attempt} for {CloneUrl} failed; retrying", attempt, cloneUrl);
+                    await Task.Delay(TimeSpan.FromSeconds(5 * attempt), ct);
+                }
+            }
             var head = (await RunGitAsync(home, repository, ct, "rev-parse", "refs/pr-head")).Trim();
             var @base = (await RunGitAsync(home, repository, ct, "rev-parse", "refs/base")).Trim();
             if (!string.Equals(head, pr.Head.Sha, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("pull request head moved before the review started");
             await RunGitAsync(home, repository, ct, "checkout", "--quiet", "--detach", head);
-            // The upstream LLM API fails whole ocr runs on rate limits and
-            // flaky responses; retry the run with exponential backoff before
-            // surfacing an incomplete review. The outer ReviewTimeout deadline
-            // still bounds every attempt combined.
-            for (var attempt = 1; ; attempt++)
-            {
-                try { return await ReviewOnceAsync(home, repository, root, @base, head, model, cloneUrl, ct); }
-                catch (Exception ex) when (ex is InvalidOperationException or JsonException or IOException && attempt < options.OcrMaxAttempts)
-                {
-                    var delay = RetryDelay(options.OcrRetryDelay, attempt);
-                    logger.LogWarning(ex, "ocr attempt {Attempt} of {MaxAttempts} failed for {CloneUrl}; retrying in {Delay}", attempt, options.OcrMaxAttempts, cloneUrl, delay);
-                    await Task.Delay(delay, ct);
-                }
-            }
+            return await ReviewWithRetriesAsync(home, repository, root, @base, head, model, cloneUrl, ct);
         }
         finally
         {
@@ -69,37 +71,82 @@ public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> 
         }
     }
 
-    private async Task<ReviewResult> ReviewOnceAsync(string home, string repository, string root, string @base, string head, string? model, string cloneUrl, CancellationToken ct)
+    /// <summary>
+    /// Runs ocr until every selected item is reviewed or the attempts run out.
+    /// The upstream LLM API is slow and flaky: single file groups fail on
+    /// provider errors, timeouts or the model's own tool-call mistakes while the
+    /// rest succeed. ocr persists a session in the scratch HOME, so a retry
+    /// resumes it (<c>--resume</c>): completed items and their findings are
+    /// reused and only the failed items are reviewed again. Retries back off
+    /// exponentially; the outer review deadline still bounds every attempt.
+    /// </summary>
+    private async Task<ReviewResult> ReviewWithRetriesAsync(string home, string repository, string root, string @base, string head, string? model, string cloneUrl, CancellationToken ct)
+    {
+        string? session = null;
+        for (var attempt = 1; ; attempt++)
+        {
+            var run = await ReviewOnceAsync(home, repository, root, @base, head, model, session, ct);
+            if (run.Result is { } result && run.Complete) return result;
+            // Resume the session this run reported; a run that produced no
+            // session (e.g. a resume ocr refused) starts over from scratch.
+            session = run.Session;
+            var last = attempt >= options.OcrMaxAttempts;
+            logger.LogWarning("ocr attempt {Attempt} of {MaxAttempts} for {CloneUrl} incomplete: {Failure}; {Next}",
+                attempt, options.OcrMaxAttempts, cloneUrl, run.Failure, last ? "giving up" : session is null ? "retrying from scratch" : "resuming session " + session);
+            if (last)
+            {
+                // Findings from the reviewed items still request changes; a
+                // review without any finding cannot pass on partial coverage.
+                if (run.Result is { Findings.Count: > 0 } partial)
+                    return partial with { Summary = partial.Summary + $" (partial review: {run.Failure} — re-run for full coverage)" };
+                throw new InvalidOperationException(run.Failure);
+            }
+            await Task.Delay(RetryDelay(options.OcrRetryDelay, attempt), ct);
+        }
+    }
+
+    private async Task<OcrRun> ReviewOnceAsync(string home, string repository, string root, string @base, string head, string? model, string? session, CancellationToken ct)
     {
         // A fresh output path per attempt so a failed run can never leave a
         // stale review behind for the next attempt to read.
         var output = Path.Combine(root, "review-" + Guid.NewGuid().ToString("N") + ".json");
-        // ocr's --timeout bounds each concurrent subtask in minutes, not
-        // the whole run; 15 accommodates 180s per-request LLM timeouts
-        // with the SDK's retry backoff. The outer ReviewTimeout deadline
-        // is the hard backstop and a review that outlives it fails like
-        // any other engine error.
-        await RunOcrAsync(home, repository, model,
-            ["review", "--from", @base, "--to", head, "--concurrency", options.OcrConcurrency.ToString(),
-             "--timeout", "15", "--format", "json", "--audience", "agent", "--color", "never", "--output", output], ct);
-        var review = JsonSerializer.Deserialize<OcrReview>(await File.ReadAllTextAsync(output, ct), JsonOptions)
-            ?? throw new InvalidOperationException("ocr returned no review");
-        var result = Map(review.Comments ?? []);
-        if (!string.Equals(review.Status, "complete", StringComparison.OrdinalIgnoreCase))
+        // ocr's --timeout bounds each file group in whole minutes, not the
+        // whole run. The outer review deadline is the hard backstop.
+        List<string> arguments = ["review", "--from", @base, "--to", head, "--concurrency", options.OcrConcurrency.ToString(CultureInfo.InvariantCulture),
+            "--timeout", ((int)Math.Ceiling(options.OcrItemTimeout.TotalMinutes)).ToString(CultureInfo.InvariantCulture),
+            "--format", "json", "--audience", "agent", "--color", "never", "--output", output];
+        if (session is not null) arguments.AddRange(["--resume", session]);
+        var process = await RunOcrAsync(home, repository, model, [.. arguments], ct);
+        // ocr writes its report even when it exits non-zero (every item
+        // failed), so the report and its session take precedence over stderr.
+        OcrReview? review = null;
+        try { if (File.Exists(output)) review = JsonSerializer.Deserialize<OcrReview>(await File.ReadAllTextAsync(output, ct), JsonOptions); }
+        catch (JsonException ex) { logger.LogWarning(ex, "ocr wrote an unreadable review"); }
+        var stderrSession = ResumeSession(process.Error);
+        if (review is null)
         {
-            // OpenCodeReview reports a clean patch with no selected review
-            // groups as a skipped review. There is no failure to surface
-            // when it selected nothing, so preserve the empty result and
-            // publish the normal successful review status.
-            if (result.Findings.Count == 0 && IsNoItemsSelected(review.Message)) return result;
-            if (result.Findings.Count == 0) throw new InvalidOperationException($"ocr review failed: {review.Message}");
-            logger.LogWarning("ocr review finished {Status} for {CloneUrl}: {Message}", review.Status, cloneUrl, review.Message);
-            result = result with { Summary = result.Summary + " (partial review: some review groups failed — re-run for full coverage)" };
+            var failure = process.ExitCode == 0 ? "ocr returned no review" : $"ocr failed with exit code {process.ExitCode}: {Truncate(process.Error)}";
+            return new OcrRun(null, false, stderrSession, failure);
         }
-        return result;
+        var result = Map(review.Comments ?? []);
+        var complete = string.Equals(review.Status, "complete", StringComparison.OrdinalIgnoreCase)
+            // OpenCodeReview reports a clean patch with no selected review
+            // groups as a skipped review: nothing failed, so it is clean.
+            || (result.Findings.Count == 0 && IsNoItemsSelected(review.Message));
+        var failed = review.Manifest?.Coverage?.Failed ?? [];
+        foreach (var item in failed)
+            logger.LogWarning("ocr item {Path} failed ({Classification}): {Reason}", item.Path, item.Classification, item.Reason);
+        return new OcrRun(result, complete, review.SessionId ?? stderrSession, $"ocr review failed: {review.Message}");
     }
 
-    /// <summary>Exponential backoff from the base delay, capped at five minutes per retry.</summary>
+    /// <summary>The session id from ocr's "retry with: --resume &lt;id&gt;" hint, if it printed one.</summary>
+    internal static string? ResumeSession(string stderr) =>
+        ResumeHint().Match(stderr) is { Success: true } match ? match.Groups[1].Value : null;
+
+    [GeneratedRegex(@"retry with: --resume ([A-Za-z0-9._-]+)")]
+    private static partial Regex ResumeHint();
+
+    /// <summary>Exponential backoff from the base delay, capped at ten minutes per retry.</summary>
     internal static TimeSpan RetryDelay(TimeSpan baseDelay, int attempt) =>
         TimeSpan.FromTicks(Math.Min(baseDelay.Ticks * (1L << Math.Clamp(attempt - 1, 0, 20)), MaxRetryDelay.Ticks));
 
@@ -151,8 +198,9 @@ public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> 
         return $"Found {findings.Count} actionable finding(s): {string.Join(", ", counts)}.";
     }
 
-    private Task<string> RunGitAsync(string home, string working, CancellationToken ct, params string[] arguments) =>
-        RunAsync("git", working, environment =>
+    private async Task<string> RunGitAsync(string home, string working, CancellationToken ct, params string[] arguments)
+    {
+        var result = await RunProcessAsync("git", working, environment =>
         {
             // The Forgejo token rides in git's environment config, never in
             // argv or on disk, so clones and fetches authenticate without
@@ -165,27 +213,33 @@ public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> 
             environment["GIT_CONFIG_KEY_0"] = "http.extraHeader";
             environment["GIT_CONFIG_VALUE_0"] = "Authorization: token " + options.ForgejoToken;
         }, ct, arguments);
+        if (result.ExitCode != 0)
+            throw new InvalidOperationException($"git failed with exit code {result.ExitCode}: {Truncate(result.Error)}");
+        return result.Output;
+    }
 
-    private Task<string> RunOcrAsync(string home, string repository, string? model, string[] arguments, CancellationToken ct) =>
-        RunAsync(_ocrPath, repository, environment =>
+    private Task<ProcessResult> RunOcrAsync(string home, string repository, string? model, string[] arguments, CancellationToken ct) =>
+        RunProcessAsync(_ocrPath, repository, environment =>
         {
             // ocr's env-only endpoint configuration (OCR_LLM_*): with no
-            // ~/.opencodereview/config.json in the scratch HOME, these four
+            // ~/.opencodereview/config.json in the scratch HOME, these
             // variables point it at the CLIProxy OpenAI-compatible endpoint
             // and the proxy token never lands on disk. A command-triggered
-            // escalation swaps the model on the same endpoint.
+            // escalation swaps the model on the same endpoint. The scratch
+            // HOME also holds ocr's session store, which --resume reads.
             environment["HOME"] = home;
             environment["OCR_LLM_URL"] = options.ProxyUrl;
             environment["OCR_LLM_TOKEN"] = options.ProxyToken;
             environment["OCR_LLM_MODEL"] = model ?? options.Model;
             environment["OCR_LLM_PROTOCOL"] = "openai";
-            // 180s per LLM request: the upstream zai GLM API is slow and
-            // flaky; ocr's SDK default is a 5-minute timeout with 5 retries.
-            environment["OCR_LLM_TIMEOUT"] = "180";
+            // Per LLM request, in seconds. The upstream zai GLM API is slow
+            // and flaky, so the default is generous; ocr's SDK retries each
+            // request five more times on top of the proxy's own retries.
+            environment["OCR_LLM_TIMEOUT"] = ((int)options.OcrLlmTimeout.TotalSeconds).ToString(CultureInfo.InvariantCulture);
             environment["OCR_ENABLE_TELEMETRY"] = "false";
         }, ct, arguments);
 
-    private static async Task<string> RunAsync(string fileName, string workingDirectory, Action<IDictionary<string, string?>> configureEnvironment, CancellationToken ct, string[] arguments)
+    private static async Task<ProcessResult> RunProcessAsync(string fileName, string workingDirectory, Action<IDictionary<string, string?>> configureEnvironment, CancellationToken ct, string[] arguments)
     {
         using var process = new Process
         {
@@ -206,14 +260,16 @@ public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> 
         // already swallowed by the InvalidOperationException catch.
         using var registration = ct.Register(() => { try { process.Kill(entireProcessTree: true); } catch (InvalidOperationException) { } catch (Win32Exception) { } });
         process.Start();
-        var stdout = process.StandardOutput.ReadToEndAsync(ct);
-        var stderr = process.StandardError.ReadToEndAsync(ct);
+        var stdout = process.StandardOutput.ReadToEndAsync(CancellationToken.None);
+        var stderr = process.StandardError.ReadToEndAsync(CancellationToken.None);
         await process.WaitForExitAsync(ct);
-        var error = await stderr;
-        if (process.ExitCode != 0)
-            throw new InvalidOperationException($"{fileName} failed with exit code {process.ExitCode}: {Truncate(error)}");
-        return await stdout;
+        return new ProcessResult(process.ExitCode, await stdout, await stderr);
     }
+
+    private sealed record ProcessResult(int ExitCode, string Output, string Error);
+
+    /// <summary>One ocr run: its mapped result when it wrote a report, whether it covered every item, and the session to resume.</summary>
+    private sealed record OcrRun(ReviewResult? Result, bool Complete, string? Session, string Failure);
 
     private static string Truncate(string value) => value.Length <= 500 ? value : value[^500..];
 }
@@ -238,4 +294,19 @@ public sealed record OcrReview
 
     [JsonPropertyName("comments")]
     public IReadOnlyList<OcrComment>? Comments { get; init; }
+
+    [JsonPropertyName("session_id")]
+    public string? SessionId { get; init; }
+
+    [JsonPropertyName("manifest")]
+    public OcrManifest? Manifest { get; init; }
 }
+
+public sealed record OcrManifest([property: JsonPropertyName("coverage")] OcrCoverage? Coverage);
+
+public sealed record OcrCoverage([property: JsonPropertyName("failed")] IReadOnlyList<OcrCoverageItem>? Failed);
+
+public sealed record OcrCoverageItem(
+    [property: JsonPropertyName("path")] string? Path,
+    [property: JsonPropertyName("classification")] string? Classification,
+    [property: JsonPropertyName("reason")] string? Reason);

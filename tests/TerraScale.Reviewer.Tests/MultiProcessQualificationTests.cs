@@ -55,6 +55,10 @@ public sealed partial class MultiProcessQualificationTests
             await Assert.That(File.Exists(crashAssembly)).IsTrue();
             using var killed = StartDotnetChild(crashAssembly, [database, Commit, LeaseMs.ToString()]);
             var claimed = await killed.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(20));
+            // The lease expires LeaseMs after the claim, so measure the reclaim
+            // from here: starting and killing the processes below takes a
+            // variable share of that window on a loaded host.
+            var sinceClaim = Stopwatch.StartNew();
             await Assert.That(claimed).StartsWith("CLAIMED ");
             var killedToken = claimed!["CLAIMED ".Length..];
 
@@ -107,7 +111,7 @@ public sealed partial class MultiProcessQualificationTests
                         if (owner == "crash-child") observedKilledLease = true;
                         else if (owner.Contains(":" + worker.Id + ":", StringComparison.Ordinal))
                         {
-                            leaseWaitMs = wait.ElapsedMilliseconds;
+                            leaseWaitMs = sinceClaim.ElapsedMilliseconds;
                             reclaimToken = job["LeaseToken"].AsString;
                             break;
                         }
