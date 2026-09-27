@@ -43,7 +43,7 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewEngine engine, C
         }
         var number = webhook.Number != 0 ? webhook.Number : webhook.PullRequest?.Number ?? 0;
         if (number < 1) return Results.NoContent();
-        if (webhook.Action is "opened" or "synchronize" or "reopened")
+        if (webhook.Action is "opened" or "synchronized" or "reopened")
         {
             _ = AcknowledgeAsync(repository.Owner.Login, repository.Name, number, null);
             _ = RunBoundedAsync(repository.Owner.Login, repository.Name, number, webhook.PullRequest?.Head?.Sha);

@@ -670,6 +670,37 @@ public sealed class ReviewerTests
         finally { File.Delete(database); }
     }
 
+    [Test]
+    public async Task SynchronizedWebhookSchedulesReviewForUpdatedPullRequestHead()
+    {
+        const string updatedHead = "updated-head-sha";
+        var database = Path.Combine(Path.GetTempPath(), "ts-reviewer-" + Guid.NewGuid().ToString("N") + ".db");
+        var options = Options(database);
+        var handler = new SynchronizedWebhookFakeHandler();
+        var forgejo = new ForgejoClient(new HttpClient(handler), options);
+        using var store = new ContextStore(options);
+        var indexer = new ContextIndexer(forgejo, store, Embedder, options, NullLogger<ContextIndexer>.Instance);
+        var engine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance);
+        var webhookHandler = new WebhookHandler(forgejo, engine, indexer, options, NullLogger<WebhookHandler>.Instance);
+
+        try
+        {
+            var result = await PostWebhookAsync(webhookHandler, new
+            {
+                action = "synchronized",
+                number = 14,
+                repository = new { name = "widgets", owner = new { login = "TerraScale" } },
+                pull_request = new { number = 14, head = new { sha = updatedHead } },
+            });
+
+            await Assert.That(((IStatusCodeHttpResult)result).StatusCode).IsEqualTo(StatusCodes.Status202Accepted);
+            await Assert.That(await handler.PendingStatusHead.Task.WaitAsync(TimeSpan.FromSeconds(5))).IsEqualTo(updatedHead);
+            await Assert.That(await handler.ReviewPullRequested.Task.WaitAsync(TimeSpan.FromSeconds(5))).IsTrue();
+            await Assert.That(await handler.FailedStatusHead.Task.WaitAsync(TimeSpan.FromSeconds(5))).IsEqualTo(updatedHead);
+        }
+        finally { File.Delete(database); }
+    }
+
     private static async Task<IResult> PostWebhookAsync(WebhookHandler handler, object payload)
     {
         var context = new DefaultHttpContext();
@@ -802,6 +833,34 @@ public sealed class ReviewerTests
         finally
         {
             File.Delete(database);
+        }
+    }
+
+    private sealed class SynchronizedWebhookFakeHandler : HttpMessageHandler
+    {
+        public TaskCompletionSource<string> PendingStatusHead { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> ReviewPullRequested { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<string> FailedStatusHead { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var path = request.RequestUri!.AbsolutePath;
+            if (request.Method == HttpMethod.Get && path.EndsWith("/pulls/14", StringComparison.Ordinal))
+            {
+                ReviewPullRequested.TrySetResult(true);
+                return new(HttpStatusCode.NotFound);
+            }
+
+            if (request.Method == HttpMethod.Post && path.Contains("/statuses/", StringComparison.Ordinal))
+            {
+                var status = await request.Content!.ReadFromJsonAsync<JsonElement>(cancellationToken);
+                var head = path[(path.LastIndexOf('/') + 1)..];
+                if (status.GetProperty("state").GetString() == "pending") PendingStatusHead.TrySetResult(head);
+                else FailedStatusHead.TrySetResult(head);
+                return new(HttpStatusCode.OK) { Content = JsonContent.Create(new { }) };
+            }
+
+            return new(HttpStatusCode.NotFound);
         }
     }
 }
