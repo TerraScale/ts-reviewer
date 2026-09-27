@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging.Console;
 using TerraScale.Reviewer.Features.Configuration;
 using TerraScale.Reviewer.Features.Context;
 using TerraScale.Reviewer.Features.Forgejo;
@@ -7,9 +8,25 @@ using TerraScale.Reviewer.Features.Webhooks;
 var options = ReviewerOptions.Load(args);
 var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.UseUrls(options.ListenUrl);
+// One timestamped line per event, without ANSI colors, and no per-request
+// framework traces: health probes and Forgejo API calls otherwise rotate the
+// container console log within minutes and bury review outcomes.
+builder.Logging.AddSimpleConsole(console =>
+{
+    console.SingleLine = true;
+    console.UseUtcTimestamp = true;
+    console.TimestampFormat = "yyyy-MM-ddTHH:mm:ssZ ";
+    console.ColorBehavior = LoggerColorBehavior.Disabled;
+});
+builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
+builder.Logging.AddFilter("System.Net.Http.HttpClient", LogLevel.Warning);
 builder.Services.AddSingleton(options);
 builder.Services.AddHttpClient<ForgejoClient>();
 builder.Services.AddSingleton<ReviewEngine>();
+builder.Services.AddSingleton<PullRequestReviewer>();
+builder.Services.AddSingleton<ReviewQueue>();
+builder.Services.AddHostedService(serviceProvider => serviceProvider.GetRequiredService<ReviewQueue>());
+builder.Services.AddHostedService<ReviewRecovery>();
 builder.Services.AddSingleton<ContextEmbedder>();
 builder.Services.AddSingleton<ContextStore>();
 builder.Services.AddSingleton<ContextIndexer>(serviceProvider => new ContextIndexer(

@@ -69,7 +69,7 @@ public sealed class AuthenticationTests
     [Arguments("   ", "empty-key-signature")]
     public async Task WebhookRejectsUnauthorizedBeforeProcessing(string secret, string signature)
     {
-        var handler = new WebhookHandler(null!, null!, null!, Options with { WebhookSecret = secret },
+        var handler = new WebhookHandler(null!, null!, null!, null!, Options with { WebhookSecret = secret },
             NullLogger<WebhookHandler>.Instance);
         var context = new DefaultHttpContext();
         context.Request.Method = "POST";

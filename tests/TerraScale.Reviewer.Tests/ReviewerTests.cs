@@ -86,21 +86,22 @@ public sealed class ReviewerTests
     }
 
     [Test]
-    public async Task ConfigurationDefaultsReviewTimeoutToOneHour()
+    public async Task ConfigurationDefaults()
     {
-        const string environmentName = "TS_REVIEWER_TIMEOUT";
-        var previous = Environment.GetEnvironmentVariable(environmentName);
+        string[] names = ["TS_REVIEWER_TIMEOUT", "TS_REVIEWER_MAX_CONCURRENT"];
+        var previous = names.ToDictionary(x => x, Environment.GetEnvironmentVariable);
         try
         {
-            Environment.SetEnvironmentVariable(environmentName, null);
+            foreach (var name in names) Environment.SetEnvironmentVariable(name, null);
             var options = ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy",
                 "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token",
                 "--operator-token=operator-test-token"]);
             await Assert.That(options.ReviewTimeout).IsEqualTo(TimeSpan.FromHours(1));
+            await Assert.That(options.MaxConcurrent).IsEqualTo(2);
         }
         finally
         {
-            Environment.SetEnvironmentVariable(environmentName, previous);
+            foreach (var (name, value) in previous) Environment.SetEnvironmentVariable(name, value);
         }
     }
 
@@ -144,19 +145,19 @@ public sealed class ReviewerTests
         var repository = new Repository(new Owner("TerraScale"), "ts-reviewer");
         var branch = new Branch("abc123", "main", repository);
         var pullRequest = new PullRequest(14, "Improve review output", "", branch, branch);
-        var empty = WebhookHandler.Format(pullRequest, new ReviewResult("ignored", []));
+        var empty = PullRequestReviewer.Format(pullRequest, new ReviewResult("ignored", []));
         await Assert.That(empty.Contains("### Summary")).IsTrue();
         await Assert.That(empty.Contains("### Result")).IsTrue();
         await Assert.That(empty.Contains("✅ No evidence-backed findings")).IsTrue();
 
         var finding = new Finding("f-1", "high", "Unsafe fallback", "The fallback bypasses validation.", "Add a validation check before retrying.", "src/Worker.cs", 42);
-        var formatted = WebhookHandler.Format(pullRequest, new ReviewResult("ignored", [finding]));
+        var formatted = PullRequestReviewer.Format(pullRequest, new ReviewResult("ignored", [finding]));
         await Assert.That(formatted.Contains("### Findings (1)")).IsTrue();
         await Assert.That(formatted.Contains("#### HIGH · Unsafe fallback")).IsTrue();
         await Assert.That(formatted.Contains("<summary>Suggested fix</summary>")).IsTrue();
         await Assert.That(formatted.Contains("model")).IsFalse();
 
-        var escalated = WebhookHandler.Format(pullRequest, new ReviewResult("ignored", [finding]), "gpt-6-astra");
+        var escalated = PullRequestReviewer.Format(pullRequest, new ReviewResult("ignored", [finding]), "gpt-6-astra");
         await Assert.That(escalated.Contains("model `gpt-6-astra`")).IsTrue();
     }
 
@@ -255,7 +256,7 @@ public sealed class ReviewerTests
             var forgejo = new ForgejoClient(http, apiOptions);
             using var store = new ContextStore(apiOptions);
             var indexer = new ContextIndexer(forgejo, store, Embedder, apiOptions, NullLogger<ContextIndexer>.Instance);
-            var webhook = new WebhookHandler(forgejo, engine, indexer, apiOptions, NullLogger<WebhookHandler>.Instance);
+            var (webhook, queue) = await StartWebhookAsync(forgejo, engine, indexer, apiOptions);
             await PostWebhookAsync(webhook, new
             {
                 action = "created",
@@ -271,6 +272,7 @@ public sealed class ReviewerTests
             await Assert.That(publishedReview.GetProperty("commit_id").GetString()).IsEqualTo(headSha);
             await Assert.That(publishedReview.GetProperty("comments").GetArrayLength()).IsEqualTo(expectedFindings);
             await Assert.That(publishedStatus.GetProperty("state").GetString()).IsEqualTo(expectedStatus);
+            await queue.StopAsync(CancellationToken.None);
         }
         finally
         {
@@ -643,7 +645,7 @@ public sealed class ReviewerTests
         using var store = new ContextStore(options);
         var indexer = new ContextIndexer(forgejo, store, Embedder, options, NullLogger<ContextIndexer>.Instance);
         var engine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance);
-        var webhookHandler = new WebhookHandler(forgejo, engine, indexer, options, NullLogger<WebhookHandler>.Instance);
+        var (webhookHandler, queue) = await StartWebhookAsync(forgejo, engine, indexer, options);
         try
         {
             var result = await PostWebhookAsync(webhookHandler, new
@@ -667,7 +669,7 @@ public sealed class ReviewerTests
             await WaitUntilAsync(() => handler.CommentReactions == 1);
             await Assert.That(handler.PullRequestReactions).IsEqualTo(1);
         }
-        finally { File.Delete(database); }
+        finally { await queue.StopAsync(CancellationToken.None); File.Delete(database); }
     }
 
     [Test]
@@ -681,7 +683,7 @@ public sealed class ReviewerTests
         using var store = new ContextStore(options);
         var indexer = new ContextIndexer(forgejo, store, Embedder, options, NullLogger<ContextIndexer>.Instance);
         var engine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance);
-        var webhookHandler = new WebhookHandler(forgejo, engine, indexer, options, NullLogger<WebhookHandler>.Instance);
+        var (webhookHandler, queue) = await StartWebhookAsync(forgejo, engine, indexer, options);
 
         try
         {
@@ -698,7 +700,15 @@ public sealed class ReviewerTests
             await Assert.That(await handler.ReviewPullRequested.Task.WaitAsync(TimeSpan.FromSeconds(5))).IsTrue();
             await Assert.That(await handler.FailedStatusHead.Task.WaitAsync(TimeSpan.FromSeconds(5))).IsEqualTo(updatedHead);
         }
-        finally { File.Delete(database); }
+        finally { await queue.StopAsync(CancellationToken.None); File.Delete(database); }
+    }
+
+    private static async Task<(WebhookHandler Handler, ReviewQueue Queue)> StartWebhookAsync(ForgejoClient forgejo, ReviewEngine engine, ContextIndexer indexer, ReviewerOptions options)
+    {
+        var reviewer = new PullRequestReviewer(forgejo, engine, options, NullLogger<PullRequestReviewer>.Instance);
+        var queue = new ReviewQueue(reviewer, options, NullLogger<ReviewQueue>.Instance);
+        await queue.StartAsync(CancellationToken.None);
+        return (new WebhookHandler(forgejo, queue, reviewer, indexer, options, NullLogger<WebhookHandler>.Instance), queue);
     }
 
     private static async Task<IResult> PostWebhookAsync(WebhookHandler handler, object payload)

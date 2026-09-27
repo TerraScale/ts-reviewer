@@ -47,6 +47,12 @@ public sealed class ForgejoClient(HttpClient http, ReviewerOptions options)
         SendAsync(HttpMethod.Post, $"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/pulls/{number}/reviews", review, ct);
     public Task StatusAsync(string owner, string name, string sha, CommitStatus status, CancellationToken ct) =>
         SendAsync(HttpMethod.Post, $"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/statuses/{Uri.EscapeDataString(sha)}", status, ct);
+    public async Task<IReadOnlyList<Repository>> OrganizationRepositoriesAsync(string organization, int page, int limit, CancellationToken ct) =>
+        await GetAsync<List<Repository>>($"api/v1/orgs/{Uri.EscapeDataString(organization)}/repos?page={page}&limit={limit}", ct) ?? [];
+    public async Task<IReadOnlyList<PullRequest>> OpenPullsAsync(string owner, string name, int page, int limit, CancellationToken ct) =>
+        await GetAsync<List<PullRequest>>($"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/pulls?state=open&page={page}&limit={limit}", ct) ?? [];
+    public Task<CombinedStatus?> CombinedStatusAsync(string owner, string name, string sha, CancellationToken ct) =>
+        GetAsync<CombinedStatus>($"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/commits/{Uri.EscapeDataString(sha)}/status", ct);
     public async Task<IReadOnlyList<RepositoryTreeEntry>> TreeAsync(string owner, string name, string sha, CancellationToken ct) =>
         (await GetAsync<RepositoryTreeResponse>($"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/git/trees/{Uri.EscapeDataString(sha)}?recursive=true", ct))?.Tree ?? [];
     public async Task<string> FileAsync(string owner, string name, string sha, string path, CancellationToken ct)
