@@ -7,7 +7,8 @@ public sealed record PullRequest([property: JsonPropertyName("number")] int Numb
     [property: JsonPropertyName("head")] Branch Head);
 public sealed record Branch([property: JsonPropertyName("sha")] string Sha, [property: JsonPropertyName("ref")] string Ref,
     [property: JsonPropertyName("repo")] Repository Repo);
-public sealed record Repository([property: JsonPropertyName("owner")] Owner Owner, [property: JsonPropertyName("name")] string Name);
+public sealed record Repository([property: JsonPropertyName("owner")] Owner Owner, [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("archived")] bool Archived = false);
 public sealed record Owner([property: JsonPropertyName("login")] string Login);
 public sealed record ChangedFile([property: JsonPropertyName("filename")] string Filename, [property: JsonPropertyName("status")] string Status,
     [property: JsonPropertyName("patch")] string Patch, [property: JsonPropertyName("additions")] int Additions,
@@ -21,6 +22,10 @@ public sealed record PullReview([property: JsonPropertyName("body")] string Body
     [property: JsonPropertyName("commit_id")] string CommitId, [property: JsonPropertyName("comments")] IReadOnlyList<ReviewComment>? Comments = null);
 public sealed record CommitStatus([property: JsonPropertyName("state")] string State, [property: JsonPropertyName("target_url")] string? TargetUrl,
     [property: JsonPropertyName("description")] string Description, [property: JsonPropertyName("context")] string Context);
+/// <summary>Latest status per context for one commit; Forgejo names the state field <c>status</c> in this listing.</summary>
+public sealed record CombinedStatus([property: JsonPropertyName("statuses")] IReadOnlyList<ContextStatus>? Statuses);
+public sealed record ContextStatus([property: JsonPropertyName("context")] string Context, [property: JsonPropertyName("status")] string State,
+    [property: JsonPropertyName("description")] string? Description);
 
 public sealed record RepositoryTreeEntry([property: JsonPropertyName("path")] string Path,
     [property: JsonPropertyName("type")] string Type, [property: JsonPropertyName("size")] long Size,
