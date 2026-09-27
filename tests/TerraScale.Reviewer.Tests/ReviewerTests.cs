@@ -66,17 +66,19 @@ public sealed class ReviewerTests
     [Test]
     public async Task ConfigurationAcceptsExplicitArgumentsAndRejectsInvalidLimits()
     {
-        var options = ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy", "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token", "--operator-token=operator-test-token", "--forgejo-url=https://forgejo.test/", "--proxy-url=https://proxy.test/v1/", "--timeout=00:00:05", "--max-concurrent=3", "--ocr-concurrency=2"]);
+        var options = ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy", "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token", "--operator-token=operator-test-token", "--forgejo-url=https://forgejo.test/", "--proxy-url=https://proxy.test/v1/", "--timeout=00:00:05", "--max-concurrent=3", "--ocr-concurrency=2", "--ocr-max-attempts=4", "--ocr-llm-timeout=00:20:00", "--ocr-item-timeout=00:30:00"]);
         await Assert.That(options.ForgejoUrl).IsEqualTo("https://forgejo.test");
         await Assert.That(options.ProxyUrl).IsEqualTo("https://proxy.test/v1");
         await Assert.That(options.MaxConcurrent).IsEqualTo(3);
         await Assert.That(options.OcrConcurrency).IsEqualTo(2);
         await Assert.That(options.ContextMaxAttempts).IsEqualTo(5);
         await Assert.That(options.ContextRetryDelay).IsEqualTo(TimeSpan.FromSeconds(1));
-        await Assert.That(options.OcrMaxAttempts).IsEqualTo(3);
-        await Assert.That(options.OcrRetryDelay).IsEqualTo(TimeSpan.FromSeconds(30));
+        await Assert.That(options.OcrMaxAttempts).IsEqualTo(4);
+        await Assert.That(options.OcrLlmTimeout).IsEqualTo(TimeSpan.FromMinutes(20));
+        await Assert.That(options.OcrItemTimeout).IsEqualTo(TimeSpan.FromMinutes(30));
 
-        foreach (var invalid in new[] { "--max-concurrent=0", "--ocr-max-attempts=0", "--ocr-max-attempts=11", "--ocr-retry-base-delay=00:00:00", "--ocr-retry-base-delay=00:05:01" })
+        foreach (var invalid in new[] { "--max-concurrent=0", "--ocr-max-attempts=0", "--ocr-max-attempts=21", "--ocr-retry-base-delay=00:00:00", "--ocr-retry-base-delay=00:05:01",
+            "--ocr-llm-timeout=00:00:30", "--ocr-llm-timeout=02:00:01", "--ocr-item-timeout=00:00:59", "--ocr-item-timeout=1.00:00:01" })
         {
             var rejected = false;
             try { ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy", "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token", "--operator-token=operator-test-token", invalid]); }
@@ -88,7 +90,8 @@ public sealed class ReviewerTests
     [Test]
     public async Task ConfigurationDefaults()
     {
-        string[] names = ["TS_REVIEWER_TIMEOUT", "TS_REVIEWER_MAX_CONCURRENT"];
+        string[] names = ["TS_REVIEWER_TIMEOUT", "TS_REVIEWER_MAX_CONCURRENT", "TS_REVIEWER_OCR_MAX_ATTEMPTS", "TS_REVIEWER_OCR_RETRY_BASE_DELAY",
+            "TS_REVIEWER_OCR_LLM_TIMEOUT", "TS_REVIEWER_OCR_ITEM_TIMEOUT"];
         var previous = names.ToDictionary(x => x, Environment.GetEnvironmentVariable);
         try
         {
@@ -96,8 +99,13 @@ public sealed class ReviewerTests
             var options = ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy",
                 "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token",
                 "--operator-token=operator-test-token"]);
-            await Assert.That(options.ReviewTimeout).IsEqualTo(TimeSpan.FromHours(1));
+            // Generous limits for the slow, flaky upstream LLM API.
+            await Assert.That(options.ReviewTimeout).IsEqualTo(TimeSpan.FromHours(4));
             await Assert.That(options.MaxConcurrent).IsEqualTo(2);
+            await Assert.That(options.OcrMaxAttempts).IsEqualTo(6);
+            await Assert.That(options.OcrRetryDelay).IsEqualTo(TimeSpan.FromSeconds(30));
+            await Assert.That(options.OcrLlmTimeout).IsEqualTo(TimeSpan.FromMinutes(15));
+            await Assert.That(options.OcrItemTimeout).IsEqualTo(TimeSpan.FromHours(1));
         }
         finally
         {
@@ -238,7 +246,9 @@ public sealed class ReviewerTests
             await Assert.That(recorded.Contains("OCR_LLM_TOKEN=proxy")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_MODEL=review")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_PROTOCOL=openai")).IsTrue();
-            await Assert.That(recorded.Contains("OCR_LLM_TIMEOUT=180")).IsTrue();
+            await Assert.That(recorded.Contains("--timeout 60 ")).IsTrue();
+            await Assert.That(recorded.Contains("--resume")).IsFalse();
+            await Assert.That(recorded.Contains("OCR_LLM_TIMEOUT=900")).IsTrue();
             await Assert.That(recorded.Contains("OCR_ENABLE_TELEMETRY=false")).IsTrue();
 
             // An escalated review re-runs the same head on the escalation model.
@@ -281,12 +291,20 @@ public sealed class ReviewerTests
     }
 
     [Test]
-    public async Task OcrRetryDelayDoublesAndCapsAtFiveMinutes()
+    public async Task OcrRetryDelayDoublesAndCapsAtTenMinutes()
     {
         await Assert.That(ReviewEngine.RetryDelay(TimeSpan.FromSeconds(30), 1)).IsEqualTo(TimeSpan.FromSeconds(30));
         await Assert.That(ReviewEngine.RetryDelay(TimeSpan.FromSeconds(30), 3)).IsEqualTo(TimeSpan.FromMinutes(2));
-        await Assert.That(ReviewEngine.RetryDelay(TimeSpan.FromMinutes(5), 10)).IsEqualTo(TimeSpan.FromMinutes(5));
-        await Assert.That(ReviewEngine.RetryDelay(TimeSpan.FromSeconds(30), int.MaxValue)).IsEqualTo(TimeSpan.FromMinutes(5));
+        await Assert.That(ReviewEngine.RetryDelay(TimeSpan.FromSeconds(30), 5)).IsEqualTo(TimeSpan.FromMinutes(8));
+        await Assert.That(ReviewEngine.RetryDelay(TimeSpan.FromMinutes(5), 10)).IsEqualTo(TimeSpan.FromMinutes(10));
+        await Assert.That(ReviewEngine.RetryDelay(TimeSpan.FromSeconds(30), int.MaxValue)).IsEqualTo(TimeSpan.FromMinutes(10));
+    }
+
+    [Test]
+    public async Task ResumeSessionIsReadFromOcrsRetryHint()
+    {
+        await Assert.That(ReviewEngine.ResumeSession("review failed: all 8 file review(s) failed\n[ocr] Session: 01J9Z-abc_1 (retry with: --resume 01J9Z-abc_1)\n")).IsEqualTo("01J9Z-abc_1");
+        await Assert.That(ReviewEngine.ResumeSession("load resume session: open: no such file")).IsNull();
     }
 
     [Test]

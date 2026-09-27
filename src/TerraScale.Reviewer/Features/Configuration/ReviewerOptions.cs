@@ -5,11 +5,15 @@ public sealed record ReviewerOptions(
     string Model, string Organization, string BotLogin, int MaxConcurrent, TimeSpan ReviewTimeout,
     string WebhookSecret, string ContextApiToken, string ContextDatabasePath, int ContextMaxFiles,
     int ContextMaxAttempts = 5, TimeSpan? ContextRetryBaseDelay = null, string OperatorToken = "",
-    string EscalationModel = "gpt-6-astra", int OcrConcurrency = 1, int OcrMaxAttempts = 3,
-    TimeSpan? OcrRetryBaseDelay = null)
+    string EscalationModel = "gpt-6-astra", int OcrConcurrency = 1, int OcrMaxAttempts = 6,
+    TimeSpan? OcrRetryBaseDelay = null, TimeSpan? OcrLlmRequestTimeout = null, TimeSpan? OcrItemReviewTimeout = null)
 {
     public TimeSpan ContextRetryDelay => ContextRetryBaseDelay ?? TimeSpan.FromSeconds(1);
     public TimeSpan OcrRetryDelay => OcrRetryBaseDelay ?? TimeSpan.FromSeconds(30);
+    /// <summary>Per-request LLM timeout handed to ocr as <c>OCR_LLM_TIMEOUT</c>.</summary>
+    public TimeSpan OcrLlmTimeout => OcrLlmRequestTimeout ?? TimeSpan.FromMinutes(15);
+    /// <summary>Per-item (file group) deadline handed to ocr as <c>--timeout</c>.</summary>
+    public TimeSpan OcrItemTimeout => OcrItemReviewTimeout ?? TimeSpan.FromHours(1);
 
     public static ReviewerOptions Load(string[] args)
     {
@@ -26,9 +30,11 @@ public sealed record ReviewerOptions(
             ["bot-login"] = Environment.GetEnvironmentVariable("TS_REVIEWER_BOT_LOGIN") ?? "terrascale-bot",
             ["max-concurrent"] = Environment.GetEnvironmentVariable("TS_REVIEWER_MAX_CONCURRENT") ?? "2",
             ["ocr-concurrency"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_CONCURRENCY") ?? "1",
-            ["ocr-max-attempts"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_MAX_ATTEMPTS") ?? "3",
+            ["ocr-max-attempts"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_MAX_ATTEMPTS") ?? "6",
             ["ocr-retry-base-delay"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_RETRY_BASE_DELAY") ?? "00:00:30",
-            ["timeout"] = Environment.GetEnvironmentVariable("TS_REVIEWER_TIMEOUT") ?? "01:00:00",
+            ["ocr-llm-timeout"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_LLM_TIMEOUT") ?? "00:15:00",
+            ["ocr-item-timeout"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_ITEM_TIMEOUT") ?? "01:00:00",
+            ["timeout"] = Environment.GetEnvironmentVariable("TS_REVIEWER_TIMEOUT") ?? "04:00:00",
             ["webhook-secret"] = Environment.GetEnvironmentVariable("TS_REVIEWER_WEBHOOK_SECRET") ?? string.Empty,
             ["context-api-token"] = Environment.GetEnvironmentVariable("TS_REVIEWER_CONTEXT_API_TOKEN") ?? string.Empty,
             ["context-database"] = Environment.GetEnvironmentVariable("TS_REVIEWER_CONTEXT_DATABASE") ?? "data/reviewer-context.db",
@@ -53,10 +59,16 @@ public sealed record ReviewerOptions(
         var ocrConcurrency = ParseInt(values, "ocr-concurrency");
         if (ocrConcurrency is < 1 or > 10) throw new InvalidOperationException("ocr-concurrency must be between 1 and 10");
         var ocrMaxAttempts = ParseInt(values, "ocr-max-attempts");
-        if (ocrMaxAttempts is < 1 or > 10) throw new InvalidOperationException("ocr-max-attempts must be between 1 and 10");
+        if (ocrMaxAttempts is < 1 or > 20) throw new InvalidOperationException("ocr-max-attempts must be between 1 and 20");
         if (!TimeSpan.TryParse(values["ocr-retry-base-delay"], out var ocrRetryBaseDelay)
             || ocrRetryBaseDelay <= TimeSpan.Zero || ocrRetryBaseDelay > TimeSpan.FromMinutes(5))
             throw new InvalidOperationException("ocr-retry-base-delay must be positive and at most five minutes");
+        if (!TimeSpan.TryParse(values["ocr-llm-timeout"], out var ocrLlmTimeout)
+            || ocrLlmTimeout < TimeSpan.FromMinutes(1) || ocrLlmTimeout > TimeSpan.FromHours(2))
+            throw new InvalidOperationException("ocr-llm-timeout must be between one minute and two hours");
+        if (!TimeSpan.TryParse(values["ocr-item-timeout"], out var ocrItemTimeout)
+            || ocrItemTimeout < TimeSpan.FromMinutes(1) || ocrItemTimeout > TimeSpan.FromHours(24))
+            throw new InvalidOperationException("ocr-item-timeout must be between one minute and 24 hours");
         if (!TimeSpan.TryParse(values["timeout"], out var reviewTimeout) || reviewTimeout <= TimeSpan.Zero)
             throw new InvalidOperationException("timeout must be positive");
         var contextMaxFiles = ParseInt(values, "context-max-files");
@@ -70,7 +82,7 @@ public sealed record ReviewerOptions(
             Trim(values["proxy-url"]!), proxyToken, values["model"]!, values["organization"]!, values["bot-login"]!,
             maxConcurrent, reviewTimeout, webhookSecret, contextApiToken, values["context-database"]!, contextMaxFiles,
             contextMaxAttempts, contextRetryBaseDelay, operatorToken, values["escalation-model"]!, ocrConcurrency,
-            ocrMaxAttempts, ocrRetryBaseDelay);
+            ocrMaxAttempts, ocrRetryBaseDelay, ocrLlmTimeout, ocrItemTimeout);
     }
     private static string Required(IReadOnlyDictionary<string, string?> values, string key, string environmentName) =>
         string.IsNullOrWhiteSpace(values[key]) ? throw new InvalidOperationException($"{environmentName} is required") : values[key]!;
