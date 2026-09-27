@@ -30,8 +30,10 @@ public sealed class ReviewRecovery(ForgejoClient forgejo, ReviewQueue queue, Rev
         var recovered = 0;
         for (var page = 1; ; page++)
         {
-            var repositories = await forgejo.OrganizationRepositoriesAsync(options.Organization, page, PageSize, ct);
-            foreach (var repository in repositories.Where(x => !x.Archived))
+            // The reviewer's token carries repository scope only, so the
+            // organization's repositories come from repository search.
+            var repositories = await forgejo.SearchRepositoriesAsync(page, PageSize, ct);
+            foreach (var repository in repositories.Where(x => !x.Archived && string.Equals(x.Owner.Login, options.Organization, StringComparison.OrdinalIgnoreCase)))
                 recovered += await RecoverRepositoryAsync(repository.Owner.Login, repository.Name, ct);
             if (repositories.Count < PageSize) return recovered;
         }

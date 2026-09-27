@@ -22,6 +22,8 @@ public sealed record PullReview([property: JsonPropertyName("body")] string Body
     [property: JsonPropertyName("commit_id")] string CommitId, [property: JsonPropertyName("comments")] IReadOnlyList<ReviewComment>? Comments = null);
 public sealed record CommitStatus([property: JsonPropertyName("state")] string State, [property: JsonPropertyName("target_url")] string? TargetUrl,
     [property: JsonPropertyName("description")] string Description, [property: JsonPropertyName("context")] string Context);
+public sealed record RepositorySearch([property: JsonPropertyName("data")] IReadOnlyList<Repository>? Data);
+
 /// <summary>Latest status per context for one commit; Forgejo names the state field <c>status</c> in this listing.</summary>
 public sealed record CombinedStatus([property: JsonPropertyName("statuses")] IReadOnlyList<ContextStatus>? Statuses);
 public sealed record ContextStatus([property: JsonPropertyName("context")] string Context, [property: JsonPropertyName("status")] string State,

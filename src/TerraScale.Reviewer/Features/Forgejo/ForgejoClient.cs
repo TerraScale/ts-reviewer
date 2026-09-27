@@ -47,8 +47,9 @@ public sealed class ForgejoClient(HttpClient http, ReviewerOptions options)
         SendAsync(HttpMethod.Post, $"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/pulls/{number}/reviews", review, ct);
     public Task StatusAsync(string owner, string name, string sha, CommitStatus status, CancellationToken ct) =>
         SendAsync(HttpMethod.Post, $"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/statuses/{Uri.EscapeDataString(sha)}", status, ct);
-    public async Task<IReadOnlyList<Repository>> OrganizationRepositoriesAsync(string organization, int page, int limit, CancellationToken ct) =>
-        await GetAsync<List<Repository>>($"api/v1/orgs/{Uri.EscapeDataString(organization)}/repos?page={page}&limit={limit}", ct) ?? [];
+    /// <summary>Non-archived repositories visible to the token. Unlike the organization listing, repository search needs only repository scope.</summary>
+    public async Task<IReadOnlyList<Repository>> SearchRepositoriesAsync(int page, int limit, CancellationToken ct) =>
+        (await GetAsync<RepositorySearch>($"api/v1/repos/search?archived=false&page={page}&limit={limit}", ct))?.Data ?? [];
     public async Task<IReadOnlyList<PullRequest>> OpenPullsAsync(string owner, string name, int page, int limit, CancellationToken ct) =>
         await GetAsync<List<PullRequest>>($"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/pulls?state=open&page={page}&limit={limit}", ct) ?? [];
     public Task<CombinedStatus?> CombinedStatusAsync(string owner, string name, string sha, CancellationToken ct) =>
