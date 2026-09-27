@@ -214,7 +214,7 @@ public sealed class ReviewQueueTests
     }
 
     [Test]
-    public async Task StartupRecoveryRequeuesOpenPullRequestsLeftPending()
+    public async Task StartupRecoveryQueuesOpenPullRequestsLeftPendingOrNeverReviewed()
     {
         var options = Options("unused.db");
         var forgejo = new ForgejoClient(new HttpClient(new RecoveryHandler()), options);
@@ -222,13 +222,16 @@ public sealed class ReviewQueueTests
         var queue = new ReviewQueue(runner.RunAsync, workers: 1, NullLogger<ReviewQueue>.Instance);
         var recovery = new ReviewRecovery(forgejo, queue, options, NullLogger<ReviewRecovery>.Instance);
 
-        await Assert.That(await recovery.RecoverAsync(CancellationToken.None)).IsEqualTo(1);
-        await Assert.That(queue.Snapshot()).IsEqualTo((1, 0));
+        await Assert.That(await recovery.RecoverAsync(CancellationToken.None)).IsEqualTo(2);
+        await Assert.That(queue.Snapshot()).IsEqualTo((2, 0));
         await queue.StartAsync(CancellationToken.None);
         try
         {
             await runner.Started(7, "pending-head").WaitAsync(Wait);
             runner.Release(7, "pending-head");
+            await runner.Started(9, "unreviewed-head").WaitAsync(Wait);
+            runner.Release(9, "unreviewed-head");
+            await Assert.That(runner.Runs.Any(x => x.Number == 8)).IsFalse();
         }
         finally { await queue.StopAsync(CancellationToken.None); }
     }

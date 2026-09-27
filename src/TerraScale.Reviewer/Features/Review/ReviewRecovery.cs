@@ -4,11 +4,12 @@ using TerraScale.Reviewer.Features.Forgejo;
 namespace TerraScale.Reviewer.Features.Review;
 
 /// <summary>
-/// Re-queues reviews that a restart dropped. Queued and running reviews live
-/// only in memory, so after a deploy or crash their heads keep a pending
-/// <c>ts-reviewer</c> status that nothing will ever resolve. On startup this
-/// scans the organization's open pull requests and queues every one whose
-/// head still carries that pending status.
+/// Re-queues reviews that a restart dropped or never received. Queued and
+/// running reviews live only in memory, so after a deploy or crash their heads
+/// keep a pending <c>ts-reviewer</c> status that nothing will ever resolve, and
+/// a push delivered while the service was down leaves its head without any
+/// status. On startup this scans the organization's open pull requests and
+/// queues every one whose head is pending or was never reviewed.
 /// </summary>
 public sealed class ReviewRecovery(ForgejoClient forgejo, ReviewQueue queue, ReviewerOptions options, ILogger<ReviewRecovery> logger) : BackgroundService
 {
@@ -19,7 +20,7 @@ public sealed class ReviewRecovery(ForgejoClient forgejo, ReviewQueue queue, Rev
         try
         {
             var recovered = await RecoverAsync(stoppingToken);
-            logger.LogInformation("startup recovery re-queued {Count} pending review(s)", recovered);
+            logger.LogInformation("startup recovery queued {Count} pending or unreviewed pull request(s)", recovered);
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
         catch (Exception ex) { logger.LogWarning(ex, "startup recovery of pending reviews failed; re-trigger them with a recheck comment"); }
@@ -49,7 +50,8 @@ public sealed class ReviewRecovery(ForgejoClient forgejo, ReviewQueue queue, Rev
             {
                 var status = await forgejo.CombinedStatusAsync(owner, name, pull.Head.Sha, ct);
                 var reviewer = status?.Statuses?.FirstOrDefault(x => x.Context == PullRequestReviewer.StatusContext);
-                if (reviewer?.State != "pending") continue;
+                if (reviewer is not null && reviewer.State != "pending") continue;
+                logger.LogInformation("recovering review for {Repository}#{Number} at {Head}: {Reason}", owner + "/" + name, pull.Number, pull.Head.Sha, reviewer is null ? "head never reviewed" : "review was pending");
                 queue.Enqueue(new ReviewRequest(owner, name, pull.Number, pull.Head.Sha));
                 recovered++;
             }
