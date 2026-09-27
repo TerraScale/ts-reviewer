@@ -305,10 +305,15 @@ public sealed class ReviewQueueTests
             var path = request.RequestUri!.AbsolutePath;
             object body = path switch
             {
-                "/api/v1/orgs/TerraScale/repos" => new object[]
+                "/api/v1/repos/search" when request.RequestUri.Query.Contains("page=1&", StringComparison.Ordinal) => new
                 {
-                    new { name = "widgets", owner = new { login = "TerraScale" }, archived = false },
-                    new { name = "retired", owner = new { login = "TerraScale" }, archived = true },
+                    ok = true,
+                    data = new object[]
+                    {
+                        new { name = "widgets", owner = new { login = "TerraScale" }, archived = false },
+                        new { name = "retired", owner = new { login = "TerraScale" }, archived = true },
+                        new { name = "elsewhere", owner = new { login = "someone-else" }, archived = false },
+                    },
                 },
                 "/api/v1/repos/TerraScale/widgets/pulls" => new object[] { Pull(7, "pending-head"), Pull(8, "reviewed-head"), Pull(9, "unreviewed-head") },
                 "/api/v1/repos/TerraScale/widgets/commits/pending-head/status" => Status(("ci", "success"), ("ts-reviewer", "pending")),
