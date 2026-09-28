@@ -151,5 +151,12 @@ jobs:
           printf '%s\n' "${TERRASCALE_BOT_TOKEN:?organization bot token is required}" | \
             podman login git.terrascale.tech --username terrascale-bot --password-stdin >/dev/null
           podman tag "${local_image}" "${remote_image}"
-          podman push "${remote_image}"
+          # TLS handshakes to the registry occasionally fail mid-push (run
+          # 11599: "server did not echo the legacy session ID"); a retry
+          # reuses the layers that already landed.
+          for attempt in 1 2 3; do
+            podman push "${remote_image}" && break
+            test "${attempt}" -lt 3
+            sleep $((attempt * 10))
+          done
           podman image inspect "${remote_image}"
