@@ -124,6 +124,41 @@ public sealed class OcrRetryTests
         await Assert.That((await fixture.RunsAsync()).Length).IsEqualTo(6);
     }
 
+    [Test]
+    public async Task OcrRunsOfflineOnAPartialCloneWithEverythingItReadsDownloaded()
+    {
+        await using var fixture = await Fixture.CreateAsync(servePartialClones: true);
+        await fixture.ScriptAsync(
+            "fail() { echo \"Error: $1\" >&2; exit 3; }\n" +
+            "from=$(printf '%s' \"$args\" | sed -n 's/.*--from \\([0-9a-f]*\\).*/\\1/p')\n" +
+            "to=$(printf '%s' \"$args\" | sed -n 's/.*--to \\([0-9a-f]*\\).*/\\1/p')\n" +
+            "test \"$(git config remote.origin.promisor)\" = true || fail 'not a partial clone'\n" +
+            "test \"$GIT_NO_LAZY_FETCH\" = 1 || fail 'ocr may fetch lazily'\n" +
+            // ocr's diff, its merge-base side, and a head file must all be local.
+            "mb=$(git merge-base \"$from\" \"$to\") || fail 'no merge-base'\n" +
+            "git diff --find-renames \"$mb\" \"$to\" >/dev/null || fail 'diff needs a missing blob'\n" +
+            "git show \"$mb:a.cs\" >/dev/null || fail 'merge-base side missing'\n" +
+            "git show \"$to:b.cs\" >/dev/null || fail 'head file missing'\n" +
+            Report("Review complete: 0 finding(s) across 2 selected item(s).", "sess-1", [], status: "complete"));
+
+        var result = await fixture.Engine(attempts: 1).RunAsync(fixture.PullRequest, CancellationToken.None);
+
+        await Assert.That(result.Findings.Count).IsEqualTo(0);
+    }
+
+    [Test]
+    public async Task FailuresReportTheErrorLineRatherThanTheUsageReport()
+    {
+        const string usage = "{\n  \"usage\": {\n    \"elapsed\": \"10m1s\"\n  },\n  \"tool_calls\": {\n    \"by_tool\": {\n      \"code_search\": 7\n    }\n  }\n}\n";
+        await Assert.That(ReviewEngine.ErrorLine("[ocr] TraceID: t1\n" + usage + "Error: review failed: all 2 file review(s) failed\n"))
+            .IsEqualTo("review failed: all 2 file review(s) failed");
+        await Assert.That(ReviewEngine.ErrorLine("[ocr] Session: s1 (retry with: --resume s1)\n" + usage))
+            .IsEqualTo("[ocr] Session: s1 (retry with: --resume s1)");
+        await Assert.That(ReviewEngine.ErrorLine("remote: Counting objects\nfatal: fetch-pack: invalid index-pack output\n"))
+            .IsEqualTo("fatal: fetch-pack: invalid index-pack output");
+        await Assert.That(ReviewEngine.ErrorLine("")).IsEqualTo("no error output");
+    }
+
     private static string Partial(int findings, int failed, int selected) =>
         $"Review partially complete: {findings} finding(s); {failed} of {selected} selected item(s) failed.";
 
@@ -144,19 +179,25 @@ public sealed class OcrRetryTests
     private sealed class Fixture : IAsyncDisposable
     {
         private readonly string _root;
+        private readonly string _forgejoUrl;
         private readonly string _stub;
         private readonly string _runs;
 
-        private Fixture(string root, PullRequest pullRequest)
+        private Fixture(string root, string forgejoUrl, PullRequest pullRequest)
         {
-            (_root, PullRequest) = (root, pullRequest);
+            (_root, _forgejoUrl, PullRequest) = (root, forgejoUrl, pullRequest);
             _stub = Path.Combine(root, "ocr");
             _runs = Path.Combine(root, "runs.log");
         }
 
         public PullRequest PullRequest { get; }
 
-        public static async Task<Fixture> CreateAsync()
+        /// <summary>
+        /// A local remote with a two-commit pull request. Plain paths use git's
+        /// local transport, which ignores fetch filters; <paramref name="servePartialClones"/>
+        /// serves the remote over file:// with filters enabled, like Forgejo.
+        /// </summary>
+        public static async Task<Fixture> CreateAsync(bool servePartialClones = false)
         {
             if (!OperatingSystem.IsLinux() && !OperatingSystem.IsMacOS()) throw new TUnit.Core.Exceptions.SkipTestException("requires a POSIX host with git");
             var root = Path.Combine(Path.GetTempPath(), "ts-reviewer-ocr-" + Guid.NewGuid().ToString("N"));
@@ -164,6 +205,11 @@ public sealed class OcrRetryTests
             var work = Path.Combine(root, "work");
             Directory.CreateDirectory(Path.GetDirectoryName(remote)!);
             await GitAsync(root, "init", "--quiet", "-b", "main", "--bare", remote);
+            if (servePartialClones)
+            {
+                await GitAsync(remote, "config", "uploadpack.allowFilter", "true");
+                await GitAsync(remote, "config", "uploadpack.allowAnySHA1InWant", "true");
+            }
             await GitAsync(root, "clone", "--quiet", remote, work);
             await GitAsync(work, "config", "user.email", "review@test");
             await GitAsync(work, "config", "user.name", "review");
@@ -178,7 +224,8 @@ public sealed class OcrRetryTests
             var headSha = (await GitAsync(work, "rev-parse", "HEAD")).Trim();
             await GitAsync(work, "push", "--quiet", "origin", baseSha + ":refs/heads/main", headSha + ":refs/pull/9/head");
             var repository = new Repository(new Owner("TerraScale"), "widgets");
-            return new Fixture(root, new PullRequest(9, "Test change", "", new Branch(baseSha, "main", repository), new Branch(headSha, "feature", repository)));
+            return new Fixture(root, servePartialClones ? "file://" + root : root,
+                new PullRequest(9, "Test change", "", new Branch(baseSha, "main", repository), new Branch(headSha, "feature", repository)));
         }
 
         /// <summary>Installs an ocr stub that runs the n-th script on its n-th run and the last one after that.</summary>
@@ -198,7 +245,7 @@ public sealed class OcrRetryTests
         /// <summary>An engine on the <c>review</c> model; the fallback model is off unless named.</summary>
         public ReviewEngine Engine(int attempts, string fallback = "")
         {
-            var options = new ReviewerOptions("http://+:8080", _root, "forgejo", "https://proxy.test/v1", "proxy", "review", "TerraScale", "bot", 1,
+            var options = new ReviewerOptions("http://+:8080", _forgejoUrl, "forgejo", "https://proxy.test/v1", "proxy", "review", "TerraScale", "bot", 1,
                 TimeSpan.FromMinutes(1), "webhook-test-secret", "context-test-token", Path.Combine(_root, "context.db"), 100,
                 OcrMaxAttempts: attempts, OcrRetryBaseDelay: TimeSpan.FromMilliseconds(10), FallbackModel: fallback);
             return new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, _stub);

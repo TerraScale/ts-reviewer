@@ -34,21 +34,21 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
         try
         {
             // Initialize an empty repository and fetch only the two commit tips
-            // needed for this review. A full clone can unpack a multi-gigabyte
-            // history before ocr starts and exhaust the review container even
-            // when only one pull request is active.
+            // needed for this review.
             Directory.CreateDirectory(repository);
             await RunGitAsync(home, root, ct, "init", "--quiet", repository);
             await RunGitAsync(home, repository, ct, "remote", "add", "origin", cloneUrl);
             // ocr needs the merge-base between the base and PR tips. A depth-1
             // fetch leaves unrelated tips shallow and makes valid PRs fail
-            // with "cannot find merge-base"; keep the two requested refs'
-            // ancestry while still avoiding a checked-out working tree.
+            // with "cannot find merge-base", so the fetch keeps the two refs'
+            // ancestry but none of the file contents (--filter=blob:none): a
+            // repository's history can be hundreds of MiB (terrabase: 750 MiB,
+            // about a minute per review) while the trees reviewed are a few.
             for (var attempt = 1; ; attempt++)
             {
                 try
                 {
-                    await RunGitAsync(home, repository, ct, "fetch", "--quiet", "--no-tags", "origin",
+                    await RunGitAsync(home, repository, ct, "fetch", "--quiet", "--no-tags", "--filter=blob:none", "origin",
                         $"+refs/heads/{pr.Base.Ref}:refs/base", $"+refs/pull/{pr.Number}/head:refs/pr-head");
                     break;
                 }
@@ -62,7 +62,13 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
             var @base = (await RunGitAsync(home, repository, ct, "rev-parse", "refs/base")).Trim();
             if (!string.Equals(head, pr.Head.Sha, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("pull request head moved before the review started");
+            // ocr reads files at the head and diffs the merge-base against it.
+            // Its git runs without the Forgejo token, so everything it can read
+            // is downloaded first: the checkout fetches the head's files,
+            // and the same merge-base diff ocr runs fetches the other side of
+            // each changed file (rename detection included).
             await RunGitAsync(home, repository, ct, "checkout", "--quiet", "--detach", head);
+            await RunGitAsync(home, repository, ct, "diff", "--shortstat", "--find-renames", "--no-ext-diff", "--no-textconv", $"{@base}...{head}");
             return await ReviewWithFallbackAsync(home, repository, root, @base, head, model ?? options.Model, cloneUrl, ct);
         }
         finally
@@ -147,7 +153,7 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
         var stderrSession = ResumeSession(process.Error);
         if (review is null)
         {
-            var failure = process.ExitCode == 0 ? "ocr returned no review" : $"ocr failed with exit code {process.ExitCode}: {Truncate(process.Error)}";
+            var failure = process.ExitCode == 0 ? "ocr returned no review" : $"ocr failed with exit code {process.ExitCode}: {ErrorLine(process.Error)}";
             return new OcrRun(null, false, stderrSession, failure);
         }
         var result = Map(review.Comments ?? []);
@@ -236,7 +242,7 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
             environment["GIT_CONFIG_VALUE_0"] = "Authorization: token " + options.ForgejoToken;
         }, ct, arguments);
         if (result.ExitCode != 0)
-            throw new InvalidOperationException($"git failed with exit code {result.ExitCode}: {Truncate(result.Error)}");
+            throw new InvalidOperationException($"git failed with exit code {result.ExitCode}: {ErrorLine(result.Error)}");
         return result.Output;
     }
 
@@ -249,7 +255,10 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
             // and the proxy token never lands on disk. Every model (review,
             // escalation, fallback) runs on this same endpoint. The scratch
             // HOME also holds ocr's session store, which --resume reads.
+            // Everything ocr reads was downloaded before it started; its git
+            // has no credentials, so it must never try to fetch more.
             environment["HOME"] = home;
+            environment["GIT_NO_LAZY_FETCH"] = "1";
             environment["OCR_LLM_URL"] = options.ProxyUrl;
             environment["OCR_LLM_TOKEN"] = options.ProxyToken;
             environment["OCR_LLM_PROTOCOL"] = "openai";
@@ -292,7 +301,31 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
     /// <summary>One ocr run: its mapped result when it wrote a report, whether it covered every item, and the session to resume.</summary>
     private sealed record OcrRun(ReviewResult? Result, bool Complete, string? Session, string Failure);
 
-    private static string Truncate(string value) => value.Length <= 500 ? value : value[^500..];
+    /// <summary>
+    /// The line of a failed command's stderr that says what went wrong, for
+    /// logs and commit statuses: ocr's <c>Error:</c> line or git's
+    /// <c>fatal:</c>/<c>error:</c> line, otherwise the last other line. ocr
+    /// pretty-prints a JSON usage report next to its error; that report is
+    /// skipped by its top-level braces, the only lines exactly <c>{</c> and
+    /// <c>}</c> at column 0.
+    /// </summary>
+    internal static string ErrorLine(string stderr)
+    {
+        var lines = new List<string>();
+        var inReport = false;
+        foreach (var raw in stderr.Split('\n'))
+        {
+            var line = raw.TrimEnd('\r');
+            if (line == "{") inReport = true;
+            else if (inReport) inReport = line != "}";
+            else if (line.Trim() is { Length: > 0 } text) lines.Add(text);
+        }
+        var reason = lines.LastOrDefault(x => x.StartsWith("Error: ", StringComparison.Ordinal))?["Error: ".Length..]
+            ?? lines.LastOrDefault(x => x.StartsWith("fatal: ", StringComparison.Ordinal) || x.StartsWith("error: ", StringComparison.Ordinal))
+            ?? lines.LastOrDefault()
+            ?? "no error output";
+        return reason.Length <= 300 ? reason : reason[..300] + "…";
+    }
 }
 
 public sealed record OcrComment(

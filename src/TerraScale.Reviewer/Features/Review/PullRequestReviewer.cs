@@ -15,9 +15,10 @@ public sealed class PullRequestReviewer(ForgejoClient forgejo, ReviewEngine engi
 
     /// <summary>
     /// Runs one review. <paramref name="cancellation"/> fires when the queue
-    /// supersedes or drops the request, which publishes nothing because a
-    /// newer request owns the pull request; the review deadline is separate
-    /// and reports a timed-out review on the head.
+    /// drops the request or shuts down, which publishes nothing here: the queue
+    /// marks a dropped head skipped once the review stops, and a shutdown leaves
+    /// it pending for startup recovery. The review deadline is separate and
+    /// reports a timed-out review on the head.
     /// </summary>
     public async Task RunAsync(ReviewRequest request, CancellationToken cancellation)
     {
@@ -49,6 +50,10 @@ public sealed class PullRequestReviewer(ForgejoClient forgejo, ReviewEngine engi
             if (sha is not null) await PublishStatusAsync(owner, name, sha, "error", "review failed: " + ex.Message);
         }
     }
+
+    /// <summary>Resolves the pending status of a head whose review the queue dropped.</summary>
+    public Task SkipAsync(ReviewRequest request, string reason) =>
+        request.HeadSha is null ? Task.CompletedTask : PublishStatusAsync(request.Owner, request.Name, request.HeadSha, "skipped", "Review skipped: " + reason);
 
     /// <summary>Best-effort commit status publication with its own short deadline.</summary>
     public async Task PublishStatusAsync(string owner, string name, string sha, string state, string description)
@@ -91,7 +96,11 @@ public sealed class PullRequestReviewer(ForgejoClient forgejo, ReviewEngine engi
         { await PublishStatusAsync(owner, name, pr.Head.Sha, "error", "review incomplete: " + ex.Message); return; }
         var latest = await forgejo.PullAsync(owner, name, number, ct);
         if (latest is null || !string.Equals(latest.Head.Sha, pr.Head.Sha, StringComparison.OrdinalIgnoreCase))
-        { logger.LogInformation("review discarded as stale for {Repository}#{Number}", owner + "/" + name, number); return; }
+        {
+            logger.LogInformation("review discarded as stale for {Repository}#{Number}", owner + "/" + name, number);
+            await PublishStatusAsync(owner, name, pr.Head.Sha, "skipped", "Review skipped: " + ReviewQueue.NewerHead);
+            return;
+        }
         var hasFindings = result.Findings.Count > 0;
         var body = Format(pr, result, model ?? options.Model);
         var existing = await forgejo.CommentsAsync(owner, name, number, ct);

@@ -130,6 +130,63 @@ public sealed class ReviewQueueTests
     }
 
     [Test]
+    public async Task NewHeadCancelsTheRunningReviewEvenWhenARequestIsWaiting()
+    {
+        var runner = new ScriptedRunner();
+        var queue = await StartAsync(runner, workers: 1);
+        try
+        {
+            // An escalation of the running head waits without cancelling it.
+            queue.Enqueue(Request(1, "old"));
+            await runner.Started(1, "old").WaitAsync(Wait);
+            await Assert.That(queue.Enqueue(Request(1, "old", "strong-model"))).IsEqualTo(ReviewAdmission.Queued);
+            await Assert.That(queue.Enqueue(Request(1, "new"))).IsEqualTo(ReviewAdmission.Superseded);
+            await Assert.That(await runner.Cancelled(1, "old").WaitAsync(Wait)).IsTrue();
+            await runner.Started(1, "new").WaitAsync(Wait);
+            runner.Release(1, "new");
+            await WaitUntilAsync(() => queue.Snapshot() == (0, 0));
+            await Assert.That(string.Join(",", runner.Runs.Select(x => x.HeadSha))).IsEqualTo("old,new");
+        }
+        finally { await queue.StopAsync(CancellationToken.None); }
+    }
+
+    [Test]
+    public async Task DroppedWorkMarksItsHeadSkippedButAShutdownLeavesItPending()
+    {
+        var runner = new ScriptedRunner();
+        var queue = await StartAsync(runner, workers: 1);
+        try
+        {
+            // A newer push replaces waiting work at once...
+            queue.Enqueue(Request(1, "a"));
+            await runner.Started(1, "a").WaitAsync(Wait);
+            queue.Enqueue(Request(2, "old"));
+            queue.Enqueue(Request(2, "new"));
+            await WaitUntilAsync(() => runner.Skipped(2, "old") == ReviewQueue.NewerHead);
+            // ...and running work only once it has stopped.
+            queue.Enqueue(Request(1, "b"));
+            await Assert.That(await runner.Cancelled(1, "a").WaitAsync(Wait)).IsTrue();
+            await WaitUntilAsync(() => runner.Skipped(1, "a") == ReviewQueue.NewerHead);
+
+            // Closing drops the waiting and the running review alike.
+            await runner.Started(2, "new").WaitAsync(Wait);
+            queue.Cancel("TerraScale", "widgets", 1);
+            queue.Cancel("TerraScale", "widgets", 2);
+            await WaitUntilAsync(() => runner.Skipped(1, "b") == ReviewQueue.Closed && runner.Skipped(2, "new") == ReviewQueue.Closed);
+
+            // Re-requesting the same head skips nothing.
+            queue.Enqueue(Request(3, "c"));
+            await runner.Started(3, "c").WaitAsync(Wait);
+            await Assert.That(queue.Enqueue(Request(3, "c"))).IsEqualTo(ReviewAdmission.Duplicate);
+            await Assert.That(runner.Skipped(3, "c")).IsNull();
+        }
+        finally { await queue.StopAsync(CancellationToken.None); }
+        // A shutdown stops the running review without skipping it.
+        await Assert.That(await runner.Cancelled(3, "c").WaitAsync(Wait)).IsTrue();
+        await Assert.That(runner.Skipped(3, "c")).IsNull();
+    }
+
+    [Test]
     public async Task WorkersStayWithinTheLimitAndSurviveFailingReviews()
     {
         var running = 0;
@@ -149,7 +206,7 @@ public sealed class ReviewQueueTests
                 Interlocked.Decrement(ref running);
                 Interlocked.Increment(ref completed);
             }
-        }, workers: 2, NullLogger<ReviewQueue>.Instance);
+        }, (_, _) => Task.CompletedTask, workers: 2, NullLogger<ReviewQueue>.Instance);
         await queue.StartAsync(CancellationToken.None);
         try
         {
@@ -209,6 +266,7 @@ public sealed class ReviewQueueTests
             });
             await Assert.That(((IStatusCodeHttpResult)closed).StatusCode).IsEqualTo(StatusCodes.Status202Accepted);
             await Assert.That(await runner.Cancelled(5, "a").WaitAsync(Wait)).IsTrue();
+            await WaitUntilAsync(() => runner.Skipped(5, "a") == ReviewQueue.Closed);
         }
         finally { await queue.StopAsync(CancellationToken.None); File.Delete(database); }
     }
@@ -220,7 +278,7 @@ public sealed class ReviewQueueTests
         var handler = new RecoveryHandler();
         var forgejo = new ForgejoClient(new HttpClient(handler), options);
         var runner = new ScriptedRunner();
-        var queue = new ReviewQueue(runner.RunAsync, workers: 1, NullLogger<ReviewQueue>.Instance);
+        var queue = new ReviewQueue(runner.RunAsync, runner.SkipAsync, workers: 1, NullLogger<ReviewQueue>.Instance);
         var reviewer = new PullRequestReviewer(forgejo, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance), options, NullLogger<PullRequestReviewer>.Instance);
         var recovery = new ReviewRecovery(forgejo, queue, reviewer, options, NullLogger<ReviewRecovery>.Instance);
 
@@ -243,7 +301,7 @@ public sealed class ReviewQueueTests
 
     private static async Task<ReviewQueue> StartAsync(ScriptedRunner runner, int workers)
     {
-        var queue = new ReviewQueue(runner.RunAsync, workers, NullLogger<ReviewQueue>.Instance);
+        var queue = new ReviewQueue(runner.RunAsync, runner.SkipAsync, workers, NullLogger<ReviewQueue>.Instance);
         await queue.StartAsync(CancellationToken.None);
         return queue;
     }
@@ -277,7 +335,16 @@ public sealed class ReviewQueueTests
         private readonly ConcurrentDictionary<string, TaskCompletionSource> _started = new();
         private readonly ConcurrentDictionary<string, TaskCompletionSource> _released = new();
         private readonly ConcurrentDictionary<string, TaskCompletionSource<bool>> _cancelled = new();
+        private readonly ConcurrentDictionary<string, string> _skipped = new();
         public ConcurrentQueue<ReviewRequest> Runs { get; } = new();
+
+        public string? Skipped(int number, string head) => _skipped.GetValueOrDefault(Key(number, head));
+
+        public Task SkipAsync(ReviewRequest request, string reason)
+        {
+            _skipped[Key(request.Number, request.HeadSha!)] = reason;
+            return Task.CompletedTask;
+        }
 
         public Task Started(int number, string head) => Signal(_started, number, head).Task;
         public Task<bool> Cancelled(int number, string head) => _cancelled.GetOrAdd(Key(number, head), _ => new(TaskCreationOptions.RunContinuationsAsynchronously)).Task;

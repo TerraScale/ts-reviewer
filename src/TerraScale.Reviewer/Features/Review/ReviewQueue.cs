@@ -30,9 +30,20 @@ public enum ReviewAdmission
 /// is dropped. A fixed pool of workers drains the queue in arrival order, so a
 /// slot is never leaked and waiting work never expires.
 /// </summary>
+/// <remarks>
+/// Work dropped for a newer head or a closed pull request is handed to the
+/// skip callback, so its head does not keep a pending status forever: waiting
+/// work at once, running work after the review has stopped, so the callback
+/// always has the last word on that head. Reviews stopped by a shutdown are
+/// not skipped; their pending status is what startup recovery re-queues.
+/// </remarks>
 public sealed class ReviewQueue : BackgroundService
 {
+    public const string NewerHead = "a newer push replaced this head";
+    public const string Closed = "the pull request was closed";
+
     private readonly Func<ReviewRequest, CancellationToken, Task> _runner;
+    private readonly Func<ReviewRequest, string, Task> _skip;
     private readonly int _workers;
     private readonly ILogger<ReviewQueue> _logger;
     private readonly Lock _gate = new();
@@ -40,72 +51,83 @@ public sealed class ReviewQueue : BackgroundService
     private readonly Channel<string> _ready = Channel.CreateUnbounded<string>(new UnboundedChannelOptions { AllowSynchronousContinuations = false });
 
     public ReviewQueue(PullRequestReviewer reviewer, ReviewerOptions options, ILogger<ReviewQueue> logger)
-        : this(reviewer.RunAsync, options.MaxConcurrent, logger) { }
+        : this(reviewer.RunAsync, reviewer.SkipAsync, options.MaxConcurrent, logger) { }
 
-    internal ReviewQueue(Func<ReviewRequest, CancellationToken, Task> runner, int workers, ILogger<ReviewQueue> logger)
+    internal ReviewQueue(Func<ReviewRequest, CancellationToken, Task> runner, Func<ReviewRequest, string, Task> skip, int workers, ILogger<ReviewQueue> logger)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(workers, 1);
-        (_runner, _workers, _logger) = (runner, workers, logger);
+        (_runner, _skip, _workers, _logger) = (runner, skip, workers, logger);
     }
 
     /// <summary>Queues a review, collapsing it with any other request for the same pull request.</summary>
     public ReviewAdmission Enqueue(ReviewRequest request)
     {
         CancellationTokenSource? stale = null;
+        ReviewRequest? replaced = null;
         ReviewAdmission admission;
         lock (_gate)
         {
             if (!_slots.TryGetValue(request.Key, out var slot)) _slots[request.Key] = slot = new PullRequestSlot();
-            if (slot.Waiting is { } waiting)
+            if (slot is { Running: { } running, StopReason: null })
             {
-                // Keep an escalation alive when a plain request for the same head replaces it.
-                slot.Waiting = request.Model is null && SameHead(waiting, request) ? request with { Model = waiting.Model } : request;
-                _logger.LogInformation("review request for {PullRequest} at {Head} replaced a waiting request", request.Key, request.HeadSha);
-                return ReviewAdmission.Superseded;
-            }
-            if (slot.Running is { } running)
-            {
-                if (SameHead(running, request) && request.Model == running.Model)
+                if (SameHead(running, request) && request.Model == running.Model && slot.Waiting is null)
                 {
                     _logger.LogInformation("review for {PullRequest} at {Head} is already running; duplicate request dropped", request.Key, request.HeadSha);
                     return ReviewAdmission.Duplicate;
                 }
-                if (request.HeadSha is not null && running.HeadSha is not null && !SameHead(running, request))
+                // Also when a request is already waiting: that request
+                // cancelled nothing if it was for the running head.
+                if (NewHead(running, request))
                 {
                     _logger.LogInformation("cancelling review for {PullRequest} at {Old}: new head {New}", request.Key, running.HeadSha, request.HeadSha);
                     stale = slot.Cancellation;
+                    slot.StopReason = NewerHead;
                 }
-                // The running worker schedules the waiting request when it finishes.
-                slot.Waiting = request;
-                admission = ReviewAdmission.Queued;
+            }
+            if (slot.Waiting is { } waiting)
+            {
+                if (NewHead(waiting, request)) replaced = waiting;
+                // Keep an escalation alive when a plain request for the same head replaces it.
+                slot.Waiting = request.Model is null && SameHead(waiting, request) ? request with { Model = waiting.Model } : request;
+                _logger.LogInformation("review request for {PullRequest} at {Head} replaced a waiting request", request.Key, request.HeadSha);
+                admission = ReviewAdmission.Superseded;
             }
             else
             {
                 slot.Waiting = request;
-                _ready.Writer.TryWrite(request.Key);
+                // A running worker schedules the waiting request when it finishes.
+                if (slot.Running is null) _ready.Writer.TryWrite(request.Key);
                 _logger.LogInformation("review for {PullRequest} at {Head} queued", request.Key, request.HeadSha);
                 admission = ReviewAdmission.Queued;
             }
         }
         CancelOutsideLock(stale);
+        if (replaced is not null) Skip(replaced, NewerHead);
         return admission;
     }
 
-    /// <summary>Drops waiting work and cancels any running review, e.g. when the pull request closes.</summary>
+    /// <summary>Drops waiting work and cancels any running review when the pull request closes.</summary>
     public bool Cancel(string owner, string name, int number)
     {
         var key = new ReviewRequest(owner, name, number, null).Key;
-        CancellationTokenSource? running;
+        ReviewRequest? waiting;
+        CancellationTokenSource? running = null;
         lock (_gate)
         {
             if (!_slots.TryGetValue(key, out var slot)) return false;
             // A slot without a running review is still in the ready channel;
             // the worker that dequeues it finds nothing waiting and skips it.
+            waiting = slot.Waiting;
             slot.Waiting = null;
-            running = slot.Cancellation;
+            if (slot is { Running: not null, StopReason: null })
+            {
+                running = slot.Cancellation;
+                slot.StopReason = Closed;
+            }
         }
         _logger.LogInformation("review work for {PullRequest} cancelled", key);
         CancelOutsideLock(running);
+        if (waiting is not null) Skip(waiting, Closed);
         return true;
     }
 
@@ -142,15 +164,20 @@ public sealed class ReviewQueue : BackgroundService
             catch (Exception ex) { _logger.LogError(ex, "review for {PullRequest} failed", key); }
             finally
             {
+                string? stopReason;
                 lock (_gate)
                 {
                     var slot = _slots[key];
+                    // A head queued again (e.g. a force-push back to it) is not skipped.
+                    stopReason = slot.Waiting is { } next && SameHead(next, request) ? null : slot.StopReason;
                     slot.Running = null;
                     slot.Cancellation = null;
+                    slot.StopReason = null;
                     if (slot.Waiting is not null) _ready.Writer.TryWrite(key);
                     else _slots.Remove(key);
                 }
                 cancellation.Dispose();
+                if (stopReason is not null) Skip(request, stopReason);
             }
         }
     }
@@ -164,13 +191,33 @@ public sealed class ReviewQueue : BackgroundService
         catch (ObjectDisposedException) { }
     }
 
+    /// <summary>Best-effort hand-off of dropped work to the skip callback; a head is only skipped when it is known.</summary>
+    private void Skip(ReviewRequest request, string reason)
+    {
+        if (request.HeadSha is null) return;
+        _logger.LogInformation("review for {PullRequest} at {Head} skipped: {Reason}", request.Key, request.HeadSha, reason);
+        _ = SkipAsync();
+
+        async Task SkipAsync()
+        {
+            try { await _skip(request, reason); }
+            catch (Exception ex) { _logger.LogWarning(ex, "could not mark {PullRequest} at {Head} skipped", request.Key, request.HeadSha); }
+        }
+    }
+
     private static bool SameHead(ReviewRequest left, ReviewRequest right) =>
         string.Equals(left.HeadSha, right.HeadSha, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Whether <paramref name="request"/> is for a different head than <paramref name="current"/>; unknown heads never count.</summary>
+    private static bool NewHead(ReviewRequest current, ReviewRequest request) =>
+        current.HeadSha is not null && request.HeadSha is not null && !SameHead(current, request);
 
     private sealed class PullRequestSlot
     {
         public ReviewRequest? Waiting { get; set; }
         public ReviewRequest? Running { get; set; }
         public CancellationTokenSource? Cancellation { get; set; }
+        /// <summary>Why the running review was cancelled, when the queue cancelled it; its head is skipped once it stops.</summary>
+        public string? StopReason { get; set; }
     }
 }
