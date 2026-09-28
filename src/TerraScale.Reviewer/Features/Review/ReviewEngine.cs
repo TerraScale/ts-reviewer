@@ -63,7 +63,7 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
             if (!string.Equals(head, pr.Head.Sha, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("pull request head moved before the review started");
             await RunGitAsync(home, repository, ct, "checkout", "--quiet", "--detach", head);
-            return await ReviewWithRetriesAsync(home, repository, root, @base, head, model, cloneUrl, ct);
+            return await ReviewWithFallbackAsync(home, repository, root, @base, head, model ?? options.Model, cloneUrl, ct);
         }
         finally
         {
@@ -72,51 +72,73 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
     }
 
     /// <summary>
-    /// Runs ocr until every selected item is reviewed or the attempts run out.
-    /// The upstream LLM API is slow and flaky: single file groups fail on
-    /// provider errors, timeouts or the model's own tool-call mistakes while the
-    /// rest succeed. ocr persists a session in the scratch HOME, so a retry
-    /// resumes it (<c>--resume</c>): completed items and their findings are
-    /// reused and only the failed items are reviewed again. Retries back off
-    /// exponentially; the outer review deadline still bounds every attempt.
+    /// Reviews on the requested model and, when it cannot cover every item
+    /// within its attempts, hands the review to the fallback model. The
+    /// fallback resumes the same ocr session, so it only reviews the file
+    /// groups the first model failed and keeps the findings already made.
     /// </summary>
-    private async Task<ReviewResult> ReviewWithRetriesAsync(string home, string repository, string root, string @base, string head, string? model, string cloneUrl, CancellationToken ct)
+    private async Task<ReviewResult> ReviewWithFallbackAsync(string home, string repository, string root, string @base, string head, string model, string cloneUrl, CancellationToken ct)
     {
-        string? session = null;
+        var run = await ReviewWithRetriesAsync(home, repository, root, @base, head, model, null, cloneUrl, ct);
+        var fallback = options.FallbackModel;
+        if (!run.Complete && fallback.Length > 0 && !string.Equals(fallback, model, StringComparison.Ordinal))
+        {
+            logger.LogWarning("model {Model} could not complete the review for {CloneUrl}; falling back to {FallbackModel}", model, cloneUrl, fallback);
+            run = await ReviewWithRetriesAsync(home, repository, root, @base, head, fallback, run.Session, cloneUrl, ct);
+            if (run.Result is { } reviewed)
+                run = run with { Result = reviewed with { Summary = reviewed.Summary + $" (`{model}` could not finish the review, so fallback model `{fallback}` took over)" } };
+        }
+        if (run.Result is { } result && run.Complete) return result;
+        // Findings from the reviewed items still request changes; a review
+        // without any finding cannot pass on partial coverage.
+        if (run.Result is { Findings.Count: > 0 } partial)
+            return partial with { Summary = partial.Summary + $" (partial review: {run.Failure} — re-run for full coverage)" };
+        throw new InvalidOperationException(run.Failure);
+    }
+
+    /// <summary>
+    /// Runs ocr on one model until every selected item is reviewed or the
+    /// attempts run out. The upstream LLM API is slow and flaky: single file
+    /// groups fail on provider errors, timeouts or the model's own tool-call
+    /// mistakes while the rest succeed. ocr persists a session in the scratch
+    /// HOME, so a retry resumes it (<c>--resume</c>): completed items and their
+    /// findings are reused and only the failed items are reviewed again.
+    /// Retries back off exponentially; the outer review deadline still bounds
+    /// every attempt.
+    /// </summary>
+    private async Task<OcrRun> ReviewWithRetriesAsync(string home, string repository, string root, string @base, string head, string model, string? session, string cloneUrl, CancellationToken ct)
+    {
         for (var attempt = 1; ; attempt++)
         {
             var run = await ReviewOnceAsync(home, repository, root, @base, head, model, session, ct);
-            if (run.Result is { } result && run.Complete) return result;
+            if (run.Complete) return run;
             // Resume the session this run reported; a run that produced no
             // session (e.g. a resume ocr refused) starts over from scratch.
             session = run.Session;
             var last = attempt >= options.OcrMaxAttempts;
-            logger.LogWarning("ocr attempt {Attempt} of {MaxAttempts} for {CloneUrl} incomplete: {Failure}; {Next}",
-                attempt, options.OcrMaxAttempts, cloneUrl, run.Failure, last ? "giving up" : session is null ? "retrying from scratch" : "resuming session " + session);
-            if (last)
-            {
-                // Findings from the reviewed items still request changes; a
-                // review without any finding cannot pass on partial coverage.
-                if (run.Result is { Findings.Count: > 0 } partial)
-                    return partial with { Summary = partial.Summary + $" (partial review: {run.Failure} — re-run for full coverage)" };
-                throw new InvalidOperationException(run.Failure);
-            }
+            logger.LogWarning("ocr attempt {Attempt} of {MaxAttempts} on {Model} for {CloneUrl} incomplete: {Failure}; {Next}",
+                attempt, options.OcrMaxAttempts, model, cloneUrl, run.Failure, last ? "giving up" : session is null ? "retrying from scratch" : "resuming session " + session);
+            if (last) return run;
             await Task.Delay(RetryDelay(options.OcrRetryDelay, attempt), ct);
         }
     }
 
-    private async Task<OcrRun> ReviewOnceAsync(string home, string repository, string root, string @base, string head, string? model, string? session, CancellationToken ct)
+    private async Task<OcrRun> ReviewOnceAsync(string home, string repository, string root, string @base, string head, string model, string? session, CancellationToken ct)
     {
         // A fresh output path per attempt so a failed run can never leave a
         // stale review behind for the next attempt to read.
         var output = Path.Combine(root, "review-" + Guid.NewGuid().ToString("N") + ".json");
         // ocr's --timeout bounds each file group in whole minutes, not the
-        // whole run. The outer review deadline is the hard backstop.
-        List<string> arguments = ["review", "--from", @base, "--to", head, "--concurrency", options.OcrConcurrency.ToString(CultureInfo.InvariantCulture),
+        // whole run. The outer review deadline is the hard backstop. The
+        // model is an explicit --model flag rather than OCR_LLM_MODEL because
+        // ocr only resumes a session on another model when it is asked for on
+        // the command line, which the fallback model relies on.
+        List<string> arguments = ["review", "--from", @base, "--to", head, "--model", model,
+            "--concurrency", options.OcrConcurrency.ToString(CultureInfo.InvariantCulture),
             "--timeout", ((int)Math.Ceiling(options.OcrItemTimeout.TotalMinutes)).ToString(CultureInfo.InvariantCulture),
             "--format", "json", "--audience", "agent", "--color", "never", "--output", output];
         if (session is not null) arguments.AddRange(["--resume", session]);
-        var process = await RunOcrAsync(home, repository, model, [.. arguments], ct);
+        var process = await RunOcrAsync(home, repository, [.. arguments], ct);
         // ocr writes its report even when it exits non-zero (every item
         // failed), so the report and its session take precedence over stderr.
         OcrReview? review = null;
@@ -218,19 +240,18 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
         return result.Output;
     }
 
-    private Task<ProcessResult> RunOcrAsync(string home, string repository, string? model, string[] arguments, CancellationToken ct) =>
+    private Task<ProcessResult> RunOcrAsync(string home, string repository, string[] arguments, CancellationToken ct) =>
         RunProcessAsync(_ocrPath, repository, environment =>
         {
             // ocr's env-only endpoint configuration (OCR_LLM_*): with no
             // ~/.opencodereview/config.json in the scratch HOME, these
             // variables point it at the CLIProxy OpenAI-compatible endpoint
-            // and the proxy token never lands on disk. A command-triggered
-            // escalation swaps the model on the same endpoint. The scratch
+            // and the proxy token never lands on disk. Every model (review,
+            // escalation, fallback) runs on this same endpoint. The scratch
             // HOME also holds ocr's session store, which --resume reads.
             environment["HOME"] = home;
             environment["OCR_LLM_URL"] = options.ProxyUrl;
             environment["OCR_LLM_TOKEN"] = options.ProxyToken;
-            environment["OCR_LLM_MODEL"] = model ?? options.Model;
             environment["OCR_LLM_PROTOCOL"] = "openai";
             // Per LLM request, in seconds. The upstream zai GLM API is slow
             // and flaky, so the default is generous; ocr's SDK retries each

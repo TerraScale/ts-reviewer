@@ -244,7 +244,8 @@ public sealed class ReviewerTests
             await Assert.That(recorded.Contains("--concurrency 1")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_URL=https://proxy.test/v1")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_TOKEN=proxy")).IsTrue();
-            await Assert.That(recorded.Contains("OCR_LLM_MODEL=review")).IsTrue();
+            await Assert.That(recorded.Contains("--model review ")).IsTrue();
+            await Assert.That(recorded.Contains("OCR_LLM_MODEL")).IsFalse();
             await Assert.That(recorded.Contains("OCR_LLM_PROTOCOL=openai")).IsTrue();
             await Assert.That(recorded.Contains("--timeout 60 ")).IsTrue();
             await Assert.That(recorded.Contains("--resume")).IsFalse();
@@ -254,7 +255,7 @@ public sealed class ReviewerTests
             // An escalated review re-runs the same head on the escalation model.
             await engine.RunAsync(pullRequest, CancellationToken.None, "gpt-6-astra");
             recorded = await File.ReadAllTextAsync(log);
-            await Assert.That(recorded.Contains("OCR_LLM_MODEL=gpt-6-astra")).IsTrue();
+            await Assert.That(recorded.Contains("--model gpt-6-astra ")).IsTrue();
 
             // Exercise the real webhook-to-HTTP publication path. Forgejo uses
             // APPROVED, not GitHub's APPROVE; the latter creates a pending draft.

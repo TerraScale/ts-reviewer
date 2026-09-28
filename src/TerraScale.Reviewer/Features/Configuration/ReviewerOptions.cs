@@ -6,7 +6,8 @@ public sealed record ReviewerOptions(
     string WebhookSecret, string ContextApiToken, string ContextDatabasePath, int ContextMaxFiles,
     int ContextMaxAttempts = 5, TimeSpan? ContextRetryBaseDelay = null, string OperatorToken = "",
     string EscalationModel = "gpt-6-astra", int OcrConcurrency = 1, int OcrMaxAttempts = 6,
-    TimeSpan? OcrRetryBaseDelay = null, TimeSpan? OcrLlmRequestTimeout = null, TimeSpan? OcrItemReviewTimeout = null)
+    TimeSpan? OcrRetryBaseDelay = null, TimeSpan? OcrLlmRequestTimeout = null, TimeSpan? OcrItemReviewTimeout = null,
+    string FallbackModel = "deepseek-flash")
 {
     public TimeSpan ContextRetryDelay => ContextRetryBaseDelay ?? TimeSpan.FromSeconds(1);
     public TimeSpan OcrRetryDelay => OcrRetryBaseDelay ?? TimeSpan.FromSeconds(30);
@@ -26,6 +27,7 @@ public sealed record ReviewerOptions(
             ["proxy-token"] = Environment.GetEnvironmentVariable("TS_REVIEWER_PROXY_TOKEN"),
             ["model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_MODEL") ?? "glm-5.3",
             ["escalation-model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_ESCALATION_MODEL") ?? "gpt-6-astra",
+            ["fallback-model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_FALLBACK_MODEL") ?? "deepseek-flash",
             ["organization"] = Environment.GetEnvironmentVariable("TS_REVIEWER_ORGANIZATION") ?? "TerraScale",
             ["bot-login"] = Environment.GetEnvironmentVariable("TS_REVIEWER_BOT_LOGIN") ?? "terrascale-bot",
             ["max-concurrent"] = Environment.GetEnvironmentVariable("TS_REVIEWER_MAX_CONCURRENT") ?? "2",
@@ -82,7 +84,7 @@ public sealed record ReviewerOptions(
             Trim(values["proxy-url"]!), proxyToken, values["model"]!, values["organization"]!, values["bot-login"]!,
             maxConcurrent, reviewTimeout, webhookSecret, contextApiToken, values["context-database"]!, contextMaxFiles,
             contextMaxAttempts, contextRetryBaseDelay, operatorToken, values["escalation-model"]!, ocrConcurrency,
-            ocrMaxAttempts, ocrRetryBaseDelay, ocrLlmTimeout, ocrItemTimeout);
+            ocrMaxAttempts, ocrRetryBaseDelay, ocrLlmTimeout, ocrItemTimeout, values["fallback-model"]!.Trim());
     }
     private static string Required(IReadOnlyDictionary<string, string?> values, string key, string environmentName) =>
         string.IsNullOrWhiteSpace(values[key]) ? throw new InvalidOperationException($"{environmentName} is required") : values[key]!;

@@ -78,6 +78,52 @@ public sealed class OcrRetryTests
         await Assert.That(failure).IsEqualTo("ocr review failed: " + Partial(0, 1, 2));
     }
 
+    [Test]
+    public async Task AnIncompleteReviewFallsBackToTheFallbackModelOnTheSameSession()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        await fixture.ScriptAsync(
+            // Runs 1-2: the review model keeps failing one of two items.
+            Report(Partial(1, 1, 2), "sess-1", [FindingA], failedPath: "b.cs"),
+            Report(Partial(1, 1, 2), "sess-2", [FindingA], failedPath: "b.cs"),
+            // Run 3 must resume run 2 on the fallback model and completes the missing item.
+            "case \"$args\" in *'--model fallback '*'--resume sess-2'*) ;; *) echo 'expected fallback resume of sess-2' >&2; exit 2 ;; esac\n" +
+            Report("Review complete: 2 finding(s) across 2 selected item(s).", "sess-3", [FindingA, FindingB], status: "complete"));
+
+        var result = await fixture.Engine(attempts: 2, fallback: "fallback").RunAsync(fixture.PullRequest, CancellationToken.None);
+
+        await Assert.That(result.Findings.Count).IsEqualTo(2);
+        await Assert.That(result.Summary.Contains("fallback model `fallback` took over", StringComparison.Ordinal)).IsTrue();
+        await Assert.That(result.Summary.Contains("partial", StringComparison.OrdinalIgnoreCase)).IsFalse();
+        var runs = await fixture.RunsAsync();
+        await Assert.That(runs.Length).IsEqualTo(3);
+        await Assert.That(runs[0].Contains("--model review ")).IsTrue();
+        await Assert.That(runs[1].Contains("--model review ")).IsTrue();
+        await Assert.That(runs[2].Contains("--model fallback ")).IsTrue();
+    }
+
+    [Test]
+    public async Task AnExhaustedFallbackPublishesPartialFindingsAndNeverFallsBackToItself()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        await fixture.ScriptAsync(Report(Partial(1, 1, 2), "sess-1", [FindingA], failedPath: "b.cs"));
+        var engine = fixture.Engine(attempts: 2, fallback: "fallback");
+
+        var partial = await engine.RunAsync(fixture.PullRequest, CancellationToken.None);
+
+        await Assert.That(partial.Findings.Count).IsEqualTo(1);
+        await Assert.That(partial.Summary.Contains("fallback model `fallback` took over", StringComparison.Ordinal)).IsTrue();
+        await Assert.That(partial.Summary.Contains("partial review", StringComparison.Ordinal)).IsTrue();
+        var runs = await fixture.RunsAsync();
+        await Assert.That(runs.Length).IsEqualTo(4);
+        await Assert.That(runs[3].Contains("--model fallback ")).IsTrue();
+
+        // A review already running on the fallback model (e.g. an escalation
+        // to it) has nothing left to fall back to.
+        await engine.RunAsync(fixture.PullRequest, CancellationToken.None, "fallback");
+        await Assert.That((await fixture.RunsAsync()).Length).IsEqualTo(6);
+    }
+
     private static string Partial(int findings, int failed, int selected) =>
         $"Review partially complete: {findings} finding(s); {failed} of {selected} selected item(s) failed.";
 
@@ -149,11 +195,12 @@ public sealed class OcrRetryTests
             if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(_stub, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
 
-        public ReviewEngine Engine(int attempts)
+        /// <summary>An engine on the <c>review</c> model; the fallback model is off unless named.</summary>
+        public ReviewEngine Engine(int attempts, string fallback = "")
         {
             var options = new ReviewerOptions("http://+:8080", _root, "forgejo", "https://proxy.test/v1", "proxy", "review", "TerraScale", "bot", 1,
                 TimeSpan.FromMinutes(1), "webhook-test-secret", "context-test-token", Path.Combine(_root, "context.db"), 100,
-                OcrMaxAttempts: attempts, OcrRetryBaseDelay: TimeSpan.FromMilliseconds(10));
+                OcrMaxAttempts: attempts, OcrRetryBaseDelay: TimeSpan.FromMilliseconds(10), FallbackModel: fallback);
             return new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, _stub);
         }
 
