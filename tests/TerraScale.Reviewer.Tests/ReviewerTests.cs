@@ -91,7 +91,7 @@ public sealed class ReviewerTests
     public async Task ConfigurationDefaults()
     {
         string[] names = ["TS_REVIEWER_TIMEOUT", "TS_REVIEWER_MODEL", "TS_REVIEWER_FALLBACK_MODEL", "TS_REVIEWER_MAX_CONCURRENT",
-            "TS_REVIEWER_OCR_CONCURRENCY", "TS_REVIEWER_OCR_MAX_ATTEMPTS", "TS_REVIEWER_OCR_RETRY_BASE_DELAY",
+            "TS_REVIEWER_OCR_CONCURRENCY", "TS_REVIEWER_PRIMARY_STREAMS", "TS_REVIEWER_PROXY_URL", "TS_REVIEWER_OCR_MAX_ATTEMPTS", "TS_REVIEWER_OCR_RETRY_BASE_DELAY",
             "TS_REVIEWER_OCR_LLM_TIMEOUT", "TS_REVIEWER_OCR_ITEM_TIMEOUT"];
         var previous = names.ToDictionary(x => x, Environment.GetEnvironmentVariable);
         try
@@ -107,6 +107,8 @@ public sealed class ReviewerTests
             await Assert.That(options.ReviewTimeout).IsEqualTo(TimeSpan.FromHours(2));
             await Assert.That(options.MaxConcurrent).IsEqualTo(4);
             await Assert.That(options.OcrConcurrency).IsEqualTo(4);
+            await Assert.That(options.PrimaryStreams).IsEqualTo(6);
+            await Assert.That(options.ProxyUrl).IsEqualTo("http://10.11.99.1:8318");
             await Assert.That(options.OcrMaxAttempts).IsEqualTo(3);
             await Assert.That(options.OcrRetryDelay).IsEqualTo(TimeSpan.FromSeconds(10));
             await Assert.That(options.OcrLlmTimeout).IsEqualTo(TimeSpan.FromMinutes(10));
@@ -251,7 +253,7 @@ public sealed class ReviewerTests
             await Assert.That(recorded.Contains("OCR_LLM_TOKEN=proxy")).IsTrue();
             await Assert.That(recorded.Contains("--model review ")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_MODEL")).IsFalse();
-            await Assert.That(recorded.Contains("OCR_LLM_PROTOCOL=openai")).IsTrue();
+            await Assert.That(recorded.Contains("OCR_LLM_PROTOCOL=anthropic")).IsTrue();
             await Assert.That(recorded.Contains("--timeout 30 ")).IsTrue();
             await Assert.That(recorded.Contains("--resume")).IsFalse();
             await Assert.That(recorded.Contains("OCR_LLM_TIMEOUT=600")).IsTrue();

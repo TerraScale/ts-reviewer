@@ -11,14 +11,23 @@ namespace TerraScale.Reviewer.Features.Review;
 
 /// <summary>
 /// Runs reviews through the OpenCodeReview CLI (alibaba/open-code-review).
-/// Each review clones the pull request, configures ocr's OpenAI-compatible
-/// endpoint through <c>OCR_LLM_*</c> environment variables pointing at the
-/// CLIProxy endpoint, invokes <c>ocr review</c> over the exact base..head
-/// range, and maps the returned comments to <see cref="Finding"/> records.
+/// Each review clones the pull request, configures ocr's Anthropic-compatible
+/// endpoint through <c>OCR_LLM_*</c> environment variables pointing at
+/// ts-router, invokes <c>ocr review</c> over the exact base..head range, and
+/// maps the returned comments to <see cref="Finding"/> records.
 /// </summary>
 public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> logger, string? ocrPath = null)
 {
     private readonly string _ocrPath = ocrPath ?? "ocr";
+
+    // The review model's upstream serves few concurrent requests (Z.AI's
+    // shared GLM key answers more with 1302 "rate limit reached"), so reviews
+    // share a budget of PrimaryStreams concurrent ocr requests on it. A review
+    // takes up to OcrConcurrency of the free streams; once none is free, new
+    // reviews start on the fallback model instead of failing on the review
+    // model first.
+    private readonly Lock _primaryLock = new();
+    private int _primaryStreams;
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(10);
@@ -69,12 +78,43 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
             // each changed file (rename detection included).
             await RunGitAsync(home, repository, ct, "checkout", "--quiet", "--detach", head);
             await RunGitAsync(home, repository, ct, "diff", "--shortstat", "--find-renames", "--no-ext-diff", "--no-textconv", $"{@base}...{head}");
-            return await ReviewWithFallbackAsync(home, repository, root, @base, head, model ?? options.Model, cloneUrl, ct);
+            var concurrency = options.OcrConcurrency;
+            if (model is not null) return await ReviewWithFallbackAsync(home, repository, root, @base, head, model, concurrency, cloneUrl, ct);
+            var fallback = options.FallbackModel;
+            // Without a distinct fallback model there is nowhere to spill:
+            // ts-router queues the review model's requests over its cap.
+            if (fallback.Length == 0 || string.Equals(fallback, options.Model, StringComparison.Ordinal))
+                return await ReviewWithFallbackAsync(home, repository, root, @base, head, options.Model, concurrency, cloneUrl, ct);
+            var streams = TakePrimaryStreams();
+            if (streams > 0)
+            {
+                try { return await ReviewWithFallbackAsync(home, repository, root, @base, head, options.Model, streams, cloneUrl, ct); }
+                finally { ReturnPrimaryStreams(streams); }
+            }
+            logger.LogInformation("all {PrimaryStreams} {Model} streams are in use; reviewing {CloneUrl} on {FallbackModel}", options.PrimaryStreams, options.Model, cloneUrl, fallback);
+            var result = await ReviewWithFallbackAsync(home, repository, root, @base, head, fallback, concurrency, cloneUrl, ct);
+            return result with { Summary = result.Summary + $" (`{options.Model}` was busy with other reviews, so `{fallback}` reviewed this one)" };
         }
         finally
         {
             try { Directory.Delete(root, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
         }
+    }
+
+    /// <summary>Takes up to OcrConcurrency free review-model streams; zero when none is free.</summary>
+    private int TakePrimaryStreams()
+    {
+        lock (_primaryLock)
+        {
+            var streams = Math.Min(options.OcrConcurrency, options.PrimaryStreams - _primaryStreams);
+            if (streams > 0) _primaryStreams += streams;
+            return Math.Max(streams, 0);
+        }
+    }
+
+    private void ReturnPrimaryStreams(int streams)
+    {
+        lock (_primaryLock) _primaryStreams -= streams;
     }
 
     /// <summary>
@@ -83,14 +123,14 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
     /// fallback resumes the same ocr session, so it only reviews the file
     /// groups the first model failed and keeps the findings already made.
     /// </summary>
-    private async Task<ReviewResult> ReviewWithFallbackAsync(string home, string repository, string root, string @base, string head, string model, string cloneUrl, CancellationToken ct)
+    private async Task<ReviewResult> ReviewWithFallbackAsync(string home, string repository, string root, string @base, string head, string model, int concurrency, string cloneUrl, CancellationToken ct)
     {
-        var run = await ReviewWithRetriesAsync(home, repository, root, @base, head, model, null, cloneUrl, ct);
+        var run = await ReviewWithRetriesAsync(home, repository, root, @base, head, model, null, concurrency, cloneUrl, ct);
         var fallback = options.FallbackModel;
         if (!run.Complete && fallback.Length > 0 && !string.Equals(fallback, model, StringComparison.Ordinal))
         {
             logger.LogWarning("model {Model} could not complete the review for {CloneUrl}; falling back to {FallbackModel}", model, cloneUrl, fallback);
-            run = await ReviewWithRetriesAsync(home, repository, root, @base, head, fallback, run.Session, cloneUrl, ct);
+            run = await ReviewWithRetriesAsync(home, repository, root, @base, head, fallback, run.Session, concurrency, cloneUrl, ct);
             if (run.Result is { } reviewed)
                 run = run with { Result = reviewed with { Summary = reviewed.Summary + $" (`{model}` could not finish the review, so fallback model `{fallback}` took over)" } };
         }
@@ -112,11 +152,11 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
     /// Retries back off exponentially; the outer review deadline still bounds
     /// every attempt.
     /// </summary>
-    private async Task<OcrRun> ReviewWithRetriesAsync(string home, string repository, string root, string @base, string head, string model, string? session, string cloneUrl, CancellationToken ct)
+    private async Task<OcrRun> ReviewWithRetriesAsync(string home, string repository, string root, string @base, string head, string model, string? session, int concurrency, string cloneUrl, CancellationToken ct)
     {
         for (var attempt = 1; ; attempt++)
         {
-            var run = await ReviewOnceAsync(home, repository, root, @base, head, model, session, ct);
+            var run = await ReviewOnceAsync(home, repository, root, @base, head, model, session, concurrency, ct);
             if (run.Complete) return run;
             // Resume the session this run reported; a run that produced no
             // session (e.g. a resume ocr refused) starts over from scratch.
@@ -129,7 +169,7 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
         }
     }
 
-    private async Task<OcrRun> ReviewOnceAsync(string home, string repository, string root, string @base, string head, string model, string? session, CancellationToken ct)
+    private async Task<OcrRun> ReviewOnceAsync(string home, string repository, string root, string @base, string head, string model, string? session, int concurrency, CancellationToken ct)
     {
         // A fresh output path per attempt so a failed run can never leave a
         // stale review behind for the next attempt to read.
@@ -140,7 +180,7 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
         // ocr only resumes a session on another model when it is asked for on
         // the command line, which the fallback model relies on.
         List<string> arguments = ["review", "--from", @base, "--to", head, "--model", model,
-            "--concurrency", options.OcrConcurrency.ToString(CultureInfo.InvariantCulture),
+            "--concurrency", concurrency.ToString(CultureInfo.InvariantCulture),
             "--timeout", ((int)Math.Ceiling(options.OcrItemTimeout.TotalMinutes)).ToString(CultureInfo.InvariantCulture),
             "--format", "json", "--audience", "agent", "--color", "never", "--output", output];
         if (session is not null) arguments.AddRange(["--resume", session]);
@@ -251,8 +291,10 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
         {
             // ocr's env-only endpoint configuration (OCR_LLM_*): with no
             // ~/.opencodereview/config.json in the scratch HOME, these
-            // variables point it at the CLIProxy OpenAI-compatible endpoint
-            // and the proxy token never lands on disk. Every model (review,
+            // variables point it at ts-router's Anthropic-compatible endpoint
+            // and the proxy token never lands on disk. ts-router queues
+            // requests over the GLM concurrency cap and retries Z.AI's 1302
+            // throttles before passing them to CLIProxy. Every model (review,
             // escalation, fallback) runs on this same endpoint. The scratch
             // HOME also holds ocr's session store, which --resume reads.
             // Everything ocr reads was downloaded before it started; its git
@@ -261,7 +303,7 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
             environment["GIT_NO_LAZY_FETCH"] = "1";
             environment["OCR_LLM_URL"] = options.ProxyUrl;
             environment["OCR_LLM_TOKEN"] = options.ProxyToken;
-            environment["OCR_LLM_PROTOCOL"] = "openai";
+            environment["OCR_LLM_PROTOCOL"] = "anthropic";
             // Per LLM request, in seconds. The upstream zai GLM API is slow
             // and flaky, so the default is generous; ocr's SDK retries each
             // request five more times on top of the proxy's own retries.

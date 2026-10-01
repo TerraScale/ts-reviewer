@@ -125,6 +125,37 @@ public sealed class OcrRetryTests
     }
 
     [Test]
+    public async Task ReviewsBeyondThePrimaryStreamsStartOnTheFallbackModel()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        var marker = Path.Combine(Path.GetTempPath(), "ts-reviewer-slot-" + Guid.NewGuid().ToString("N"));
+        // The review-model run holds its slot until the marker appears; the
+        // fallback run creates it once it has started.
+        await fixture.ScriptAsync(
+            "case \"$args\" in *'--model fallback '*) touch '" + marker + "' ;; *) while [ ! -e '" + marker + "' ]; do sleep 0.05; done ;; esac\n" +
+            Report("Review complete: 0 finding(s) across 2 selected item(s).", "sess", [], status: "complete"));
+        var engine = fixture.Engine(attempts: 1, fallback: "fallback", primaryStreams: 1);
+
+        try
+        {
+            var first = engine.RunAsync(fixture.PullRequest, CancellationToken.None);
+            while ((File.Exists(fixture.Runs) ? await fixture.RunsAsync() : []).Length == 0) await Task.Delay(20);
+            var second = await engine.RunAsync(fixture.PullRequest, CancellationToken.None);
+            var primary = await first;
+
+            await Assert.That(second.Summary.Contains("`review` was busy with other reviews, so `fallback` reviewed this one", StringComparison.Ordinal)).IsTrue();
+            await Assert.That(primary.Summary.Contains("busy", StringComparison.Ordinal)).IsFalse();
+            var runs = await fixture.RunsAsync();
+            await Assert.That(runs[0].Contains("--model review --concurrency 1 ")).IsTrue();
+            await Assert.That(runs[1].Contains("--model fallback ")).IsTrue();
+        }
+        finally
+        {
+            File.Delete(marker);
+        }
+    }
+
+    [Test]
     public async Task OcrRunsOfflineOnAPartialCloneWithEverythingItReadsDownloaded()
     {
         await using var fixture = await Fixture.CreateAsync(servePartialClones: true);
@@ -243,13 +274,15 @@ public sealed class OcrRetryTests
         }
 
         /// <summary>An engine on the <c>review</c> model; the fallback model is off unless named.</summary>
-        public ReviewEngine Engine(int attempts, string fallback = "")
+        public ReviewEngine Engine(int attempts, string fallback = "", int primaryStreams = 6)
         {
             var options = new ReviewerOptions("http://+:8080", _forgejoUrl, "forgejo", "https://proxy.test/v1", "proxy", "review", "TerraScale", "bot", 1,
                 TimeSpan.FromMinutes(1), "webhook-test-secret", "context-test-token", Path.Combine(_root, "context.db"), 100,
-                OcrMaxAttempts: attempts, OcrRetryBaseDelay: TimeSpan.FromMilliseconds(10), FallbackModel: fallback);
+                OcrMaxAttempts: attempts, OcrRetryBaseDelay: TimeSpan.FromMilliseconds(10), FallbackModel: fallback, PrimaryStreams: primaryStreams);
             return new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, _stub);
         }
+
+        public string Runs => _runs;
 
         public async Task<string[]> RunsAsync() => await File.ReadAllLinesAsync(_runs);
 

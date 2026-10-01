@@ -7,7 +7,7 @@ public sealed record ReviewerOptions(
     int ContextMaxAttempts = 5, TimeSpan? ContextRetryBaseDelay = null, string OperatorToken = "",
     string EscalationModel = "gpt-6-astra", int OcrConcurrency = 4, int OcrMaxAttempts = 3,
     TimeSpan? OcrRetryBaseDelay = null, TimeSpan? OcrLlmRequestTimeout = null, TimeSpan? OcrItemReviewTimeout = null,
-    string FallbackModel = "gpt-6.1-sol(high)")
+    string FallbackModel = "gpt-6.1-sol(high)", int PrimaryStreams = 6)
 {
     public TimeSpan ContextRetryDelay => ContextRetryBaseDelay ?? TimeSpan.FromSeconds(1);
     public TimeSpan OcrRetryDelay => OcrRetryBaseDelay ?? TimeSpan.FromSeconds(10);
@@ -23,13 +23,14 @@ public sealed record ReviewerOptions(
             ["listen"] = Environment.GetEnvironmentVariable("TS_REVIEWER_LISTEN") ?? "http://+:8080",
             ["forgejo-url"] = Environment.GetEnvironmentVariable("TS_REVIEWER_FORGEJO_URL") ?? "https://git.terrascale.tech",
             ["forgejo-token"] = Environment.GetEnvironmentVariable("TS_REVIEWER_FORGEJO_TOKEN"),
-            ["proxy-url"] = Environment.GetEnvironmentVariable("TS_REVIEWER_PROXY_URL") ?? "http://10.11.99.1:8317/v1",
+            ["proxy-url"] = Environment.GetEnvironmentVariable("TS_REVIEWER_PROXY_URL") ?? "http://10.11.99.1:8318",
             ["proxy-token"] = Environment.GetEnvironmentVariable("TS_REVIEWER_PROXY_TOKEN"),
             ["model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_MODEL") ?? "glm-5.3(xhigh)",
             ["escalation-model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_ESCALATION_MODEL") ?? "gpt-6-astra",
             ["fallback-model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_FALLBACK_MODEL") ?? "gpt-6.1-sol(high)",
             ["organization"] = Environment.GetEnvironmentVariable("TS_REVIEWER_ORGANIZATION") ?? "TerraScale",
             ["bot-login"] = Environment.GetEnvironmentVariable("TS_REVIEWER_BOT_LOGIN") ?? "terrascale-bot",
+            ["primary-streams"] = Environment.GetEnvironmentVariable("TS_REVIEWER_PRIMARY_STREAMS") ?? "6",
             ["max-concurrent"] = Environment.GetEnvironmentVariable("TS_REVIEWER_MAX_CONCURRENT") ?? "4",
             ["ocr-concurrency"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_CONCURRENCY") ?? "4",
             ["ocr-max-attempts"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_MAX_ATTEMPTS") ?? "3",
@@ -58,6 +59,8 @@ public sealed record ReviewerOptions(
         var operatorToken = Required(values, "operator-token", "TS_REVIEWER_OPERATOR_TOKEN");
         var maxConcurrent = ParseInt(values, "max-concurrent");
         if (maxConcurrent is < 1 or > 100) throw new InvalidOperationException("max-concurrent must be between 1 and 100");
+        var primaryStreams = ParseInt(values, "primary-streams");
+        if (primaryStreams is < 1 or > 1000) throw new InvalidOperationException("primary-streams must be between 1 and 1000");
         var ocrConcurrency = ParseInt(values, "ocr-concurrency");
         if (ocrConcurrency is < 1 or > 10) throw new InvalidOperationException("ocr-concurrency must be between 1 and 10");
         var ocrMaxAttempts = ParseInt(values, "ocr-max-attempts");
@@ -84,7 +87,7 @@ public sealed record ReviewerOptions(
             Trim(values["proxy-url"]!), proxyToken, values["model"]!, values["organization"]!, values["bot-login"]!,
             maxConcurrent, reviewTimeout, webhookSecret, contextApiToken, values["context-database"]!, contextMaxFiles,
             contextMaxAttempts, contextRetryBaseDelay, operatorToken, values["escalation-model"]!, ocrConcurrency,
-            ocrMaxAttempts, ocrRetryBaseDelay, ocrLlmTimeout, ocrItemTimeout, values["fallback-model"]!.Trim());
+            ocrMaxAttempts, ocrRetryBaseDelay, ocrLlmTimeout, ocrItemTimeout, values["fallback-model"]!.Trim(), primaryStreams);
     }
     private static string Required(IReadOnlyDictionary<string, string?> values, string key, string environmentName) =>
         string.IsNullOrWhiteSpace(values[key]) ? throw new InvalidOperationException($"{environmentName} is required") : values[key]!;
