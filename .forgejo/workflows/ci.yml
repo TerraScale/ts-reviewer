@@ -100,7 +100,10 @@ jobs:
             -p:IncludeNativeLibrariesForSelfExtract=true \
             -p:DebugType=None
           test -s artifacts/ci/container-publish/TerraScale.Reviewer
+          # The job's container storage is discarded afterwards, so cached
+          # intermediate layers are never reused: commit only the final image.
           podman build \
+            --layers=false \
             --pull=missing \
             --platform linux/amd64 \
             --tag "localhost/terrascale/ts-reviewer:${source_commit}" \
