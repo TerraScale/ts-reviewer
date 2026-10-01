@@ -5,16 +5,16 @@ public sealed record ReviewerOptions(
     string Model, string Organization, string BotLogin, int MaxConcurrent, TimeSpan ReviewTimeout,
     string WebhookSecret, string ContextApiToken, string ContextDatabasePath, int ContextMaxFiles,
     int ContextMaxAttempts = 5, TimeSpan? ContextRetryBaseDelay = null, string OperatorToken = "",
-    string EscalationModel = "gpt-6-astra", int OcrConcurrency = 1, int OcrMaxAttempts = 6,
+    string EscalationModel = "gpt-6-astra", int OcrConcurrency = 4, int OcrMaxAttempts = 3,
     TimeSpan? OcrRetryBaseDelay = null, TimeSpan? OcrLlmRequestTimeout = null, TimeSpan? OcrItemReviewTimeout = null,
-    string FallbackModel = "deepseek-flash")
+    string FallbackModel = "gpt-6.1-sol(high)")
 {
     public TimeSpan ContextRetryDelay => ContextRetryBaseDelay ?? TimeSpan.FromSeconds(1);
-    public TimeSpan OcrRetryDelay => OcrRetryBaseDelay ?? TimeSpan.FromSeconds(30);
+    public TimeSpan OcrRetryDelay => OcrRetryBaseDelay ?? TimeSpan.FromSeconds(10);
     /// <summary>Per-request LLM timeout handed to ocr as <c>OCR_LLM_TIMEOUT</c>.</summary>
-    public TimeSpan OcrLlmTimeout => OcrLlmRequestTimeout ?? TimeSpan.FromMinutes(15);
+    public TimeSpan OcrLlmTimeout => OcrLlmRequestTimeout ?? TimeSpan.FromMinutes(10);
     /// <summary>Per-item (file group) deadline handed to ocr as <c>--timeout</c>.</summary>
-    public TimeSpan OcrItemTimeout => OcrItemReviewTimeout ?? TimeSpan.FromHours(1);
+    public TimeSpan OcrItemTimeout => OcrItemReviewTimeout ?? TimeSpan.FromMinutes(30);
 
     public static ReviewerOptions Load(string[] args)
     {
@@ -25,18 +25,18 @@ public sealed record ReviewerOptions(
             ["forgejo-token"] = Environment.GetEnvironmentVariable("TS_REVIEWER_FORGEJO_TOKEN"),
             ["proxy-url"] = Environment.GetEnvironmentVariable("TS_REVIEWER_PROXY_URL") ?? "http://10.11.99.1:8317/v1",
             ["proxy-token"] = Environment.GetEnvironmentVariable("TS_REVIEWER_PROXY_TOKEN"),
-            ["model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_MODEL") ?? "glm-5.3",
+            ["model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_MODEL") ?? "glm-5.3(xhigh)",
             ["escalation-model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_ESCALATION_MODEL") ?? "gpt-6-astra",
-            ["fallback-model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_FALLBACK_MODEL") ?? "deepseek-flash",
+            ["fallback-model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_FALLBACK_MODEL") ?? "gpt-6.1-sol(high)",
             ["organization"] = Environment.GetEnvironmentVariable("TS_REVIEWER_ORGANIZATION") ?? "TerraScale",
             ["bot-login"] = Environment.GetEnvironmentVariable("TS_REVIEWER_BOT_LOGIN") ?? "terrascale-bot",
-            ["max-concurrent"] = Environment.GetEnvironmentVariable("TS_REVIEWER_MAX_CONCURRENT") ?? "2",
-            ["ocr-concurrency"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_CONCURRENCY") ?? "1",
-            ["ocr-max-attempts"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_MAX_ATTEMPTS") ?? "6",
-            ["ocr-retry-base-delay"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_RETRY_BASE_DELAY") ?? "00:00:30",
-            ["ocr-llm-timeout"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_LLM_TIMEOUT") ?? "00:15:00",
-            ["ocr-item-timeout"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_ITEM_TIMEOUT") ?? "01:00:00",
-            ["timeout"] = Environment.GetEnvironmentVariable("TS_REVIEWER_TIMEOUT") ?? "04:00:00",
+            ["max-concurrent"] = Environment.GetEnvironmentVariable("TS_REVIEWER_MAX_CONCURRENT") ?? "4",
+            ["ocr-concurrency"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_CONCURRENCY") ?? "4",
+            ["ocr-max-attempts"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_MAX_ATTEMPTS") ?? "3",
+            ["ocr-retry-base-delay"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_RETRY_BASE_DELAY") ?? "00:00:10",
+            ["ocr-llm-timeout"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_LLM_TIMEOUT") ?? "00:10:00",
+            ["ocr-item-timeout"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_ITEM_TIMEOUT") ?? "00:30:00",
+            ["timeout"] = Environment.GetEnvironmentVariable("TS_REVIEWER_TIMEOUT") ?? "02:00:00",
             ["webhook-secret"] = Environment.GetEnvironmentVariable("TS_REVIEWER_WEBHOOK_SECRET") ?? string.Empty,
             ["context-api-token"] = Environment.GetEnvironmentVariable("TS_REVIEWER_CONTEXT_API_TOKEN") ?? string.Empty,
             ["context-database"] = Environment.GetEnvironmentVariable("TS_REVIEWER_CONTEXT_DATABASE") ?? "data/reviewer-context.db",
