@@ -9,7 +9,7 @@
     <IsPackable>false</IsPackable>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="TUnit" Version="1.56.18" />
+    <PackageReference Include="TUnit" Version="1.72.10" />
     <ProjectReference Include="../../src/TerraScale.Reviewer/TerraScale.Reviewer.csproj" />
     <ProjectReference Include="../TerraScale.Reviewer.LeaseCrashChild/TerraScale.Reviewer.LeaseCrashChild.csproj" />
   </ItemGroup>
