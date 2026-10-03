@@ -78,7 +78,8 @@ public sealed class ReviewerTests
         await Assert.That(options.OcrItemTimeout).IsEqualTo(TimeSpan.FromMinutes(30));
 
         foreach (var invalid in new[] { "--max-concurrent=0", "--ocr-max-attempts=0", "--ocr-max-attempts=21", "--ocr-retry-base-delay=00:00:00", "--ocr-retry-base-delay=00:05:01",
-            "--ocr-llm-timeout=00:00:30", "--ocr-llm-timeout=02:00:01", "--ocr-item-timeout=00:00:59", "--ocr-item-timeout=1.00:00:01" })
+            "--ocr-llm-timeout=00:00:30", "--ocr-llm-timeout=02:00:01", "--ocr-item-timeout=00:00:59", "--ocr-item-timeout=1.00:00:01",
+            "--ocr-concurrency=0", "--ocr-concurrency=33" })
         {
             var rejected = false;
             try { ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy", "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token", "--operator-token=operator-test-token", invalid]); }
@@ -100,19 +101,19 @@ public sealed class ReviewerTests
             var options = ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy",
                 "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token",
                 "--operator-token=operator-test-token"]);
-            // Parallel file groups and a quick hand-off to the fallback model
-            // keep reviews fast on the slow, flaky upstream GLM API.
-            await Assert.That(options.Model).IsEqualTo("glm-5.3(xhigh)");
-            await Assert.That(options.FallbackModel).IsEqualTo("gpt-6.1-sol(high)");
-            await Assert.That(options.ReviewTimeout).IsEqualTo(TimeSpan.FromHours(2));
-            await Assert.That(options.MaxConcurrent).IsEqualTo(4);
-            await Assert.That(options.OcrConcurrency).IsEqualTo(4);
-            await Assert.That(options.PrimaryStreams).IsEqualTo(6);
+            // Sol scales to many concurrent streams, so reviews run on it alone
+            // with wide parallelism and no fallback model.
+            await Assert.That(options.Model).IsEqualTo("gpt-6.1-sol(medium)");
+            await Assert.That(options.FallbackModel).IsEqualTo(string.Empty);
+            await Assert.That(options.ReviewTimeout).IsEqualTo(TimeSpan.FromHours(4));
+            await Assert.That(options.MaxConcurrent).IsEqualTo(16);
+            await Assert.That(options.OcrConcurrency).IsEqualTo(8);
+            await Assert.That(options.PrimaryStreams).IsEqualTo(64);
             await Assert.That(options.ProxyUrl).IsEqualTo("http://10.11.99.1:8318");
             await Assert.That(options.OcrMaxAttempts).IsEqualTo(3);
             await Assert.That(options.OcrRetryDelay).IsEqualTo(TimeSpan.FromSeconds(10));
-            await Assert.That(options.OcrLlmTimeout).IsEqualTo(TimeSpan.FromMinutes(10));
-            await Assert.That(options.OcrItemTimeout).IsEqualTo(TimeSpan.FromMinutes(30));
+            await Assert.That(options.OcrLlmTimeout).IsEqualTo(TimeSpan.FromMinutes(20));
+            await Assert.That(options.OcrItemTimeout).IsEqualTo(TimeSpan.FromHours(1));
         }
         finally
         {
@@ -248,15 +249,15 @@ public sealed class ReviewerTests
             await Assert.That(recorded.Contains("--from " + baseSha)).IsTrue();
             await Assert.That(recorded.Contains("--to " + headSha)).IsTrue();
             await Assert.That(recorded.Contains("--format json")).IsTrue();
-            await Assert.That(recorded.Contains("--concurrency 4")).IsTrue();
+            await Assert.That(recorded.Contains("--concurrency 8")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_URL=https://proxy.test/v1")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_TOKEN=proxy")).IsTrue();
             await Assert.That(recorded.Contains("--model review ")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_MODEL")).IsFalse();
             await Assert.That(recorded.Contains("OCR_LLM_PROTOCOL=anthropic")).IsTrue();
-            await Assert.That(recorded.Contains("--timeout 30 ")).IsTrue();
+            await Assert.That(recorded.Contains("--timeout 60 ")).IsTrue();
             await Assert.That(recorded.Contains("--resume")).IsFalse();
-            await Assert.That(recorded.Contains("OCR_LLM_TIMEOUT=600")).IsTrue();
+            await Assert.That(recorded.Contains("OCR_LLM_TIMEOUT=1200")).IsTrue();
             await Assert.That(recorded.Contains("OCR_ENABLE_TELEMETRY=false")).IsTrue();
 
             // An escalated review re-runs the same head on the escalation model.

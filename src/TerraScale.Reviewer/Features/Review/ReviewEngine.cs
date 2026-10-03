@@ -20,12 +20,12 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
 {
     private readonly string _ocrPath = ocrPath ?? "ocr";
 
-    // The review model's upstream serves few concurrent requests (Z.AI's
-    // shared GLM key answers more with 1302 "rate limit reached"), so reviews
-    // share a budget of PrimaryStreams concurrent ocr requests on it. A review
-    // takes up to OcrConcurrency of the free streams; once none is free, new
-    // reviews start on the fallback model instead of failing on the review
-    // model first.
+    // When a fallback model is configured, reviews share a budget of
+    // PrimaryStreams concurrent ocr requests on the review model, for review
+    // models whose upstream serves few concurrent requests. A review takes up
+    // to OcrConcurrency of the free streams; once none is free, new reviews
+    // start on the fallback model instead of failing on the review model
+    // first. Without a fallback model there is no budget.
     private readonly Lock _primaryLock = new();
     private int _primaryStreams;
 
@@ -292,10 +292,9 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
             // ocr's env-only endpoint configuration (OCR_LLM_*): with no
             // ~/.opencodereview/config.json in the scratch HOME, these
             // variables point it at ts-router's Anthropic-compatible endpoint
-            // and the proxy token never lands on disk. ts-router queues
-            // requests over the GLM concurrency cap and retries Z.AI's 1302
-            // throttles before passing them to CLIProxy. Every model (review,
-            // escalation, fallback) runs on this same endpoint. The scratch
+            // and the proxy token never lands on disk. ts-router passes them
+            // to CLIProxy. Every model (review, escalation, fallback) runs on
+            // this same endpoint. The scratch
             // HOME also holds ocr's session store, which --resume reads.
             // Everything ocr reads was downloaded before it started; its git
             // has no credentials, so it must never try to fetch more.
@@ -304,9 +303,9 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
             environment["OCR_LLM_URL"] = options.ProxyUrl;
             environment["OCR_LLM_TOKEN"] = options.ProxyToken;
             environment["OCR_LLM_PROTOCOL"] = "anthropic";
-            // Per LLM request, in seconds. The upstream zai GLM API is slow
-            // and flaky, so the default is generous; ocr's SDK retries each
-            // request five more times on top of the proxy's own retries.
+            // Per LLM request, in seconds. Large file groups take a while, so
+            // the default is generous; ocr's SDK retries each request five
+            // more times on top of the proxy's own retries.
             environment["OCR_LLM_TIMEOUT"] = ((int)options.OcrLlmTimeout.TotalSeconds).ToString(CultureInfo.InvariantCulture);
             environment["OCR_ENABLE_TELEMETRY"] = "false";
         }, ct, arguments);

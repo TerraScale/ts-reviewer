@@ -5,16 +5,16 @@ public sealed record ReviewerOptions(
     string Model, string Organization, string BotLogin, int MaxConcurrent, TimeSpan ReviewTimeout,
     string WebhookSecret, string ContextApiToken, string ContextDatabasePath, int ContextMaxFiles,
     int ContextMaxAttempts = 5, TimeSpan? ContextRetryBaseDelay = null, string OperatorToken = "",
-    string EscalationModel = "gpt-6-astra", int OcrConcurrency = 4, int OcrMaxAttempts = 3,
+    string EscalationModel = "gpt-6-astra", int OcrConcurrency = 8, int OcrMaxAttempts = 3,
     TimeSpan? OcrRetryBaseDelay = null, TimeSpan? OcrLlmRequestTimeout = null, TimeSpan? OcrItemReviewTimeout = null,
-    string FallbackModel = "gpt-6.1-sol(high)", int PrimaryStreams = 6)
+    string FallbackModel = "", int PrimaryStreams = 64)
 {
     public TimeSpan ContextRetryDelay => ContextRetryBaseDelay ?? TimeSpan.FromSeconds(1);
     public TimeSpan OcrRetryDelay => OcrRetryBaseDelay ?? TimeSpan.FromSeconds(10);
     /// <summary>Per-request LLM timeout handed to ocr as <c>OCR_LLM_TIMEOUT</c>.</summary>
-    public TimeSpan OcrLlmTimeout => OcrLlmRequestTimeout ?? TimeSpan.FromMinutes(10);
+    public TimeSpan OcrLlmTimeout => OcrLlmRequestTimeout ?? TimeSpan.FromMinutes(20);
     /// <summary>Per-item (file group) deadline handed to ocr as <c>--timeout</c>.</summary>
-    public TimeSpan OcrItemTimeout => OcrItemReviewTimeout ?? TimeSpan.FromMinutes(30);
+    public TimeSpan OcrItemTimeout => OcrItemReviewTimeout ?? TimeSpan.FromHours(1);
 
     public static ReviewerOptions Load(string[] args)
     {
@@ -25,19 +25,19 @@ public sealed record ReviewerOptions(
             ["forgejo-token"] = Environment.GetEnvironmentVariable("TS_REVIEWER_FORGEJO_TOKEN"),
             ["proxy-url"] = Environment.GetEnvironmentVariable("TS_REVIEWER_PROXY_URL") ?? "http://10.11.99.1:8318",
             ["proxy-token"] = Environment.GetEnvironmentVariable("TS_REVIEWER_PROXY_TOKEN"),
-            ["model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_MODEL") ?? "glm-5.3(xhigh)",
+            ["model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_MODEL") ?? "gpt-6.1-sol(medium)",
             ["escalation-model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_ESCALATION_MODEL") ?? "gpt-6-astra",
-            ["fallback-model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_FALLBACK_MODEL") ?? "gpt-6.1-sol(high)",
+            ["fallback-model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_FALLBACK_MODEL") ?? string.Empty,
             ["organization"] = Environment.GetEnvironmentVariable("TS_REVIEWER_ORGANIZATION") ?? "TerraScale",
             ["bot-login"] = Environment.GetEnvironmentVariable("TS_REVIEWER_BOT_LOGIN") ?? "terrascale-bot",
-            ["primary-streams"] = Environment.GetEnvironmentVariable("TS_REVIEWER_PRIMARY_STREAMS") ?? "6",
-            ["max-concurrent"] = Environment.GetEnvironmentVariable("TS_REVIEWER_MAX_CONCURRENT") ?? "4",
-            ["ocr-concurrency"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_CONCURRENCY") ?? "4",
+            ["primary-streams"] = Environment.GetEnvironmentVariable("TS_REVIEWER_PRIMARY_STREAMS") ?? "64",
+            ["max-concurrent"] = Environment.GetEnvironmentVariable("TS_REVIEWER_MAX_CONCURRENT") ?? "16",
+            ["ocr-concurrency"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_CONCURRENCY") ?? "8",
             ["ocr-max-attempts"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_MAX_ATTEMPTS") ?? "3",
             ["ocr-retry-base-delay"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_RETRY_BASE_DELAY") ?? "00:00:10",
-            ["ocr-llm-timeout"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_LLM_TIMEOUT") ?? "00:10:00",
-            ["ocr-item-timeout"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_ITEM_TIMEOUT") ?? "00:30:00",
-            ["timeout"] = Environment.GetEnvironmentVariable("TS_REVIEWER_TIMEOUT") ?? "02:00:00",
+            ["ocr-llm-timeout"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_LLM_TIMEOUT") ?? "00:20:00",
+            ["ocr-item-timeout"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_ITEM_TIMEOUT") ?? "01:00:00",
+            ["timeout"] = Environment.GetEnvironmentVariable("TS_REVIEWER_TIMEOUT") ?? "04:00:00",
             ["webhook-secret"] = Environment.GetEnvironmentVariable("TS_REVIEWER_WEBHOOK_SECRET") ?? string.Empty,
             ["context-api-token"] = Environment.GetEnvironmentVariable("TS_REVIEWER_CONTEXT_API_TOKEN") ?? string.Empty,
             ["context-database"] = Environment.GetEnvironmentVariable("TS_REVIEWER_CONTEXT_DATABASE") ?? "data/reviewer-context.db",
@@ -62,7 +62,7 @@ public sealed record ReviewerOptions(
         var primaryStreams = ParseInt(values, "primary-streams");
         if (primaryStreams is < 1 or > 1000) throw new InvalidOperationException("primary-streams must be between 1 and 1000");
         var ocrConcurrency = ParseInt(values, "ocr-concurrency");
-        if (ocrConcurrency is < 1 or > 10) throw new InvalidOperationException("ocr-concurrency must be between 1 and 10");
+        if (ocrConcurrency is < 1 or > 32) throw new InvalidOperationException("ocr-concurrency must be between 1 and 32");
         var ocrMaxAttempts = ParseInt(values, "ocr-max-attempts");
         if (ocrMaxAttempts is < 1 or > 20) throw new InvalidOperationException("ocr-max-attempts must be between 1 and 20");
         if (!TimeSpan.TryParse(values["ocr-retry-base-delay"], out var ocrRetryBaseDelay)
@@ -87,7 +87,7 @@ public sealed record ReviewerOptions(
             Trim(values["proxy-url"]!), proxyToken, values["model"]!, values["organization"]!, values["bot-login"]!,
             maxConcurrent, reviewTimeout, webhookSecret, contextApiToken, values["context-database"]!, contextMaxFiles,
             contextMaxAttempts, contextRetryBaseDelay, operatorToken, values["escalation-model"]!, ocrConcurrency,
-            ocrMaxAttempts, ocrRetryBaseDelay, ocrLlmTimeout, ocrItemTimeout, values["fallback-model"]!.Trim(), primaryStreams);
+            ocrMaxAttempts, ocrRetryBaseDelay, ocrLlmTimeout, ocrItemTimeout, (values["fallback-model"] ?? string.Empty).Trim(), primaryStreams);
     }
     private static string Required(IReadOnlyDictionary<string, string?> values, string key, string environmentName) =>
         string.IsNullOrWhiteSpace(values[key]) ? throw new InvalidOperationException($"{environmentName} is required") : values[key]!;
