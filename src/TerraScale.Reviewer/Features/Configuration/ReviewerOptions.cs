@@ -5,7 +5,7 @@ public sealed record ReviewerOptions(
     string Model, string Organization, string BotLogin, int MaxConcurrent, TimeSpan ReviewTimeout,
     string WebhookSecret, string ContextApiToken, string ContextDatabasePath, int ContextMaxFiles,
     int ContextMaxAttempts = 5, TimeSpan? ContextRetryBaseDelay = null, string OperatorToken = "",
-    string EscalationModel = "gpt-6-astra", int OcrConcurrency = 8, int OcrMaxAttempts = 3,
+    string EscalationModel = "gpt-6-astra", int OcrConcurrency = 16, int OcrMaxAttempts = 3,
     TimeSpan? OcrRetryBaseDelay = null, TimeSpan? OcrLlmRequestTimeout = null, TimeSpan? OcrItemReviewTimeout = null,
     string FallbackModel = "", int PrimaryStreams = 64)
 {
@@ -31,8 +31,8 @@ public sealed record ReviewerOptions(
             ["organization"] = Environment.GetEnvironmentVariable("TS_REVIEWER_ORGANIZATION") ?? "TerraScale",
             ["bot-login"] = Environment.GetEnvironmentVariable("TS_REVIEWER_BOT_LOGIN") ?? "terrascale-bot",
             ["primary-streams"] = Environment.GetEnvironmentVariable("TS_REVIEWER_PRIMARY_STREAMS") ?? "64",
-            ["max-concurrent"] = Environment.GetEnvironmentVariable("TS_REVIEWER_MAX_CONCURRENT") ?? "16",
-            ["ocr-concurrency"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_CONCURRENCY") ?? "8",
+            ["max-concurrent"] = Environment.GetEnvironmentVariable("TS_REVIEWER_MAX_CONCURRENT") ?? "32",
+            ["ocr-concurrency"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_CONCURRENCY") ?? "16",
             ["ocr-max-attempts"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_MAX_ATTEMPTS") ?? "3",
             ["ocr-retry-base-delay"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_RETRY_BASE_DELAY") ?? "00:00:10",
             ["ocr-llm-timeout"] = Environment.GetEnvironmentVariable("TS_REVIEWER_OCR_LLM_TIMEOUT") ?? "00:20:00",
@@ -62,7 +62,7 @@ public sealed record ReviewerOptions(
         var primaryStreams = ParseInt(values, "primary-streams");
         if (primaryStreams is < 1 or > 1000) throw new InvalidOperationException("primary-streams must be between 1 and 1000");
         var ocrConcurrency = ParseInt(values, "ocr-concurrency");
-        if (ocrConcurrency is < 1 or > 32) throw new InvalidOperationException("ocr-concurrency must be between 1 and 32");
+        if (ocrConcurrency is < 1 or > 64) throw new InvalidOperationException("ocr-concurrency must be between 1 and 64");
         var ocrMaxAttempts = ParseInt(values, "ocr-max-attempts");
         if (ocrMaxAttempts is < 1 or > 20) throw new InvalidOperationException("ocr-max-attempts must be between 1 and 20");
         if (!TimeSpan.TryParse(values["ocr-retry-base-delay"], out var ocrRetryBaseDelay)

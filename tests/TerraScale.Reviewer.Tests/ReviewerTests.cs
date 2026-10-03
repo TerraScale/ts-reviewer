@@ -79,7 +79,7 @@ public sealed class ReviewerTests
 
         foreach (var invalid in new[] { "--max-concurrent=0", "--ocr-max-attempts=0", "--ocr-max-attempts=21", "--ocr-retry-base-delay=00:00:00", "--ocr-retry-base-delay=00:05:01",
             "--ocr-llm-timeout=00:00:30", "--ocr-llm-timeout=02:00:01", "--ocr-item-timeout=00:00:59", "--ocr-item-timeout=1.00:00:01",
-            "--ocr-concurrency=0", "--ocr-concurrency=33" })
+            "--ocr-concurrency=0", "--ocr-concurrency=65" })
         {
             var rejected = false;
             try { ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy", "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token", "--operator-token=operator-test-token", invalid]); }
@@ -106,8 +106,8 @@ public sealed class ReviewerTests
             await Assert.That(options.Model).IsEqualTo("gpt-6.1-sol(medium)");
             await Assert.That(options.FallbackModel).IsEqualTo(string.Empty);
             await Assert.That(options.ReviewTimeout).IsEqualTo(TimeSpan.FromHours(4));
-            await Assert.That(options.MaxConcurrent).IsEqualTo(16);
-            await Assert.That(options.OcrConcurrency).IsEqualTo(8);
+            await Assert.That(options.MaxConcurrent).IsEqualTo(32);
+            await Assert.That(options.OcrConcurrency).IsEqualTo(16);
             await Assert.That(options.PrimaryStreams).IsEqualTo(64);
             await Assert.That(options.ProxyUrl).IsEqualTo("http://10.11.99.1:8318");
             await Assert.That(options.OcrMaxAttempts).IsEqualTo(3);
@@ -249,7 +249,7 @@ public sealed class ReviewerTests
             await Assert.That(recorded.Contains("--from " + baseSha)).IsTrue();
             await Assert.That(recorded.Contains("--to " + headSha)).IsTrue();
             await Assert.That(recorded.Contains("--format json")).IsTrue();
-            await Assert.That(recorded.Contains("--concurrency 8")).IsTrue();
+            await Assert.That(recorded.Contains("--concurrency 16")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_URL=https://proxy.test/v1")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_TOKEN=proxy")).IsTrue();
             await Assert.That(recorded.Contains("--model review ")).IsTrue();
