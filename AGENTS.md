@@ -1,6 +1,7 @@
 AI IS NOT ALLOWED TO EDIT THIS FILE ONLY HUMANS CAN!
 
 # Rules
+- Never add AI attribution to commits, PR titles, or PR descriptions: no `Co-Authored-By:` trailers, no `🤖 Generated with [Claude Code]` or similar generated-by notices.
 - This project needs to use C#
 - This needs to be deployed using the dotnet container way of doing things
 - The project must follow a feature sliced design so it is well organized and similar or dependant files and services are kept together
