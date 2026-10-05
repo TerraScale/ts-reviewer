@@ -47,6 +47,6 @@ app.MapGet("/context/healthz", async (ContextStore store, CancellationToken canc
 app.MapGet("/admin/context/dead-letter", ContextEndpoints.DeadLetters);
 app.MapPost("/admin/context/dead-letter/replay", ContextEndpoints.ReplayDeadLetterAsync);
 app.Lifetime.ApplicationStarted.Register(() =>
-    app.Logger.LogInformation("ts-reviewer listening on {Address}; model {Model}; fallback_model {FallbackModel}; max_concurrent {MaxConcurrent}; ocr_concurrency {OcrConcurrency}; primary_streams {PrimaryStreams}",
-        options.ListenUrl, options.Model, options.FallbackModel.Length > 0 ? options.FallbackModel : "off", options.MaxConcurrent, options.OcrConcurrency, options.PrimaryStreams));
+    app.Logger.LogInformation("ts-reviewer listening on {Address}; model {Model}; fallback_model {FallbackModel}; escalation_model {EscalationModel}; max_concurrent {MaxConcurrent}; ocr_concurrency {OcrConcurrency}; primary_streams {PrimaryStreams}",
+        options.ListenUrl, options.Model, options.FallbackModel.Length > 0 ? options.FallbackModel : "off", options.EscalationModel, options.MaxConcurrent, options.OcrConcurrency, options.PrimaryStreams));
 await app.RunAsync();

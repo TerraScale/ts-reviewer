@@ -42,6 +42,9 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewQueue queue, Pul
             return queued ? Results.Accepted() : Results.BadRequest("invalid commit");
         }
         var number = webhook.Number != 0 ? webhook.Number : webhook.PullRequest?.Number ?? 0;
+        if (webhook.Action == "created" && webhook.PullRequest is null && webhook.Issue?.PullRequest is null)
+            return Results.NoContent();
+        if (number == 0 && webhook.Issue?.PullRequest is not null) number = webhook.Issue.Number;
         if (number < 1) return Results.NoContent();
         var head = webhook.PullRequest?.Head?.Sha;
         if (webhook.Action is "opened" or "synchronized" or "reopened")
@@ -142,9 +145,11 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewQueue queue, Pul
         catch (Exception ex) { logger.LogError(ex, "command {Command} failed for {Repository}#{Number}", command, owner + "/" + name, number); }
     }
 
-    private sealed record WebhookEvent([property: JsonPropertyName("action")] string? Action, [property: JsonPropertyName("number")] int Number, [property: JsonPropertyName("ref")] string? Ref, [property: JsonPropertyName("after")] string? After, [property: JsonPropertyName("repository")] WebhookRepository? Repository, [property: JsonPropertyName("pull_request")] WebhookPullRequest? PullRequest, [property: JsonPropertyName("comment")] WebhookComment? Comment, [property: JsonPropertyName("sender")] Owner? Sender);
+    private sealed record WebhookEvent([property: JsonPropertyName("action")] string? Action, [property: JsonPropertyName("number")] int Number, [property: JsonPropertyName("ref")] string? Ref, [property: JsonPropertyName("after")] string? After, [property: JsonPropertyName("repository")] WebhookRepository? Repository, [property: JsonPropertyName("pull_request")] WebhookPullRequest? PullRequest, [property: JsonPropertyName("issue")] WebhookIssue? Issue, [property: JsonPropertyName("comment")] WebhookComment? Comment, [property: JsonPropertyName("sender")] Owner? Sender);
     private sealed record WebhookRepository([property: JsonPropertyName("name")] string Name, [property: JsonPropertyName("owner")] Owner Owner);
     private sealed record WebhookPullRequest([property: JsonPropertyName("number")] int Number, [property: JsonPropertyName("head")] WebhookBranch? Head);
+    private sealed record WebhookIssue([property: JsonPropertyName("number")] int Number, [property: JsonPropertyName("pull_request")] WebhookIssuePullRequest? PullRequest);
+    private sealed record WebhookIssuePullRequest;
     private sealed record WebhookBranch([property: JsonPropertyName("sha")] string? Sha);
     private sealed record WebhookComment([property: JsonPropertyName("id")] long Id, [property: JsonPropertyName("body")] string Body, [property: JsonPropertyName("user")] Owner? User);
 }

@@ -8,8 +8,8 @@ FROM docker.io/library/debian:trixie-slim@sha256:7792b1f7702a86946cd518db72b6a40
 # OpenCodeReview CLI (github.com/alibaba/open-code-review): the npm package is
 # just a launcher around this static Go binary, so fetch the platform package
 # directly (sha256-gated) and skip shipping Node.js entirely.
-ARG OCR_VERSION=1.12.7
-ARG OCR_SHA256=1514949445f4b1d39875b690677bb33d6a30c4414bd5088c5448cbe501c2fb83
+ARG OCR_VERSION=1.12.12
+ARG OCR_SHA256=6d3f6004bb062e418bac4ece1c72e9ecec2b15ec06ad7bfb7ad7a7c8ac83d52e
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl git \
  && curl -fsSL "https://registry.npmjs.org/@alibaba-group/ocr-linux-x64/-/ocr-linux-x64-${OCR_VERSION}.tgz" -o /tmp/ocr.tgz \

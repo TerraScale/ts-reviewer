@@ -5,9 +5,9 @@ public sealed record ReviewerOptions(
     string Model, string Organization, string BotLogin, int MaxConcurrent, TimeSpan ReviewTimeout,
     string WebhookSecret, string ContextApiToken, string ContextDatabasePath, int ContextMaxFiles,
     int ContextMaxAttempts = 5, TimeSpan? ContextRetryBaseDelay = null, string OperatorToken = "",
-    string EscalationModel = "gpt-6-astra", int OcrConcurrency = 16, int OcrMaxAttempts = 3,
+    string EscalationModel = "gpt-6.1-sol", int OcrConcurrency = 16, int OcrMaxAttempts = 3,
     TimeSpan? OcrRetryBaseDelay = null, TimeSpan? OcrLlmRequestTimeout = null, TimeSpan? OcrItemReviewTimeout = null,
-    string FallbackModel = "", int PrimaryStreams = 64)
+    string FallbackModel = "glm-5.3", int PrimaryStreams = 64)
 {
     public TimeSpan ContextRetryDelay => ContextRetryBaseDelay ?? TimeSpan.FromSeconds(1);
     public TimeSpan OcrRetryDelay => OcrRetryBaseDelay ?? TimeSpan.FromSeconds(10);
@@ -25,9 +25,9 @@ public sealed record ReviewerOptions(
             ["forgejo-token"] = Environment.GetEnvironmentVariable("TS_REVIEWER_FORGEJO_TOKEN"),
             ["proxy-url"] = Environment.GetEnvironmentVariable("TS_REVIEWER_PROXY_URL") ?? "http://10.11.99.1:8318",
             ["proxy-token"] = Environment.GetEnvironmentVariable("TS_REVIEWER_PROXY_TOKEN"),
-            ["model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_MODEL") ?? "gpt-6.1-sol(medium)",
-            ["escalation-model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_ESCALATION_MODEL") ?? "gpt-6-astra",
-            ["fallback-model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_FALLBACK_MODEL") ?? string.Empty,
+            ["model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_MODEL") ?? "gpt-6.1-sol",
+            ["escalation-model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_ESCALATION_MODEL") ?? "gpt-6.1-sol",
+            ["fallback-model"] = Environment.GetEnvironmentVariable("TS_REVIEWER_FALLBACK_MODEL") ?? "glm-5.3",
             ["organization"] = Environment.GetEnvironmentVariable("TS_REVIEWER_ORGANIZATION") ?? "TerraScale",
             ["bot-login"] = Environment.GetEnvironmentVariable("TS_REVIEWER_BOT_LOGIN") ?? "terrascale-bot",
             ["primary-streams"] = Environment.GetEnvironmentVariable("TS_REVIEWER_PRIMARY_STREAMS") ?? "64",
@@ -57,6 +57,9 @@ public sealed record ReviewerOptions(
         var webhookSecret = Required(values, "webhook-secret", "TS_REVIEWER_WEBHOOK_SECRET");
         var contextApiToken = Required(values, "context-api-token", "TS_REVIEWER_CONTEXT_API_TOKEN");
         var operatorToken = Required(values, "operator-token", "TS_REVIEWER_OPERATOR_TOKEN");
+        var model = ValidateModel(values, "model");
+        var escalationModel = ValidateModel(values, "escalation-model");
+        var fallbackModel = ValidateModel(values, "fallback-model", allowEmpty: true);
         var maxConcurrent = ParseInt(values, "max-concurrent");
         if (maxConcurrent is < 1 or > 100) throw new InvalidOperationException("max-concurrent must be between 1 and 100");
         var primaryStreams = ParseInt(values, "primary-streams");
@@ -84,14 +87,22 @@ public sealed record ReviewerOptions(
             || contextRetryBaseDelay <= TimeSpan.Zero || contextRetryBaseDelay > TimeSpan.FromMinutes(1))
             throw new InvalidOperationException("context-retry-base-delay must be positive and at most one minute");
         return new ReviewerOptions(Trim(values["listen"]!), Trim(values["forgejo-url"]!), forgejoToken,
-            Trim(values["proxy-url"]!), proxyToken, values["model"]!, values["organization"]!, values["bot-login"]!,
+            Trim(values["proxy-url"]!), proxyToken, model, values["organization"]!, values["bot-login"]!,
             maxConcurrent, reviewTimeout, webhookSecret, contextApiToken, values["context-database"]!, contextMaxFiles,
-            contextMaxAttempts, contextRetryBaseDelay, operatorToken, values["escalation-model"]!, ocrConcurrency,
-            ocrMaxAttempts, ocrRetryBaseDelay, ocrLlmTimeout, ocrItemTimeout, (values["fallback-model"] ?? string.Empty).Trim(), primaryStreams);
+            contextMaxAttempts, contextRetryBaseDelay, operatorToken, escalationModel, ocrConcurrency,
+            ocrMaxAttempts, ocrRetryBaseDelay, ocrLlmTimeout, ocrItemTimeout, fallbackModel, primaryStreams);
     }
     private static string Required(IReadOnlyDictionary<string, string?> values, string key, string environmentName) =>
         string.IsNullOrWhiteSpace(values[key]) ? throw new InvalidOperationException($"{environmentName} is required") : values[key]!;
     private static int ParseInt(IReadOnlyDictionary<string, string?> values, string key) =>
         int.TryParse(values[key], out var result) ? result : throw new InvalidOperationException($"{key} must be an integer");
+    private static string ValidateModel(IReadOnlyDictionary<string, string?> values, string key, bool allowEmpty = false)
+    {
+        var model = (values[key] ?? string.Empty).Trim();
+        if (!allowEmpty && model.Length == 0) throw new InvalidOperationException($"{key} is required");
+        if (model.Contains("astra", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"{key} cannot contain astra");
+        return model;
+    }
     private static string Trim(string value) => value.TrimEnd('/');
 }

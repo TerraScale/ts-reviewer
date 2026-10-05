@@ -91,7 +91,7 @@ public sealed class ReviewerTests
     [Test]
     public async Task ConfigurationDefaults()
     {
-        string[] names = ["TS_REVIEWER_TIMEOUT", "TS_REVIEWER_MODEL", "TS_REVIEWER_FALLBACK_MODEL", "TS_REVIEWER_MAX_CONCURRENT",
+        string[] names = ["TS_REVIEWER_TIMEOUT", "TS_REVIEWER_MODEL", "TS_REVIEWER_ESCALATION_MODEL", "TS_REVIEWER_FALLBACK_MODEL", "TS_REVIEWER_MAX_CONCURRENT",
             "TS_REVIEWER_OCR_CONCURRENCY", "TS_REVIEWER_PRIMARY_STREAMS", "TS_REVIEWER_PROXY_URL", "TS_REVIEWER_OCR_MAX_ATTEMPTS", "TS_REVIEWER_OCR_RETRY_BASE_DELAY",
             "TS_REVIEWER_OCR_LLM_TIMEOUT", "TS_REVIEWER_OCR_ITEM_TIMEOUT"];
         var previous = names.ToDictionary(x => x, Environment.GetEnvironmentVariable);
@@ -101,10 +101,10 @@ public sealed class ReviewerTests
             var options = ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy",
                 "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token",
                 "--operator-token=operator-test-token"]);
-            // Sol scales to many concurrent streams, so reviews run on it alone
-            // with wide parallelism and no fallback model.
-            await Assert.That(options.Model).IsEqualTo("gpt-6.1-sol(medium)");
-            await Assert.That(options.FallbackModel).IsEqualTo(string.Empty);
+            // Sol is the primary model and GLM 5.3 is the configured fallback.
+            await Assert.That(options.Model).IsEqualTo("gpt-6.1-sol");
+            await Assert.That(options.EscalationModel).IsEqualTo("gpt-6.1-sol");
+            await Assert.That(options.FallbackModel).IsEqualTo("glm-5.3");
             await Assert.That(options.ReviewTimeout).IsEqualTo(TimeSpan.FromHours(4));
             await Assert.That(options.MaxConcurrent).IsEqualTo(32);
             await Assert.That(options.OcrConcurrency).IsEqualTo(16);
@@ -119,6 +119,32 @@ public sealed class ReviewerTests
         {
             foreach (var (name, value) in previous) Environment.SetEnvironmentVariable(name, value);
         }
+    }
+
+    [Test]
+    public async Task ConfigurationRejectsAstraInAnyConfiguredModel()
+    {
+        var common = new[] { "--forgejo-token=forgejo", "--proxy-token=proxy", "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token", "--operator-token=operator-test-token" };
+        foreach (var key in new[] { "model", "fallback-model", "escalation-model" })
+        {
+            var rejected = false;
+            try { ReviewerOptions.Load([.. common, "--" + key + "=provider-Astra-v1"]); }
+            catch (InvalidOperationException ex) { rejected = ex.Message.Contains("astra", StringComparison.OrdinalIgnoreCase); }
+            await Assert.That(rejected).IsTrue();
+        }
+    }
+
+    [Test]
+    public async Task ReviewEngineRejectsAnAstraModelOverride()
+    {
+        var options = Options(Path.Combine(Path.GetTempPath(), "ts-reviewer-model-" + Guid.NewGuid().ToString("N") + ".db"));
+        var engine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance);
+        var repository = new Repository(new Owner("TerraScale"), "widgets");
+        var pullRequest = new PullRequest(14, "Test", "", new Branch("base", "main", repository), new Branch("head", "feature", repository));
+        var rejected = false;
+        try { await engine.RunAsync(pullRequest, CancellationToken.None, "provider-Astra-v1"); }
+        catch (InvalidOperationException ex) { rejected = ex.Message.Contains("astra", StringComparison.OrdinalIgnoreCase); }
+        await Assert.That(rejected).IsTrue();
     }
 
     [Test]
@@ -173,8 +199,8 @@ public sealed class ReviewerTests
         await Assert.That(formatted.Contains("<summary>Suggested fix</summary>")).IsTrue();
         await Assert.That(formatted.Contains("model")).IsFalse();
 
-        var escalated = PullRequestReviewer.Format(pullRequest, new ReviewResult("ignored", [finding]), "gpt-6-astra");
-        await Assert.That(escalated.Contains("model `gpt-6-astra`")).IsTrue();
+        var escalated = PullRequestReviewer.Format(pullRequest, new ReviewResult("ignored", [finding]), "gpt-6.1-sol");
+        await Assert.That(escalated.Contains("model `gpt-6.1-sol`")).IsTrue();
     }
 
     [Test]
@@ -261,9 +287,11 @@ public sealed class ReviewerTests
             await Assert.That(recorded.Contains("OCR_ENABLE_TELEMETRY=false")).IsTrue();
 
             // An escalated review re-runs the same head on the escalation model.
-            await engine.RunAsync(pullRequest, CancellationToken.None, "gpt-6-astra");
+            await engine.RunAsync(pullRequest, CancellationToken.None, "gpt-6.1-sol");
             recorded = await File.ReadAllTextAsync(log);
-            await Assert.That(recorded.Contains("--model gpt-6-astra ")).IsTrue();
+            await Assert.That(recorded.Contains("--model gpt-6.1-sol ")).IsTrue();
+            await Assert.That(recorded.Contains("--from " + baseSha)).IsTrue();
+            await Assert.That(recorded.Contains("--to " + headSha)).IsTrue();
 
             // Exercise the real webhook-to-HTTP publication path. Forgejo uses
             // APPROVED, not GitHub's APPROVE; the latter creates a pending draft.
@@ -279,8 +307,8 @@ public sealed class ReviewerTests
             await PostWebhookAsync(webhook, new
             {
                 action = "created",
-                number = 9,
                 repository = new { name = "widgets", owner = new { login = "TerraScale" } },
+                issue = new { number = 9, pull_request = new { } },
                 comment = new { id = 77, body = "@bot recheck" },
             });
             var pendingStatus = await transport.PendingStatus.Task.WaitAsync(TimeSpan.FromSeconds(30));
@@ -688,9 +716,8 @@ public sealed class ReviewerTests
             await PostWebhookAsync(webhookHandler, new
             {
                 action = "created",
-                number = 14,
                 repository = new { name = "widgets", owner = new { login = "TerraScale" } },
-                pull_request = new { number = 14 },
+                issue = new { number = 14, pull_request = new { } },
                 comment = new { id = 77, body = "@bot recheck" },
             });
             await WaitUntilAsync(() => handler.CommentReactions == 1);

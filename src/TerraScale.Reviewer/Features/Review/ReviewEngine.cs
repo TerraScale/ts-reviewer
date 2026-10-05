@@ -35,6 +35,8 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
 
     public async Task<ReviewResult> RunAsync(PullRequest pr, CancellationToken ct, string? model = null)
     {
+        if (model?.Contains("astra", StringComparison.OrdinalIgnoreCase) == true)
+            throw new InvalidOperationException("model cannot contain astra");
         var root = Path.Combine(Path.GetTempPath(), "ts-reviewer-" + Guid.NewGuid().ToString("N"));
         var home = Path.Combine(root, "home");
         var repository = Path.Combine(root, "repo");
