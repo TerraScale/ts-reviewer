@@ -50,7 +50,7 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewQueue queue, Pul
         if (webhook.Action is "opened" or "synchronized" or "reopened")
         {
             _ = AcknowledgeAsync(owner, name, number, null);
-            _ = QueueReviewAsync(new ReviewRequest(owner, name, number, head));
+            QueueReview(new ReviewRequest(owner, name, number, head));
         }
         else if (webhook.Action == "closed")
         {
@@ -103,21 +103,25 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewQueue queue, Pul
         catch (Exception ex) { logger.LogWarning(ex, "failed to acknowledge {Repository}#{Number}", owner + "/" + name, number); }
     }
 
-    /// <summary>Resolves the head when the event did not carry it, marks it queued and hands the request to the queue.</summary>
-    private async Task QueueReviewAsync(ReviewRequest request)
+    /// <summary>Enqueues before any network I/O so webhook arrival order is preserved.</summary>
+    private void QueueReview(ReviewRequest request)
     {
         try
         {
-            var sha = request.HeadSha;
-            if (string.IsNullOrWhiteSpace(sha))
+            request = request with { HeadSha = string.IsNullOrWhiteSpace(request.HeadSha) ? null : request.HeadSha };
+            queue.Enqueue(request, async admitted =>
             {
-                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-                try { sha = (await forgejo.PullAsync(request.Owner, request.Name, request.Number, timeout.Token))?.Head.Sha; }
-                catch (Exception ex) { logger.LogWarning(ex, "could not load {Repository}#{Number} before queueing", request.Owner + "/" + request.Name, request.Number); }
-            }
-            request = request with { HeadSha = string.IsNullOrWhiteSpace(sha) ? null : sha };
-            if (queue.Enqueue(request) != ReviewAdmission.Duplicate && request.HeadSha is not null)
-                await reviewer.PublishStatusAsync(request.Owner, request.Name, request.HeadSha, "pending", "Review queued");
+                if (admitted.HeadSha is null)
+                {
+                    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                    var sha = (await forgejo.PullAsync(admitted.Owner, admitted.Name, admitted.Number, timeout.Token))?.Head.Sha;
+                    if (string.IsNullOrWhiteSpace(sha)) return;
+                    var resolved = queue.ResolveHead(admitted, sha);
+                    if (resolved is null) return;
+                    admitted = resolved;
+                }
+                await reviewer.PublishStatusAsync(admitted.Owner, admitted.Name, admitted.HeadSha!, "pending", "Review queued");
+            });
         }
         catch (Exception ex) { logger.LogError(ex, "could not queue review for {PullRequest}", request.Key); }
     }
@@ -129,10 +133,10 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewQueue queue, Pul
             switch (command)
             {
                 case "review" or "recheck":
-                    await QueueReviewAsync(new ReviewRequest(owner, name, number, head));
+                    QueueReview(new ReviewRequest(owner, name, number, head));
                     break;
                 case "escalate":
-                    await QueueReviewAsync(new ReviewRequest(owner, name, number, head, options.EscalationModel));
+                    QueueReview(new ReviewRequest(owner, name, number, head, options.EscalationModel));
                     break;
                 case "explain":
                     await forgejo.CommentAsync(owner, name, number, $"ts-reviewer: the latest evidence and suggested fix are in the marked review comment. Use `@{options.BotLogin} recheck` after pushing a correction or `@{options.BotLogin} escalate` to re-review with {options.EscalationModel}.", CancellationToken.None);

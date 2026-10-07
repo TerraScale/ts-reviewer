@@ -55,8 +55,8 @@ public sealed class ReviewRecovery(ForgejoClient forgejo, ReviewQueue queue, Pul
                 var current = status?.Statuses?.FirstOrDefault(x => x.Context == PullRequestReviewer.StatusContext);
                 if (current is not null && current.State != "pending") continue;
                 logger.LogInformation("recovering review for {Repository}#{Number} at {Head}: {Reason}", owner + "/" + name, pull.Number, pull.Head.Sha, current is null ? "head never reviewed" : "review was pending");
-                if (queue.Enqueue(new ReviewRequest(owner, name, pull.Number, pull.Head.Sha)) != ReviewAdmission.Duplicate)
-                    await reviewer.PublishStatusAsync(owner, name, pull.Head.Sha, "pending", "Review queued");
+                queue.Enqueue(new ReviewRequest(owner, name, pull.Number, pull.Head.Sha),
+                    _ => reviewer.PublishStatusAsync(owner, name, pull.Head.Sha, "pending", "Review queued"));
                 recovered++;
             }
             if (pulls.Count < PageSize) return recovered;

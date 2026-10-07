@@ -19,6 +19,8 @@ public sealed record ReviewResult
     [JsonPropertyName("findings")]
     public IReadOnlyList<Finding> Findings { get; init; } = [];
 
+    public string? Model { get; init; }
+
     public ReviewResult() { }
     public ReviewResult(string summary, IReadOnlyList<Finding> findings) => (Summary, Findings) = (summary, findings);
 }

@@ -31,6 +31,11 @@ public sealed class PullRequestReviewer(ForgejoClient forgejo, ReviewEngine engi
         {
             logger.LogInformation("review started for {Repository}#{Number} with model {Model}", owner + "/" + name, number, request.Model ?? options.Model);
             var pr = await forgejo.PullAsync(owner, name, number, ct) ?? throw new InvalidOperationException("pull request not found");
+            if (sha is not null && !string.Equals(sha, pr.Head.Sha, StringComparison.OrdinalIgnoreCase))
+            {
+                await SkipAsync(request, ReviewQueue.NewerHead);
+                return;
+            }
             sha = pr.Head.Sha;
             await PublishStatusAsync(owner, name, sha, "pending", "Review in progress");
             await ReviewAsync(pr, owner, name, number, request.Model, ct);
@@ -102,7 +107,7 @@ public sealed class PullRequestReviewer(ForgejoClient forgejo, ReviewEngine engi
             return;
         }
         var hasFindings = result.Findings.Count > 0;
-        var body = Format(pr, result, model ?? options.Model);
+        var body = Format(pr, result, result.Model ?? model ?? options.Model);
         var existing = await forgejo.CommentsAsync(owner, name, number, ct);
         var marked = existing.FirstOrDefault(x => string.Equals(x.User.Login, options.BotLogin, StringComparison.OrdinalIgnoreCase) && x.Body.StartsWith("<!-- ts-reviewer:", StringComparison.Ordinal));
         if (marked is not null) await forgejo.UpdateCommentAsync(owner, name, marked.Id, body, ct);

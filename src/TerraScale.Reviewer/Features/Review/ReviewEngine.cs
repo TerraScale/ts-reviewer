@@ -4,6 +4,7 @@ using System.Globalization;
 using System.Text.RegularExpressions;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.Extensions.Logging.Abstractions;
 using TerraScale.Reviewer.Features.Configuration;
 using TerraScale.Reviewer.Features.Forgejo;
 
@@ -16,18 +17,11 @@ namespace TerraScale.Reviewer.Features.Review;
 /// ts-router, invokes <c>ocr review</c> over the exact base..head range, and
 /// maps the returned comments to <see cref="Finding"/> records.
 /// </summary>
-public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> logger, string? ocrPath = null)
+public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> logger, string? ocrPath = null, ReviewModelScheduler? scheduler = null)
 {
     private readonly string _ocrPath = ocrPath ?? "ocr";
 
-    // When a fallback model is configured, reviews share a budget of
-    // PrimaryStreams concurrent ocr requests on the review model, for review
-    // models whose upstream serves few concurrent requests. A review takes up
-    // to OcrConcurrency of the free streams; once none is free, new reviews
-    // start on the fallback model instead of failing on the review model
-    // first. Without a fallback model there is no budget.
-    private readonly Lock _primaryLock = new();
-    private int _primaryStreams;
+    private readonly ReviewModelScheduler _scheduler = scheduler ?? new(options, NullLogger<ReviewModelScheduler>.Instance);
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(10);
@@ -37,6 +31,7 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
     {
         if (model?.Contains("astra", StringComparison.OrdinalIgnoreCase) == true)
             throw new InvalidOperationException("model cannot contain astra");
+        using var lease = await _scheduler.AcquireAsync(model, ct);
         var root = Path.Combine(Path.GetTempPath(), "ts-reviewer-" + Guid.NewGuid().ToString("N"));
         var home = Path.Combine(root, "home");
         var repository = Path.Combine(root, "repo");
@@ -80,43 +75,12 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
             // each changed file (rename detection included).
             await RunGitAsync(home, repository, ct, "checkout", "--quiet", "--detach", head);
             await RunGitAsync(home, repository, ct, "diff", "--shortstat", "--find-renames", "--no-ext-diff", "--no-textconv", $"{@base}...{head}");
-            var concurrency = options.OcrConcurrency;
-            if (model is not null) return await ReviewWithFallbackAsync(home, repository, root, @base, head, model, concurrency, cloneUrl, ct);
-            var fallback = options.FallbackModel;
-            // Without a distinct fallback model there is nowhere to spill:
-            // ts-router queues the review model's requests over its cap.
-            if (fallback.Length == 0 || string.Equals(fallback, options.Model, StringComparison.Ordinal))
-                return await ReviewWithFallbackAsync(home, repository, root, @base, head, options.Model, concurrency, cloneUrl, ct);
-            var streams = TakePrimaryStreams();
-            if (streams > 0)
-            {
-                try { return await ReviewWithFallbackAsync(home, repository, root, @base, head, options.Model, streams, cloneUrl, ct); }
-                finally { ReturnPrimaryStreams(streams); }
-            }
-            logger.LogInformation("all {PrimaryStreams} {Model} streams are in use; reviewing {CloneUrl} on {FallbackModel}", options.PrimaryStreams, options.Model, cloneUrl, fallback);
-            var result = await ReviewWithFallbackAsync(home, repository, root, @base, head, fallback, concurrency, cloneUrl, ct);
-            return result with { Summary = result.Summary + $" (`{options.Model}` was busy with other reviews, so `{fallback}` reviewed this one)" };
+            return await ReviewWithFallbackAsync(home, repository, root, @base, head, lease, cloneUrl, ct);
         }
         finally
         {
             try { Directory.Delete(root, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
         }
-    }
-
-    /// <summary>Takes up to OcrConcurrency free review-model streams; zero when none is free.</summary>
-    private int TakePrimaryStreams()
-    {
-        lock (_primaryLock)
-        {
-            var streams = Math.Min(options.OcrConcurrency, options.PrimaryStreams - _primaryStreams);
-            if (streams > 0) _primaryStreams += streams;
-            return Math.Max(streams, 0);
-        }
-    }
-
-    private void ReturnPrimaryStreams(int streams)
-    {
-        lock (_primaryLock) _primaryStreams -= streams;
     }
 
     /// <summary>
@@ -125,22 +89,35 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
     /// fallback resumes the same ocr session, so it only reviews the file
     /// groups the first model failed and keeps the findings already made.
     /// </summary>
-    private async Task<ReviewResult> ReviewWithFallbackAsync(string home, string repository, string root, string @base, string head, string model, int concurrency, string cloneUrl, CancellationToken ct)
+    private async Task<ReviewResult> ReviewWithFallbackAsync(string home, string repository, string root, string @base, string head, ReviewModelScheduler.Lease lease, string cloneUrl, CancellationToken ct)
     {
-        var run = await ReviewWithRetriesAsync(home, repository, root, @base, head, model, null, concurrency, cloneUrl, ct);
-        var fallback = options.FallbackModel;
-        if (!run.Complete && fallback.Length > 0 && !string.Equals(fallback, model, StringComparison.Ordinal))
+        var model = lease.Model;
+        var run = await ReviewWithRetriesAsync(home, repository, root, @base, head, model, null, cloneUrl, ct);
+        if (run.Complete) lease.Complete();
+        var fallback = model == "gpt-6.1-sol" ? "glm-5.3" : "gpt-6.1-sol";
+        // A 429 moves either model to the other immediately. Ordinary exhausted
+        // retries retain the existing Sol -> GLM fallback, never a loop.
+        if (!run.Complete && (run.RateLimited || (model == "gpt-6.1-sol" && options.FallbackModel.Length > 0)))
         {
-            logger.LogWarning("model {Model} could not complete the review for {CloneUrl}; falling back to {FallbackModel}", model, cloneUrl, fallback);
-            run = await ReviewWithRetriesAsync(home, repository, root, @base, head, fallback, run.Session, concurrency, cloneUrl, ct);
+            logger.LogWarning("model {Model} could not complete the review for {CloneUrl}; switching to {FallbackModel}", model, cloneUrl, fallback);
+            lease.Dispose();
+            using var next = await _scheduler.AcquireAsync(fallback, ct);
+            run = await ReviewWithRetriesAsync(home, repository, root, @base, head, next.Model, run.Session, cloneUrl, ct);
+            if (run.Complete) next.Complete();
             if (run.Result is { } reviewed)
-                run = run with { Result = reviewed with { Summary = reviewed.Summary + $" (`{model}` could not finish the review, so fallback model `{fallback}` took over)" } };
+            {
+                var note = next.Model == model
+                    ? $" (`{fallback}` remained unavailable, so `{model}` resumed after the slot wait)"
+                    : $" (`{model}` could not finish the review, so fallback model `{next.Model}` took over)";
+                run = run with { Result = reviewed with { Summary = reviewed.Summary + note } };
+            }
+            model = next.Model;
         }
-        if (run.Result is { } result && run.Complete) return result;
+        if (run.Result is { } result && run.Complete) return result with { Model = model };
         // Findings from the reviewed items still request changes; a review
         // without any finding cannot pass on partial coverage.
         if (run.Result is { Findings.Count: > 0 } partial)
-            return partial with { Summary = partial.Summary + $" (partial review: {run.Failure} — re-run for full coverage)" };
+            return partial with { Model = model, Summary = partial.Summary + $" (partial review: {run.Failure} — re-run for full coverage)" };
         throw new InvalidOperationException(run.Failure);
     }
 
@@ -154,11 +131,16 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
     /// Retries back off exponentially; the outer review deadline still bounds
     /// every attempt.
     /// </summary>
-    private async Task<OcrRun> ReviewWithRetriesAsync(string home, string repository, string root, string @base, string head, string model, string? session, int concurrency, string cloneUrl, CancellationToken ct)
+    private async Task<OcrRun> ReviewWithRetriesAsync(string home, string repository, string root, string @base, string head, string model, string? session, string cloneUrl, CancellationToken ct)
     {
         for (var attempt = 1; ; attempt++)
         {
-            var run = await ReviewOnceAsync(home, repository, root, @base, head, model, session, concurrency, ct);
+            var run = await ReviewOnceAsync(home, repository, root, @base, head, model, session, model == "glm-5.3" ? 1 : options.OcrConcurrency, ct);
+            if (run.RateLimited)
+            {
+                _scheduler.RateLimited(model);
+                return run;
+            }
             if (run.Complete) return run;
             // Resume the session this run reported; a run that produced no
             // session (e.g. a resume ocr refused) starts over from scratch.
@@ -196,7 +178,7 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
         if (review is null)
         {
             var failure = process.ExitCode == 0 ? "ocr returned no review" : $"ocr failed with exit code {process.ExitCode}: {ErrorLine(process.Error)}";
-            return new OcrRun(null, false, stderrSession, failure);
+            return new OcrRun(null, false, stderrSession, failure, IsRateLimited(process.Error));
         }
         var result = Map(review.Comments ?? []);
         var complete = string.Equals(review.Status, "complete", StringComparison.OrdinalIgnoreCase)
@@ -206,8 +188,19 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
         var failed = review.Manifest?.Coverage?.Failed ?? [];
         foreach (var item in failed)
             logger.LogWarning("ocr item {Path} failed ({Classification}): {Reason}", item.Path, item.Classification, item.Reason);
-        return new OcrRun(result, complete, review.SessionId ?? stderrSession, $"ocr review failed: {review.Message}");
+        return new OcrRun(result, complete, review.SessionId ?? stderrSession, $"ocr review failed: {review.Message}",
+            !complete && (IsRateLimited(process.Error) || IsRateLimited(review.Message) || failed.Any(item => IsRateLimited(item.Reason) || IsRateLimited(item.Classification))));
     }
+
+    internal static bool IsRateLimited(string? text) =>
+        text is not null && (RateLimitStatus().IsMatch(text)
+            || text.Contains("rate limit", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("rate_limit", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("rate-limit", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("too many requests", StringComparison.OrdinalIgnoreCase));
+
+    [GeneratedRegex(@"\b429\b")]
+    private static partial Regex RateLimitStatus();
 
     /// <summary>The session id from ocr's "retry with: --resume &lt;id&gt;" hint, if it printed one.</summary>
     internal static string? ResumeSession(string stderr) =>
@@ -342,7 +335,7 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
     private sealed record ProcessResult(int ExitCode, string Output, string Error);
 
     /// <summary>One ocr run: its mapped result when it wrote a report, whether it covered every item, and the session to resume.</summary>
-    private sealed record OcrRun(ReviewResult? Result, bool Complete, string? Session, string Failure);
+    private sealed record OcrRun(ReviewResult? Result, bool Complete, string? Session, string Failure, bool RateLimited);
 
     /// <summary>
     /// The line of a failed command's stderr that says what went wrong, for
