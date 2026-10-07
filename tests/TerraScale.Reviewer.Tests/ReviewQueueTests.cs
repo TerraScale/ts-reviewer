@@ -26,6 +26,268 @@ public sealed class ReviewQueueTests
     private static ReviewRequest Request(int number, string? head, string? model = null) => new("TerraScale", "widgets", number, head, model);
 
     [Test]
+    [Arguments(false)]
+    [Arguments(true)]
+    public async Task DelayedQueuedStatusCannotOverwriteSuccessOrSkipped(bool replace)
+    {
+        var queuedPost = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var queuedStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var terminalPost = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var states = new ConcurrentQueue<string>();
+        var queue = new ReviewQueue((request, _) =>
+        {
+            if (request.HeadSha == "old") { states.Enqueue("success"); terminalPost.TrySetResult(); }
+            return Task.CompletedTask;
+        }, (request, _) =>
+        {
+            if (request.HeadSha == "old") { states.Enqueue("skipped"); terminalPost.TrySetResult(); }
+            return Task.CompletedTask;
+        }, 1, NullLogger<ReviewQueue>.Instance);
+        await queue.StartAsync(CancellationToken.None);
+        try
+        {
+            queue.Enqueue(Request(1, "old"), async _ =>
+            {
+                queuedStarted.TrySetResult();
+                await queuedPost.Task;
+                states.Enqueue("pending");
+            });
+            await queuedStarted.Task.WaitAsync(Wait);
+            await WaitUntilAsync(() => queue.Snapshot() == (0, 1));
+            if (replace) queue.Enqueue(Request(1, "new"));
+            await Assert.That(terminalPost.Task.IsCompleted).IsFalse();
+            queuedPost.TrySetResult();
+            await terminalPost.Task.WaitAsync(Wait);
+            await Assert.That(string.Join(",", states)).IsEqualTo(replace ? "pending,skipped" : "pending,success");
+        }
+        finally { queuedPost.TrySetResult(); await queue.StopAsync(CancellationToken.None); }
+    }
+
+    [Test]
+    public async Task ReturningToAnEarlierShaFencesDelayedQueuedAndSkippedWrites()
+    {
+        var releaseOld = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var oldPostStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var completed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var states = new ConcurrentDictionary<string, string>();
+        var runs = new ConcurrentQueue<string>();
+        var queue = new ReviewQueue((request, _) =>
+        {
+            runs.Enqueue(request.HeadSha!);
+            states[request.HeadSha!] = "success";
+            completed.TrySetResult();
+            return Task.CompletedTask;
+        }, (request, _) =>
+        {
+            states[request.HeadSha!] = "skipped";
+            return Task.CompletedTask;
+        }, 1, NullLogger<ReviewQueue>.Instance);
+        queue.Enqueue(Request(1, "a"), async _ => { oldPostStarted.TrySetResult(); await releaseOld.Task; states["a"] = "pending"; });
+        await oldPostStarted.Task.WaitAsync(Wait);
+        queue.Enqueue(Request(1, "b"), _ => { states["b"] = "pending"; return Task.CompletedTask; });
+        queue.Enqueue(Request(1, "a"), _ => { states["a"] = "pending"; return Task.CompletedTask; });
+        await queue.StartAsync(CancellationToken.None);
+        try
+        {
+            await WaitUntilAsync(() => queue.Snapshot() == (0, 1));
+            await Assert.That(completed.Task.IsCompleted).IsFalse();
+            releaseOld.TrySetResult();
+            await completed.Task.WaitAsync(Wait);
+            await WaitUntilAsync(() => queue.Snapshot() == (0, 0));
+            await Assert.That(states["a"]).IsEqualTo("success");
+            await Assert.That(states["b"]).IsEqualTo("skipped");
+            await Assert.That(string.Join(",", runs)).IsEqualTo("a");
+        }
+        finally { releaseOld.TrySetResult(); await queue.StopAsync(CancellationToken.None); }
+    }
+
+    [Test]
+    public async Task ResolvedCommandWaitsForSkipsAppendedByTheCancelledReview()
+    {
+        var oldStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var oldStopping = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var finishOld = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var lookupStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var finishLookup = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var reviewed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var states = new ConcurrentDictionary<string, string>();
+        var runs = 0;
+        var skippedA = 0;
+        var queue = new ReviewQueue(async (request, ct) =>
+        {
+            if (Interlocked.Increment(ref runs) == 1)
+            {
+                oldStarted.TrySetResult();
+                try { await Task.Delay(Timeout.Infinite, ct); }
+                catch (OperationCanceledException)
+                { oldStopping.TrySetResult(); await finishOld.Task; throw; }
+            }
+            states[request.HeadSha!] = "success";
+            reviewed.TrySetResult();
+        }, (request, _) =>
+        {
+            if (request.HeadSha == "a") Interlocked.Increment(ref skippedA);
+            states[request.HeadSha!] = "skipped";
+            return Task.CompletedTask;
+        }, 1, NullLogger<ReviewQueue>.Instance);
+        await queue.StartAsync(CancellationToken.None);
+        try
+        {
+            queue.Enqueue(Request(1, "a"));
+            await oldStarted.Task.WaitAsync(Wait);
+            queue.Enqueue(Request(1, "b"));
+            await oldStopping.Task.WaitAsync(Wait);
+            queue.Enqueue(Request(1, null), async admitted =>
+            {
+                lookupStarted.TrySetResult();
+                await finishLookup.Task;
+                queue.ResolveHead(admitted, "a");
+                states["a"] = "pending";
+            });
+            await lookupStarted.Task.WaitAsync(Wait);
+            finishOld.TrySetResult();
+            await WaitUntilAsync(() => queue.Snapshot() == (0, 1));
+            finishLookup.TrySetResult();
+            await reviewed.Task.WaitAsync(Wait);
+            await WaitUntilAsync(() => queue.Snapshot() == (0, 0));
+            await Assert.That(states["a"]).IsEqualTo("success");
+            await Assert.That(Volatile.Read(ref skippedA)).IsEqualTo(0);
+            await Assert.That(Volatile.Read(ref runs)).IsEqualTo(2);
+        }
+        finally { finishOld.TrySetResult(); finishLookup.TrySetResult(); await queue.StopAsync(CancellationToken.None); }
+    }
+
+    [Test]
+    public async Task HeadResolutionUpdatesIdentityAndDropsACommandForTheRunningHead()
+    {
+        var runner = new ScriptedRunner();
+        var queue = await StartAsync(runner, 1);
+        try
+        {
+            queue.Enqueue(Request(1, "a"));
+            await runner.Started(1, "a").WaitAsync(Wait);
+            var resolved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            queue.Enqueue(Request(1, null), admitted =>
+            {
+                var duplicate = queue.ResolveHead(admitted, "a");
+                resolved.TrySetResult();
+                return duplicate is null ? Task.CompletedTask : Task.FromException(new InvalidOperationException("duplicate survived resolution"));
+            });
+            await resolved.Task.WaitAsync(Wait);
+            await Assert.That(queue.Snapshot()).IsEqualTo((0, 1));
+            runner.Release(1, "a");
+            await WaitUntilAsync(() => queue.Snapshot() == (0, 0));
+            await Assert.That(runner.Runs.Count).IsEqualTo(1);
+
+            queue.Enqueue(Request(2, null), admitted =>
+            {
+                queue.ResolveHead(admitted, "b");
+                return Task.CompletedTask;
+            });
+            await runner.Started(2, "b").WaitAsync(Wait);
+            await Assert.That(runner.Runs.Last().HeadSha).IsEqualTo("b");
+            runner.Release(2, "b");
+        }
+        finally { await queue.StopAsync(CancellationToken.None); }
+    }
+
+    [Test]
+    public async Task ReplacementKeepsItsFifoPositionAcrossDifferentPullRequests()
+    {
+        var runner = new ScriptedRunner();
+        var queue = new ReviewQueue(runner.RunAsync, runner.SkipAsync, 1, NullLogger<ReviewQueue>.Instance);
+        queue.Enqueue(Request(1, "a"));
+        queue.Enqueue(Request(2, "old"));
+        queue.Enqueue(Request(3, "c"));
+        queue.Enqueue(Request(2, "new"));
+        await queue.StartAsync(CancellationToken.None);
+        try
+        {
+            foreach (var (number, head) in new[] { (1, "a"), (2, "new"), (3, "c") })
+            {
+                await runner.Started(number, head).WaitAsync(Wait);
+                runner.Release(number, head);
+            }
+            await WaitUntilAsync(() => queue.Snapshot() == (0, 0));
+            await Assert.That(string.Join(",", runner.Runs.Select(x => x.Number))).IsEqualTo("1,2,3");
+        }
+        finally { await queue.StopAsync(CancellationToken.None); }
+    }
+
+    [Test]
+    public async Task CommentWebhookKeepsFifoAdmissionWhileResolvingAndMarkingItsHeadPending()
+    {
+        var database = Path.Combine(Path.GetTempPath(), "ts-reviewer-" + Guid.NewGuid().ToString("N") + ".db");
+        var options = Options(database);
+        var transport = new CommentHeadHandler();
+        var forgejo = new ForgejoClient(new HttpClient(transport), options);
+        var runner = new ScriptedRunner();
+        var queue = new ReviewQueue(runner.RunAsync, runner.SkipAsync, 1, NullLogger<ReviewQueue>.Instance);
+        using var store = new ContextStore(options);
+        var indexer = new ContextIndexer(forgejo, store, new ContextEmbedder(), options, NullLogger<ContextIndexer>.Instance);
+        var reviewer = new PullRequestReviewer(forgejo, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance), options, NullLogger<PullRequestReviewer>.Instance);
+        var webhook = new WebhookHandler(forgejo, queue, reviewer, indexer, options, NullLogger<WebhookHandler>.Instance);
+        try
+        {
+            var response = await PostAsync(webhook, new
+            {
+                action = "created",
+                repository = new { name = "widgets", owner = new { login = "TerraScale" } },
+                issue = new { number = 7, pull_request = new { } },
+                comment = new { id = 1, body = "@bot recheck", user = new { login = "author" } },
+            }).WaitAsync(TimeSpan.FromSeconds(1));
+            await Assert.That(((IStatusCodeHttpResult)response).StatusCode).IsEqualTo(StatusCodes.Status202Accepted);
+            await Assert.That(queue.Snapshot()).IsEqualTo((1, 0));
+            transport.ReleaseHead.TrySetResult();
+            await Assert.That(await transport.PendingHead.Task.WaitAsync(Wait)).IsEqualTo("command-head");
+            await queue.StartAsync(CancellationToken.None);
+            await runner.Started(7, "command-head").WaitAsync(Wait);
+            runner.Release(7, "command-head");
+        }
+        finally { transport.ReleaseHead.TrySetResult(); await queue.StopAsync(CancellationToken.None); File.Delete(database); }
+    }
+
+    [Test]
+    public async Task AQueuedOutdatedHeadIsSkippedBeforeStartingTheCurrentHead()
+    {
+        var options = Options("unused.db");
+        var transport = new MovedHeadHandler();
+        var forgejo = new ForgejoClient(new HttpClient(transport), options);
+        var reviewer = new PullRequestReviewer(forgejo, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance), options, NullLogger<PullRequestReviewer>.Instance);
+        await reviewer.RunAsync(Request(7, "old"), CancellationToken.None);
+        await Assert.That(transport.Requests.Count).IsEqualTo(2);
+        await Assert.That(transport.Requests.Last()).IsEqualTo("/api/v1/repos/TerraScale/widgets/statuses/old");
+        await Assert.That(transport.State).IsEqualTo("skipped");
+    }
+
+    [Test]
+    public async Task WebhookEnqueuesBeforeReturningEvenWhenForgejoDoesNotRespond()
+    {
+        var database = Path.Combine(Path.GetTempPath(), "ts-reviewer-" + Guid.NewGuid().ToString("N") + ".db");
+        var options = Options(database);
+        var blocked = new BlockedHandler();
+        var forgejo = new ForgejoClient(new HttpClient(blocked), options);
+        var queue = new ReviewQueue((_, _) => Task.CompletedTask, (_, _) => Task.CompletedTask, 2, NullLogger<ReviewQueue>.Instance);
+        using var store = new ContextStore(options);
+        var indexer = new ContextIndexer(forgejo, store, new ContextEmbedder(), options, NullLogger<ContextIndexer>.Instance);
+        var reviewer = new PullRequestReviewer(forgejo, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance), options, NullLogger<PullRequestReviewer>.Instance);
+        var webhook = new WebhookHandler(forgejo, queue, reviewer, indexer, options, NullLogger<WebhookHandler>.Instance);
+        try
+        {
+            var response = await PostAsync(webhook, new
+            {
+                action = "created",
+                repository = new { name = "widgets", owner = new { login = "TerraScale" } },
+                issue = new { number = 7, pull_request = new { } },
+                comment = new { id = 1, body = "@bot recheck", user = new { login = "author" } },
+            }).WaitAsync(TimeSpan.FromSeconds(1));
+            await Assert.That(((IStatusCodeHttpResult)response).StatusCode).IsEqualTo(StatusCodes.Status202Accepted);
+            await Assert.That(queue.Snapshot()).IsEqualTo((1, 0));
+        }
+        finally { blocked.Release(); File.Delete(database); }
+    }
+
+    [Test]
     public async Task RequestsForAWaitingPullRequestCollapseIntoOneReviewOfTheNewestHead()
     {
         var runner = new ScriptedRunner();
@@ -284,7 +546,8 @@ public sealed class ReviewQueueTests
 
         await Assert.That(await recovery.RecoverAsync(CancellationToken.None)).IsEqualTo(2);
         await Assert.That(queue.Snapshot()).IsEqualTo((2, 0));
-        // Recovered heads show they are queued, like webhook-queued reviews.
+        // Recovery admission is immediate; its queued POST runs asynchronously.
+        await WaitUntilAsync(() => handler.QueuedHeads.Count == 2);
         await Assert.That(string.Join(",", handler.QueuedHeads.Order())).IsEqualTo("pending-head,unreviewed-head");
         await queue.StartAsync(CancellationToken.None);
         try
@@ -366,6 +629,58 @@ public sealed class ReviewQueueTests
             map.GetOrAdd(Key(number, head), _ => new(TaskCreationOptions.RunContinuationsAsynchronously));
 
         private static string Key(int number, string head) => number + "@" + head.ToLowerInvariant();
+    }
+
+    private sealed class CommentHeadHandler : HttpMessageHandler
+    {
+        public TaskCompletionSource ReleaseHead { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<string> PendingHead { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            if (request.Method == HttpMethod.Get)
+            {
+                await ReleaseHead.Task.WaitAsync(cancellationToken);
+                var repository = new Repository(new Owner("TerraScale"), "widgets");
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = JsonContent.Create(
+                    new PullRequest(7, "change", "", new Branch("base", "main", repository), new Branch("command-head", "feature", repository))) };
+            }
+            if (request.RequestUri!.AbsolutePath.Contains("/statuses/", StringComparison.Ordinal))
+            {
+                var status = await request.Content!.ReadFromJsonAsync<JsonElement>(cancellationToken);
+                if (status.GetProperty("state").GetString() == "pending") PendingHead.TrySetResult(request.RequestUri.AbsolutePath.Split('/')[^1]);
+            }
+            return new HttpResponseMessage(HttpStatusCode.Created) { Content = JsonContent.Create(new { }) };
+        }
+    }
+
+    private sealed class MovedHeadHandler : HttpMessageHandler
+    {
+        public List<string> Requests { get; } = [];
+        public string? State { get; private set; }
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Requests.Add(request.RequestUri!.AbsolutePath);
+            if (request.Method == HttpMethod.Get)
+            {
+                var repository = new Repository(new Owner("TerraScale"), "widgets");
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = JsonContent.Create(
+                    new PullRequest(7, "change", "", new Branch("base", "main", repository), new Branch("new", "feature", repository))) };
+            }
+            var status = await request.Content!.ReadFromJsonAsync<JsonElement>(cancellationToken);
+            State = status.GetProperty("state").GetString();
+            return new HttpResponseMessage(HttpStatusCode.Created) { Content = JsonContent.Create(new { }) };
+        }
+    }
+
+    private sealed class BlockedHandler : HttpMessageHandler
+    {
+        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public void Release() => _release.TrySetResult();
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            await _release.Task.WaitAsync(cancellationToken);
+            return new HttpResponseMessage(HttpStatusCode.OK) { Content = JsonContent.Create(new { }) };
+        }
     }
 
     private sealed class StatusOnlyHandler : HttpMessageHandler

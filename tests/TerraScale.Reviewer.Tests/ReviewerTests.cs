@@ -19,7 +19,7 @@ public sealed class ReviewerTests
     private static readonly ContextEmbedder Embedder = new();
 
     private static ReviewerOptions Options(string database) =>
-        new("http://+:8080", "https://forgejo.test", "forgejo", "https://proxy.test/v1", "proxy", "review", "TerraScale", "bot", 2, TimeSpan.FromMinutes(1), "webhook-test-secret", "context-test-token", database, 100, 5, null, "operator-test-token");
+        new("http://+:8080", "https://forgejo.test", "forgejo", "https://proxy.test/v1", "proxy", "gpt-6.1-sol", "TerraScale", "bot", 2, TimeSpan.FromMinutes(1), "webhook-test-secret", "context-test-token", database, 100, 5, null, "operator-test-token");
 
     private static float[] UnitVector(int index)
     {
@@ -63,13 +63,13 @@ public sealed class ReviewerTests
         await Assert.That(UnifiedDiff.ReviewPosition(files[0].Patch, 2)).IsGreaterThan(0);
     }
 
-    [Test]
+    [Test, NotInParallel]
     public async Task ConfigurationAcceptsExplicitArgumentsAndRejectsInvalidLimits()
     {
-        var options = ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy", "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token", "--operator-token=operator-test-token", "--forgejo-url=https://forgejo.test/", "--proxy-url=https://proxy.test/v1/", "--timeout=00:00:05", "--max-concurrent=3", "--ocr-concurrency=2", "--ocr-max-attempts=4", "--ocr-llm-timeout=00:20:00", "--ocr-item-timeout=00:30:00"]);
+        var options = ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy", "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token", "--operator-token=operator-test-token", "--forgejo-url=https://forgejo.test/", "--proxy-url=https://proxy.test/v1/", "--timeout=00:00:05", "--max-concurrent=2", "--ocr-concurrency=2", "--ocr-max-attempts=4", "--ocr-llm-timeout=00:20:00", "--ocr-item-timeout=00:30:00"]);
         await Assert.That(options.ForgejoUrl).IsEqualTo("https://forgejo.test");
         await Assert.That(options.ProxyUrl).IsEqualTo("https://proxy.test/v1");
-        await Assert.That(options.MaxConcurrent).IsEqualTo(3);
+        await Assert.That(options.MaxConcurrent).IsEqualTo(2);
         await Assert.That(options.OcrConcurrency).IsEqualTo(2);
         await Assert.That(options.ContextMaxAttempts).IsEqualTo(5);
         await Assert.That(options.ContextRetryDelay).IsEqualTo(TimeSpan.FromSeconds(1));
@@ -77,7 +77,10 @@ public sealed class ReviewerTests
         await Assert.That(options.OcrLlmTimeout).IsEqualTo(TimeSpan.FromMinutes(20));
         await Assert.That(options.OcrItemTimeout).IsEqualTo(TimeSpan.FromMinutes(30));
 
-        foreach (var invalid in new[] { "--max-concurrent=0", "--ocr-max-attempts=0", "--ocr-max-attempts=21", "--ocr-retry-base-delay=00:00:00", "--ocr-retry-base-delay=00:05:01",
+        foreach (var invalid in new[] { "--max-concurrent=0", "--max-concurrent=3", "--sol-slots=0", "--sol-slots=3", "--glm-slots=0", "--glm-slots=2",
+            "--sol-weight=0", "--glm-weight=-1", "--sol-weight=61", "--glm-weight=1.5", "--sol-weight=2147483647",
+            "--model-slot-wait=00:00:00", "--model-slot-wait=invalid", "--model-backoff-base-delay=-00:00:01",
+            "--model-backoff-base-delay=00:10:01", "--model-backoff-max-delay=00:00:00", "--model-backoff-max-delay=00:00:29", "--ocr-max-attempts=0", "--ocr-max-attempts=21", "--ocr-retry-base-delay=00:00:00", "--ocr-retry-base-delay=00:05:01",
             "--ocr-llm-timeout=00:00:30", "--ocr-llm-timeout=02:00:01", "--ocr-item-timeout=00:00:59", "--ocr-item-timeout=1.00:00:01",
             "--ocr-concurrency=0", "--ocr-concurrency=65" })
         {
@@ -88,12 +91,14 @@ public sealed class ReviewerTests
         }
     }
 
-    [Test]
+    [Test, NotInParallel]
     public async Task ConfigurationDefaults()
     {
         string[] names = ["TS_REVIEWER_TIMEOUT", "TS_REVIEWER_MODEL", "TS_REVIEWER_ESCALATION_MODEL", "TS_REVIEWER_FALLBACK_MODEL", "TS_REVIEWER_MAX_CONCURRENT",
-            "TS_REVIEWER_OCR_CONCURRENCY", "TS_REVIEWER_PRIMARY_STREAMS", "TS_REVIEWER_PROXY_URL", "TS_REVIEWER_OCR_MAX_ATTEMPTS", "TS_REVIEWER_OCR_RETRY_BASE_DELAY",
-            "TS_REVIEWER_OCR_LLM_TIMEOUT", "TS_REVIEWER_OCR_ITEM_TIMEOUT"];
+            "TS_REVIEWER_OCR_CONCURRENCY", "TS_REVIEWER_PROXY_URL", "TS_REVIEWER_OCR_MAX_ATTEMPTS", "TS_REVIEWER_OCR_RETRY_BASE_DELAY",
+            "TS_REVIEWER_OCR_LLM_TIMEOUT", "TS_REVIEWER_OCR_ITEM_TIMEOUT", "TS_REVIEWER_CONFIG",
+            "TS_REVIEWER_SOL_WEIGHT", "TS_REVIEWER_GLM_WEIGHT", "TS_REVIEWER_SOL_SLOTS", "TS_REVIEWER_GLM_SLOTS",
+            "TS_REVIEWER_MODEL_SLOT_WAIT", "TS_REVIEWER_MODEL_BACKOFF_BASE_DELAY", "TS_REVIEWER_MODEL_BACKOFF_MAX_DELAY"];
         var previous = names.ToDictionary(x => x, Environment.GetEnvironmentVariable);
         try
         {
@@ -101,14 +106,23 @@ public sealed class ReviewerTests
             var options = ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy",
                 "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token",
                 "--operator-token=operator-test-token"]);
-            // Sol is the primary model and GLM 5.3 is the configured fallback.
             await Assert.That(options.Model).IsEqualTo("gpt-6.1-sol");
             await Assert.That(options.EscalationModel).IsEqualTo("gpt-6.1-sol");
             await Assert.That(options.FallbackModel).IsEqualTo("glm-5.3");
             await Assert.That(options.ReviewTimeout).IsEqualTo(TimeSpan.FromHours(4));
-            await Assert.That(options.MaxConcurrent).IsEqualTo(32);
+            await Assert.That(options.MaxConcurrent).IsEqualTo(2);
+            await Assert.That(options.SolWeight).IsEqualTo(60);
+            await Assert.That(options.GlmWeight).IsEqualTo(40);
+            await Assert.That(options.SolSlots).IsEqualTo(2);
+            await Assert.That(options.GlmSlots).IsEqualTo(1);
+            await Assert.That(options.ModelSlotWait).IsEqualTo(TimeSpan.FromMinutes(2));
+            await Assert.That(options.ModelBackoffDelay).IsEqualTo(TimeSpan.FromSeconds(30));
+            await Assert.That(options.ModelBackoffMaxDelay).IsEqualTo(TimeSpan.FromMinutes(10));
+            var constructed = Options("unused");
+            await Assert.That(constructed.ModelSlotWait).IsEqualTo(options.ModelSlotWait);
+            await Assert.That(constructed.ModelBackoffDelay).IsEqualTo(options.ModelBackoffDelay);
+            await Assert.That(constructed.ModelBackoffMaxDelay).IsEqualTo(options.ModelBackoffMaxDelay);
             await Assert.That(options.OcrConcurrency).IsEqualTo(16);
-            await Assert.That(options.PrimaryStreams).IsEqualTo(64);
             await Assert.That(options.ProxyUrl).IsEqualTo("http://10.11.99.1:8318");
             await Assert.That(options.OcrMaxAttempts).IsEqualTo(3);
             await Assert.That(options.OcrRetryDelay).IsEqualTo(TimeSpan.FromSeconds(10));
@@ -121,7 +135,7 @@ public sealed class ReviewerTests
         }
     }
 
-    [Test]
+    [Test, NotInParallel]
     public async Task ConfigurationRejectsAstraInAnyConfiguredModel()
     {
         var common = new[] { "--forgejo-token=forgejo", "--proxy-token=proxy", "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token", "--operator-token=operator-test-token" };
@@ -132,6 +146,109 @@ public sealed class ReviewerTests
             catch (InvalidOperationException ex) { rejected = ex.Message.Contains("astra", StringComparison.OrdinalIgnoreCase); }
             await Assert.That(rejected).IsTrue();
         }
+    }
+
+    [Test, NotInParallel]
+    public async Task ConfigurationRejectsNonCanonicalModels()
+    {
+        string[] common = ["--forgejo-token=forgejo", "--proxy-token=proxy", "--webhook-secret=secret", "--context-api-token=context", "--operator-token=operator"];
+        foreach (var invalid in new[] { "--model=glm-5.3", "--fallback-model=gpt-6.1-sol", "--fallback-model=",
+            "--escalation-model=glm-5.3", "--model=provider/gpt-6.1-sol", "--model=GPT-6.1-SOL", "--fallback-model=glm-5" })
+        {
+            var rejected = false;
+            try { ReviewerOptions.Load([.. common, invalid]); }
+            catch (InvalidOperationException) { rejected = true; }
+            await Assert.That(rejected).IsTrue();
+        }
+    }
+
+    [Test, NotInParallel]
+    public async Task ConfigurationFileEnvironmentAndArgumentsFollowPrecedence()
+    {
+        var path = Path.GetTempFileName();
+        var overridePath = Path.GetTempFileName();
+        string[] names = ["TS_REVIEWER_CONFIG", "TS_REVIEWER_SOL_WEIGHT", "TS_REVIEWER_GLM_WEIGHT", "TS_REVIEWER_SOL_SLOTS",
+            "TS_REVIEWER_GLM_SLOTS", "TS_REVIEWER_MODEL_SLOT_WAIT", "TS_REVIEWER_MODEL_BACKOFF_BASE_DELAY", "TS_REVIEWER_MODEL_BACKOFF_MAX_DELAY"];
+        var previous = names.ToDictionary(x => x, Environment.GetEnvironmentVariable);
+        string[] common = ["--forgejo-token=forgejo", "--proxy-token=proxy", "--webhook-secret=secret", "--context-api-token=context", "--operator-token=operator"];
+        try
+        {
+            foreach (var name in names) Environment.SetEnvironmentVariable(name, null);
+            await File.WriteAllTextAsync(path, """
+                { "sol-weight": 70, "glm-weight": "30", "sol-slots": 1, "model-slot-wait": "00:03:00" }
+                """);
+            await File.WriteAllTextAsync(overridePath, """
+                { "sol-weight": 80, "glm-weight": 20, "sol-slots": 2, "model-slot-wait": "00:04:00" }
+                """);
+            Environment.SetEnvironmentVariable("TS_REVIEWER_CONFIG", path);
+            var fromFile = ReviewerOptions.Load(common);
+            await Assert.That(fromFile.SolWeight).IsEqualTo(70);
+            await Assert.That(fromFile.GlmWeight).IsEqualTo(30);
+            await Assert.That(fromFile.SolSlots).IsEqualTo(1);
+            await Assert.That(fromFile.GlmSlots).IsEqualTo(1);
+            await Assert.That(fromFile.ModelSlotWait).IsEqualTo(TimeSpan.FromMinutes(3));
+            await Assert.That(fromFile.ModelBackoffDelay).IsEqualTo(TimeSpan.FromSeconds(30));
+            var selectedFile = ReviewerOptions.Load([.. common, "--config=" + overridePath]);
+            await Assert.That(selectedFile.SolWeight).IsEqualTo(80);
+            await Assert.That(selectedFile.GlmWeight).IsEqualTo(20);
+            await Assert.That(selectedFile.ModelSlotWait).IsEqualTo(TimeSpan.FromMinutes(4));
+
+            Environment.SetEnvironmentVariable("TS_REVIEWER_SOL_WEIGHT", "55");
+            Environment.SetEnvironmentVariable("TS_REVIEWER_GLM_WEIGHT", "45");
+            Environment.SetEnvironmentVariable("TS_REVIEWER_SOL_SLOTS", "2");
+            Environment.SetEnvironmentVariable("TS_REVIEWER_GLM_SLOTS", "1");
+            Environment.SetEnvironmentVariable("TS_REVIEWER_MODEL_SLOT_WAIT", "00:05:00");
+            Environment.SetEnvironmentVariable("TS_REVIEWER_MODEL_BACKOFF_BASE_DELAY", "00:00:45");
+            Environment.SetEnvironmentVariable("TS_REVIEWER_MODEL_BACKOFF_MAX_DELAY", "00:12:00");
+            var fromEnvironment = ReviewerOptions.Load(common);
+            await Assert.That(fromEnvironment.SolWeight).IsEqualTo(55);
+            await Assert.That(fromEnvironment.GlmWeight).IsEqualTo(45);
+            await Assert.That(fromEnvironment.SolSlots).IsEqualTo(2);
+            await Assert.That(fromEnvironment.GlmSlots).IsEqualTo(1);
+            await Assert.That(fromEnvironment.ModelSlotWait).IsEqualTo(TimeSpan.FromMinutes(5));
+            await Assert.That(fromEnvironment.ModelBackoffDelay).IsEqualTo(TimeSpan.FromSeconds(45));
+            await Assert.That(fromEnvironment.ModelBackoffMaxDelay).IsEqualTo(TimeSpan.FromMinutes(12));
+            var fromArguments = ReviewerOptions.Load([.. common, "--sol-weight=65", "--glm-weight=35", "--sol-slots=1",
+                "--model-slot-wait=00:06:00", "--model-backoff-base-delay=00:01:00", "--model-backoff-max-delay=00:15:00"]);
+            await Assert.That(fromArguments.SolWeight).IsEqualTo(65);
+            await Assert.That(fromArguments.GlmWeight).IsEqualTo(35);
+            await Assert.That(fromArguments.SolSlots).IsEqualTo(1);
+            await Assert.That(fromArguments.ModelSlotWait).IsEqualTo(TimeSpan.FromMinutes(6));
+            await Assert.That(fromArguments.ModelBackoffDelay).IsEqualTo(TimeSpan.FromMinutes(1));
+            await Assert.That(fromArguments.ModelBackoffMaxDelay).IsEqualTo(TimeSpan.FromMinutes(15));
+        }
+        finally
+        {
+            foreach (var (name, value) in previous) Environment.SetEnvironmentVariable(name, value);
+            File.Delete(path);
+            File.Delete(overridePath);
+        }
+    }
+
+    [Test, NotInParallel]
+    [Arguments(null)]
+    [Arguments("not-json")]
+    [Arguments("[]")]
+    [Arguments("{\"sol-slots\": {}}")]
+    [Arguments("{\"unknown-option\": 1}")]
+    [Arguments("{\"sol-slots\": 3}")]
+    [Arguments("{\"model\": \"gpt-6.1-astra\"}")]
+    public async Task ConfigurationRejectsInvalidFiles(string? content)
+    {
+        var path = Path.Combine(Path.GetTempPath(), "reviewer-config-" + Guid.NewGuid().ToString("N") + ".json");
+        try
+        {
+            if (content is not null) await File.WriteAllTextAsync(path, content);
+            var rejected = false;
+            try
+            {
+                ReviewerOptions.Load(["--config=" + path, "--forgejo-token=forgejo", "--proxy-token=proxy",
+                    "--webhook-secret=secret", "--context-api-token=context", "--operator-token=operator"]);
+            }
+            catch (InvalidOperationException) { rejected = true; }
+            await Assert.That(rejected).IsTrue();
+        }
+        finally { File.Delete(path); }
     }
 
     [Test]
@@ -278,7 +395,7 @@ public sealed class ReviewerTests
             await Assert.That(recorded.Contains("--concurrency 16")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_URL=https://proxy.test/v1")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_TOKEN=proxy")).IsTrue();
-            await Assert.That(recorded.Contains("--model review ")).IsTrue();
+            await Assert.That(recorded.Contains("--model gpt-6.1-sol ")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_MODEL")).IsFalse();
             await Assert.That(recorded.Contains("OCR_LLM_PROTOCOL=anthropic")).IsTrue();
             await Assert.That(recorded.Contains("--timeout 60 ")).IsTrue();

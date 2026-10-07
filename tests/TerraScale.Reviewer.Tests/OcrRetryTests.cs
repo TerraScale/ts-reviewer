@@ -87,19 +87,19 @@ public sealed class OcrRetryTests
             Report(Partial(1, 1, 2), "sess-1", [FindingA], failedPath: "b.cs"),
             Report(Partial(1, 1, 2), "sess-2", [FindingA], failedPath: "b.cs"),
             // Run 3 must resume run 2 on the fallback model and completes the missing item.
-            "case \"$args\" in *'--model fallback '*'--resume sess-2'*) ;; *) echo 'expected fallback resume of sess-2' >&2; exit 2 ;; esac\n" +
+            "case \"$args\" in *'--model glm-5.3 '*'--resume sess-2'*) ;; *) echo 'expected fallback resume of sess-2' >&2; exit 2 ;; esac\n" +
             Report("Review complete: 2 finding(s) across 2 selected item(s).", "sess-3", [FindingA, FindingB], status: "complete"));
 
-        var result = await fixture.Engine(attempts: 2, fallback: "fallback").RunAsync(fixture.PullRequest, CancellationToken.None);
+        var result = await fixture.Engine(attempts: 2, fallback: "glm-5.3").RunAsync(fixture.PullRequest, CancellationToken.None);
 
         await Assert.That(result.Findings.Count).IsEqualTo(2);
-        await Assert.That(result.Summary.Contains("fallback model `fallback` took over", StringComparison.Ordinal)).IsTrue();
+        await Assert.That(result.Summary.Contains("fallback model `glm-5.3` took over", StringComparison.Ordinal)).IsTrue();
         await Assert.That(result.Summary.Contains("partial", StringComparison.OrdinalIgnoreCase)).IsFalse();
         var runs = await fixture.RunsAsync();
         await Assert.That(runs.Length).IsEqualTo(3);
-        await Assert.That(runs[0].Contains("--model review ")).IsTrue();
-        await Assert.That(runs[1].Contains("--model review ")).IsTrue();
-        await Assert.That(runs[2].Contains("--model fallback ")).IsTrue();
+        await Assert.That(runs[0].Contains("--model gpt-6.1-sol ")).IsTrue();
+        await Assert.That(runs[1].Contains("--model gpt-6.1-sol ")).IsTrue();
+        await Assert.That(runs[2].Contains("--model glm-5.3 ")).IsTrue();
     }
 
     [Test]
@@ -107,53 +107,95 @@ public sealed class OcrRetryTests
     {
         await using var fixture = await Fixture.CreateAsync();
         await fixture.ScriptAsync(Report(Partial(1, 1, 2), "sess-1", [FindingA], failedPath: "b.cs"));
-        var engine = fixture.Engine(attempts: 2, fallback: "fallback");
+        var engine = fixture.Engine(attempts: 2, fallback: "glm-5.3");
 
         var partial = await engine.RunAsync(fixture.PullRequest, CancellationToken.None);
 
         await Assert.That(partial.Findings.Count).IsEqualTo(1);
-        await Assert.That(partial.Summary.Contains("fallback model `fallback` took over", StringComparison.Ordinal)).IsTrue();
+        await Assert.That(partial.Summary.Contains("fallback model `glm-5.3` took over", StringComparison.Ordinal)).IsTrue();
         await Assert.That(partial.Summary.Contains("partial review", StringComparison.Ordinal)).IsTrue();
         var runs = await fixture.RunsAsync();
         await Assert.That(runs.Length).IsEqualTo(4);
-        await Assert.That(runs[3].Contains("--model fallback ")).IsTrue();
+        await Assert.That(runs[3].Contains("--model glm-5.3 ")).IsTrue();
 
         // A review already running on the fallback model (e.g. an escalation
         // to it) has nothing left to fall back to.
-        await engine.RunAsync(fixture.PullRequest, CancellationToken.None, "fallback");
+        await engine.RunAsync(fixture.PullRequest, CancellationToken.None, "glm-5.3");
         await Assert.That((await fixture.RunsAsync()).Length).IsEqualTo(6);
     }
 
     [Test]
-    public async Task ReviewsBeyondThePrimaryStreamsStartOnTheFallbackModel()
+    public async Task OccupiedFallbackSpillsToIdleSolAndLetsTheNextQueuedReviewRun()
     {
         await using var fixture = await Fixture.CreateAsync();
-        var marker = Path.Combine(Path.GetTempPath(), "ts-reviewer-slot-" + Guid.NewGuid().ToString("N"));
-        // The review-model run holds its slot until the marker appears; the
-        // fallback run creates it once it has started.
         await fixture.ScriptAsync(
-            "case \"$args\" in *'--model fallback '*) touch '" + marker + "' ;; *) while [ ! -e '" + marker + "' ]; do sleep 0.05; done ;; esac\n" +
-            Report("Review complete: 0 finding(s) across 2 selected item(s).", "sess", [], status: "complete"));
-        var engine = fixture.Engine(attempts: 1, fallback: "fallback", primaryStreams: 1);
-
+            Report(Partial(0, 1, 1), "retry", [], failedPath: "a.cs"),
+            "case \"$args\" in *'--model gpt-6.1-sol '*'--resume retry'*) ;; *) echo 'expected Sol spill' >&2; exit 2 ;; esac\n" +
+            Report("Review complete.", "done", [], status: "complete"));
+        var scheduler = fixture.Scheduler(slotWait: TimeSpan.FromMilliseconds(30));
+        using var occupiedGlm = await scheduler.AcquireAsync("glm-5.3", CancellationToken.None);
+        var engine = fixture.Engine(1, "glm-5.3", scheduler);
+        var nextRan = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        ReviewResult? reviewed = null;
+        var queue = new ReviewQueue(async (request, ct) =>
+        {
+            if (request.Number == 1) reviewed = await engine.RunAsync(fixture.PullRequest, ct, "gpt-6.1-sol");
+            else nextRan.TrySetResult();
+        }, (_, _) => Task.CompletedTask, 1, NullLogger<ReviewQueue>.Instance);
+        queue.Enqueue(new ReviewRequest("TerraScale", "widgets", 1, fixture.PullRequest.Head.Sha));
+        queue.Enqueue(new ReviewRequest("TerraScale", "widgets", 2, "next"));
+        await queue.StartAsync(CancellationToken.None);
         try
         {
-            var first = engine.RunAsync(fixture.PullRequest, CancellationToken.None);
-            while ((File.Exists(fixture.Runs) ? await fixture.RunsAsync() : []).Length == 0) await Task.Delay(20);
-            var second = await engine.RunAsync(fixture.PullRequest, CancellationToken.None);
-            var primary = await first;
-
-            await Assert.That(second.Summary.Contains("`review` was busy with other reviews, so `fallback` reviewed this one", StringComparison.Ordinal)).IsTrue();
-            await Assert.That(primary.Summary.Contains("busy", StringComparison.Ordinal)).IsFalse();
-            var runs = await fixture.RunsAsync();
-            await Assert.That(runs[0].Contains("--model review --concurrency 1 ")).IsTrue();
-            await Assert.That(runs[1].Contains("--model fallback ")).IsTrue();
+            await nextRan.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await Assert.That(reviewed?.Model).IsEqualTo("gpt-6.1-sol");
+            await Assert.That(scheduler.Snapshot().Glm.InFlight).IsEqualTo(1);
+            await Assert.That((await fixture.RunsAsync()).Length).IsEqualTo(2);
         }
-        finally
-        {
-            File.Delete(marker);
-        }
+        finally { await queue.StopAsync(CancellationToken.None); }
     }
+
+    [Test]
+    public async Task RateLimitImmediatelyResumesOnOtherModelAndBacksOffTheFirst()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        await fixture.ScriptAsync(
+            "echo 'Error: HTTP 429 Too Many Requests' >&2\necho '[ocr] Session: limited (retry with: --resume limited)' >&2\nexit 1\n",
+            "case \"$args\" in *'--model glm-5.3 '*'--concurrency 1 '*'--resume limited'*) ;; *) echo 'expected GLM resume' >&2; exit 2 ;; esac\n" +
+            Report("Review complete.", "done", [], status: "complete"));
+        var scheduler = fixture.Scheduler();
+        var engine = fixture.Engine(attempts: 3, fallback: "glm-5.3", scheduler: scheduler);
+        var result = await engine.RunAsync(fixture.PullRequest, CancellationToken.None);
+        await Assert.That(result.Model).IsEqualTo("glm-5.3");
+        await Assert.That((await fixture.RunsAsync()).Length).IsEqualTo(2);
+        await Assert.That(scheduler.Snapshot().Sol.RateLimits).IsEqualTo(1L);
+        await Assert.That(scheduler.Snapshot().InFlight).IsEqualTo(0);
+        using var next = await scheduler.AcquireAsync(null, CancellationToken.None);
+        await Assert.That(next.Model).IsEqualTo("glm-5.3");
+    }
+
+    [Test]
+    public async Task GlmRateLimitResumesOnSolWithoutLoopingBack()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        await fixture.ScriptAsync(
+            Report(Partial(0, 1, 1), "limited", [], failedPath: "a.cs").Replace("provider or subtask request failed", "rate_limit_error"),
+            "case \"$args\" in *'--model gpt-6.1-sol '*'--resume limited'*) ;; *) echo 'expected Sol resume' >&2; exit 2 ;; esac\n" +
+            Report("Review complete.", "done", [], status: "complete"));
+        var result = await fixture.Engine(attempts: 3, fallback: "glm-5.3")
+            .RunAsync(fixture.PullRequest, CancellationToken.None, "glm-5.3");
+        await Assert.That(result.Model).IsEqualTo("gpt-6.1-sol");
+        await Assert.That((await fixture.RunsAsync()).Length).IsEqualTo(2);
+    }
+
+    [Test]
+    [Arguments("HTTP 429: upstream exhausted", true)]
+    [Arguments("rate_limit_error", true)]
+    [Arguments("Rate limit reached", true)]
+    [Arguments("Too many requests", true)]
+    [Arguments("file 4290.cs could not be read", false)]
+    public async Task RecognizesRateLimits(string failure, bool expected) =>
+        await Assert.That(ReviewEngine.IsRateLimited(failure)).IsEqualTo(expected);
 
     [Test]
     public async Task OcrRunsOfflineOnAPartialCloneWithEverythingItReadsDownloaded()
@@ -274,12 +316,16 @@ public sealed class OcrRetryTests
         }
 
         /// <summary>An engine on the <c>review</c> model; the fallback model is off unless named.</summary>
-        public ReviewEngine Engine(int attempts, string fallback = "", int primaryStreams = 6)
-        {
-            var options = new ReviewerOptions("http://+:8080", _forgejoUrl, "forgejo", "https://proxy.test/v1", "proxy", "review", "TerraScale", "bot", 1,
+        public ReviewModelScheduler Scheduler(TimeSpan? slotWait = null) => new(Options(3, "glm-5.3") with { ModelSlotWaitDuration = slotWait }, NullLogger<ReviewModelScheduler>.Instance);
+
+        private ReviewerOptions Options(int attempts, string fallback) =>
+            new("http://+:8080", _forgejoUrl, "forgejo", "https://proxy.test/v1", "proxy", "gpt-6.1-sol", "TerraScale", "bot", 2,
                 TimeSpan.FromMinutes(1), "webhook-test-secret", "context-test-token", Path.Combine(_root, "context.db"), 100,
-                OcrMaxAttempts: attempts, OcrRetryBaseDelay: TimeSpan.FromMilliseconds(10), FallbackModel: fallback, PrimaryStreams: primaryStreams);
-            return new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, _stub);
+                OcrMaxAttempts: attempts, OcrRetryBaseDelay: TimeSpan.FromMilliseconds(10), FallbackModel: fallback);
+
+        public ReviewEngine Engine(int attempts, string fallback = "", ReviewModelScheduler? scheduler = null)
+        {
+            return new ReviewEngine(Options(attempts, fallback), NullLogger<ReviewEngine>.Instance, _stub, scheduler);
         }
 
         public string Runs => _runs;
