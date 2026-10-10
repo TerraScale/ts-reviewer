@@ -69,7 +69,7 @@ public sealed record ReviewerOptions(
         }
         foreach (var (key, value) in overrides)
         {
-            if (key == "config") continue;
+            if (string.Equals(key, "config", StringComparison.OrdinalIgnoreCase)) continue;
             if (!values.ContainsKey(key)) throw new InvalidOperationException($"unknown option: {key}");
             values[key] = value;
         }

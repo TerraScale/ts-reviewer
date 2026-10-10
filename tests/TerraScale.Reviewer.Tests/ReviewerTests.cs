@@ -90,7 +90,10 @@ public sealed class ReviewerTests
     }
 
     [Test, NotInParallel]
-    public async Task ConfigurationFileEnvironmentAndArgumentsFollowPrecedence()
+    [Arguments("config")]
+    [Arguments("CONFIG")]
+    [Arguments("Config")]
+    public async Task ConfigurationFileEnvironmentAndArgumentsFollowPrecedence(string configKey)
     {
         var path = Path.GetTempFileName();
         var overridePath = Path.GetTempFileName();
@@ -103,7 +106,7 @@ public sealed class ReviewerTests
             await File.WriteAllTextAsync(overridePath, "{ \"context-max-files\": \"80\" }");
             Environment.SetEnvironmentVariable("TS_REVIEWER_CONFIG", path);
             await Assert.That(ReviewerOptions.Load(Credentials).ContextMaxFiles).IsEqualTo(70);
-            await Assert.That(ReviewerOptions.Load([.. Credentials, "--config=" + overridePath]).ContextMaxFiles).IsEqualTo(80);
+            await Assert.That(ReviewerOptions.Load([.. Credentials, "--" + configKey + "=" + overridePath]).ContextMaxFiles).IsEqualTo(80);
             Environment.SetEnvironmentVariable("TS_REVIEWER_CONTEXT_MAX_FILES", "55");
             await Assert.That(ReviewerOptions.Load(Credentials).ContextMaxFiles).IsEqualTo(55);
             await Assert.That(ReviewerOptions.Load([.. Credentials, "--context-max-files=65"]).ContextMaxFiles).IsEqualTo(65);

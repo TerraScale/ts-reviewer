@@ -62,6 +62,9 @@ internal sealed class ReviewProvider : IAsyncDisposable
         {
             var body = await JsonNode.ParseAsync(request.Body, cancellationToken: ct) as JsonObject
                 ?? throw new InvalidOperationException("model request must be a JSON object");
+            // OCR 1.12.12 uses Anthropic Messages.New, not NewStreaming; reject incompatible callers.
+            if (body["stream"]?.GetValue<bool>() == true)
+                throw new InvalidOperationException("OCR provider accepts only non-streaming requests");
             return Results.Text(await SendAsync(body, ct), "application/json");
         }
         catch (Exception ex) when (ex is InvalidOperationException or JsonException)
@@ -106,6 +109,7 @@ internal sealed class ReviewProvider : IAsyncDisposable
                             _review, step, model, attempt, attempt - 1);
                         return json;
                     }
+                    // User decision 2026-10-10: exhaust 30 attempts before reporting any upstream failure, including 401/403.
                     reason = $"HTTP {(int)response.StatusCode}: {ProviderError(json)}";
                 }
                 catch (OperationCanceledException) when (!ct.IsCancellationRequested) { reason = $"provider timed out after {AttemptTimeout}"; }

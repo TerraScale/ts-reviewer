@@ -14,7 +14,7 @@ public sealed class ReviewProviderTests
     private static readonly ReviewerOptions Options = new("http://+:8080", "https://forgejo.test", "forgejo",
         "https://router.test/v1", "proxy-secret", "TerraScale", "bot", TimeSpan.FromHours(4), "webhook", "context", "unused", 100);
 
-    private static JsonObject Request() => new() { ["model"] = "ignored", ["messages"] = new JsonArray(), ["stream"] = true };
+    private static JsonObject Request() => new() { ["model"] = "ignored", ["messages"] = new JsonArray(), ["stream"] = false };
 
     private static HttpResponseMessage Success(string model, object[]? content = null) => new(HttpStatusCode.OK)
     {
@@ -49,11 +49,15 @@ public sealed class ReviewProviderTests
     }
 
     [Test]
-    public async Task ThirtyAttemptsAreSharedAcrossModelsAndCannotBeReopenedByOcr()
+    [Arguments(503)]
+    [Arguments(401)]
+    [Arguments(403)]
+    [Arguments(400)]
+    public async Task ThirtyAttemptsAreSharedAcrossModelsAndCannotBeReopenedByOcr(int upstreamStatus)
     {
         var delays = 0;
-        var transport = new Transport((_, _, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
-        { Content = JsonContent.Create(new { error = new { message = "upstream unavailable" } }) }));
+        var transport = new Transport((_, _, _) => Task.FromResult(new HttpResponseMessage((HttpStatusCode)upstreamStatus)
+        { Content = JsonContent.Create(new { error = new { message = "upstream rejected" } }) }));
         await using var provider = new ReviewProvider(Options, NullLogger.Instance, "review", new HttpClient(transport),
             (_, _) => { delays++; return Task.CompletedTask; });
         await provider.StartAsync(CancellationToken.None);
@@ -63,12 +67,31 @@ public sealed class ReviewProviderTests
         {
             using var response = await client.PostAsJsonAsync(provider.Url + "/v1/messages", Request());
             await Assert.That(response.StatusCode).IsEqualTo(HttpStatusCode.BadRequest);
-            await Assert.That((await response.Content.ReadAsStringAsync()).Contains("failed after 30 attempts: HTTP 503: upstream unavailable")).IsTrue();
+            await Assert.That((await response.Content.ReadAsStringAsync()).Contains($"failed after 30 attempts: HTTP {upstreamStatus}: upstream rejected")).IsTrue();
         }
         await Assert.That(transport.Models.Count).IsEqualTo(30);
         await Assert.That(delays).IsEqualTo(29);
         await Assert.That(transport.Models.Count(x => x == "glm-5.3")).IsEqualTo(15);
         await Assert.That(transport.Models.Count(x => x == "glm-5.3-flash")).IsEqualTo(15);
+    }
+
+    [Test]
+    public async Task StreamingRequestsAreRejectedBeforeCallingTheRouter()
+    {
+        var transport = new Transport((_, model, _) => Task.FromResult(Success(model)));
+        await using var provider = Create(transport);
+        await provider.StartAsync(CancellationToken.None);
+        using var client = new HttpClient();
+        client.DefaultRequestHeaders.Add("Authorization", "Bearer " + provider.Token);
+        var body = Request();
+        body["stream"] = true;
+        using var streaming = await client.PostAsJsonAsync(provider.Url + "/v1/messages", body);
+        await Assert.That(streaming.StatusCode).IsEqualTo(HttpStatusCode.BadRequest);
+        await Assert.That((await streaming.Content.ReadAsStringAsync()).Contains("only non-streaming requests")).IsTrue();
+        await Assert.That(transport.Models.Count).IsEqualTo(0);
+        using var buffered = await client.PostAsJsonAsync(provider.Url + "/v1/messages", Request());
+        await Assert.That(buffered.StatusCode).IsEqualTo(HttpStatusCode.OK);
+        await Assert.That(transport.Models.Count).IsEqualTo(1);
     }
 
     [Test]
