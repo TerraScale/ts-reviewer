@@ -89,13 +89,8 @@ public sealed class OcrRetryTests
         var digest = containerfile.Single(line => line.StartsWith("ARG OCR_SHA256=", StringComparison.Ordinal)).Split('=', 2)[1];
         var assets = Path.Combine(root, "artifacts", "ci", "ocr");
         Directory.CreateDirectory(assets);
-        var archivePath = Path.Combine(assets, "ocr-" + version + ".tgz");
-        if (!File.Exists(archivePath))
-        {
-            using var http = new HttpClient();
-            await File.WriteAllBytesAsync(archivePath, await http.GetByteArrayAsync($"https://registry.npmjs.org/@alibaba-group/ocr-linux-x64/-/ocr-linux-x64-{version}.tgz", ct), ct);
-        }
-        var archive = await File.ReadAllBytesAsync(archivePath, ct);
+        using var http = new HttpClient();
+        var archive = await http.GetByteArrayAsync($"https://registry.npmjs.org/@alibaba-group/ocr-linux-x64/-/ocr-linux-x64-{version}.tgz", ct);
         await Assert.That(Convert.ToHexStringLower(SHA256.HashData(archive))).IsEqualTo(digest);
         using var compressed = new GZipStream(new MemoryStream(archive), CompressionMode.Decompress);
         using var tar = new TarReader(compressed);

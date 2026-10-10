@@ -219,13 +219,33 @@ public sealed class ReviewProviderTests
                 "text-with-tool-stop" => Success(model, stopReason: "tool_use"),
                 "tool-with-end-stop" => Success(model, [new { type = "tool_use", id = "tool_1", name = "code_search", input = new { search_text = "failure" } }]),
                 "tool-with-sequence-stop" => Success(model, [new { type = "tool_use", id = "tool_1", name = "code_search", input = new { search_text = "failure" } }], "stop_sequence"),
-                _ => Success(model, [new { type = "thinking", thinking = "reasoning" }])
+                _ => Success(model, [new { type = "thinking", thinking = "reasoning", signature = "signed" }])
             };
             return Task.FromResult(response);
         });
         await using var provider = Create(transport);
         await provider.SendAsync(Request(), CancellationToken.None);
         await Assert.That(transport.Models.Count).IsEqualTo(2);
+        await Assert.That(provider.Failure).IsNull();
+    }
+
+    [Test]
+    [Arguments("""{"type":"thinking","thinking":123,"signature":"signed"}""", false)]
+    [Arguments("""{"type":"thinking","signature":"signed"}""", false)]
+    [Arguments("""{"type":"thinking","thinking":"reasoning","signature":false}""", false)]
+    [Arguments("""{"type":"thinking","thinking":"reasoning"}""", false)]
+    [Arguments("""{"type":"redacted_thinking","data":null}""", false)]
+    [Arguments("""{"type":"redacted_thinking"}""", false)]
+    [Arguments("""{"type":"thinking","thinking":"reasoning","signature":"signed"}""", true)]
+    [Arguments("""{"type":"redacted_thinking","data":"redacted"}""", true)]
+    public async Task ThinkingBlocksAreValidatedEvenWithUsableText(string block, bool valid)
+    {
+        var transport = new Transport((attempt, model, _) => Task.FromResult(attempt == 1
+            ? Success(model, [new { type = "text", text = "Reviewed." }, JsonSerializer.Deserialize<JsonElement>(block)])
+            : Success(model)));
+        await using var provider = Create(transport);
+        await provider.SendAsync(Request(), CancellationToken.None);
+        await Assert.That(transport.Models.Count).IsEqualTo(valid ? 1 : 2);
         await Assert.That(provider.Failure).IsNull();
     }
 

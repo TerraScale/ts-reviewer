@@ -183,7 +183,15 @@ internal sealed class ReviewProvider : IAsyncDisposable
                     usable = true;
                     hasTool = true;
                     break;
-                case "thinking" or "redacted_thinking": break;
+                case "thinking":
+                    if (!block.TryGetProperty("thinking", out var thinking) || thinking.ValueKind != JsonValueKind.String
+                        || !block.TryGetProperty("signature", out var signature) || signature.ValueKind != JsonValueKind.String)
+                        throw new InvalidOperationException("provider returned a malformed thinking block");
+                    break;
+                case "redacted_thinking":
+                    if (!block.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.String)
+                        throw new InvalidOperationException("provider returned a malformed redacted thinking block");
+                    break;
                 default: throw new InvalidOperationException("provider returned an unsupported content block");
             }
         }
