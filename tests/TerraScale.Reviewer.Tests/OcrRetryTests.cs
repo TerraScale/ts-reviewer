@@ -28,8 +28,10 @@ public sealed class OcrRetryTests
     {
         if (!OperatingSystem.IsLinux() || RuntimeInformation.ProcessArchitecture != Architecture.X64)
             throw new TUnit.Core.Exceptions.SkipTestException("requires the production Linux x64 OCR binary");
+        string binary;
+        using (var preparation = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+            binary = await PinnedOcrAsync(preparation.Token);
         using var deadline = new CancellationTokenSource(TimeSpan.FromMinutes(2));
-        var binary = await PinnedOcrAsync(deadline.Token);
         await using var fixture = await Fixture.CreateAsync(servePartialClones: true);
         var builder = WebApplication.CreateSlimBuilder();
         builder.Configuration.Sources.Clear();
@@ -90,8 +92,8 @@ public sealed class OcrRetryTests
         var assets = Path.Combine(root, "artifacts", "ci", "ocr");
         Directory.CreateDirectory(assets);
         using var http = new HttpClient();
-        var archive = await http.GetByteArrayAsync($"https://registry.npmjs.org/@alibaba-group/ocr-linux-x64/-/ocr-linux-x64-{version}.tgz", ct);
-        await Assert.That(Convert.ToHexStringLower(SHA256.HashData(archive))).IsEqualTo(digest);
+        var archive = await VerifiedArchiveAsync(Path.Combine(assets, $"ocr-{version}-{digest}.tgz"), digest,
+            token => http.GetByteArrayAsync($"https://registry.npmjs.org/@alibaba-group/ocr-linux-x64/-/ocr-linux-x64-{version}.tgz", token), ct);
         using var compressed = new GZipStream(new MemoryStream(archive), CompressionMode.Decompress);
         using var tar = new TarReader(compressed);
         while (tar.GetNextEntry() is { } entry)
@@ -103,6 +105,87 @@ public sealed class OcrRetryTests
             return binary;
         }
         throw new InvalidOperationException("Pinned OCR archive contains no production binary");
+    }
+
+    private static async Task<byte[]> VerifiedArchiveAsync(string path, string digest,
+        Func<CancellationToken, Task<byte[]>> download, CancellationToken ct)
+    {
+        if (File.Exists(path))
+        {
+            var cached = await File.ReadAllBytesAsync(path, ct);
+            if (Convert.ToHexStringLower(SHA256.HashData(cached)) == digest) return cached;
+        }
+        var archive = await download(ct);
+        if (Convert.ToHexStringLower(SHA256.HashData(archive)) != digest)
+            throw new InvalidOperationException("Pinned OCR archive checksum mismatch");
+        var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            await File.WriteAllBytesAsync(temporary, archive, ct);
+            ct.ThrowIfCancellationRequested();
+            File.Move(temporary, path, overwrite: true);
+            return archive;
+        }
+        finally { File.Delete(temporary); }
+    }
+
+    [Test]
+    [Arguments("missing")]
+    [Arguments("valid")]
+    [Arguments("corrupt")]
+    public async Task VerifiedArchiveReusesValidCacheAndRepairsCorruption(string initial)
+    {
+        var root = Directory.CreateTempSubdirectory("ts-reviewer-archive-").FullName;
+        try
+        {
+            var path = Path.Combine(root, "pinned.tgz");
+            byte[] archive = [1, 2, 3];
+            var digest = Convert.ToHexStringLower(SHA256.HashData(archive));
+            if (initial != "missing") await File.WriteAllBytesAsync(path, initial == "valid" ? archive : [0]);
+            var downloads = 0;
+            Task<byte[]> Download(CancellationToken _) { downloads++; return Task.FromResult(archive); }
+            await VerifiedArchiveAsync(path, digest, Download, CancellationToken.None);
+            await VerifiedArchiveAsync(path, digest, Download, CancellationToken.None);
+            await Assert.That(downloads).IsEqualTo(initial == "valid" ? 0 : 1);
+            await Assert.That(Convert.ToHexStringLower(SHA256.HashData(await File.ReadAllBytesAsync(path)))).IsEqualTo(digest);
+            await Assert.That(Directory.GetFiles(root, "*.tmp").Length).IsEqualTo(0);
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Test]
+    [Arguments("checksum")]
+    [Arguments("download")]
+    [Arguments("write")]
+    public async Task FailedArchivePreparationDoesNotPublishAndCanRecover(string failure)
+    {
+        var root = Directory.CreateTempSubdirectory("ts-reviewer-archive-").FullName;
+        try
+        {
+            var path = Path.Combine(root, "pinned.tgz");
+            byte[] archive = [1, 2, 3];
+            var digest = Convert.ToHexStringLower(SHA256.HashData(archive));
+            await File.WriteAllBytesAsync(path, [0]);
+            using var cancellation = new CancellationTokenSource();
+            Task<byte[]> Download(CancellationToken _)
+            {
+                if (failure == "download") return Task.FromCanceled<byte[]>(new CancellationToken(true));
+                if (failure == "write") cancellation.Cancel();
+                return Task.FromResult(failure == "checksum" ? new byte[] { 9 } : archive);
+            }
+            var failed = false;
+            try
+            {
+                await VerifiedArchiveAsync(path, digest, Download, cancellation.Token);
+            }
+            catch (Exception ex) when (failure == "checksum" ? ex is InvalidOperationException : ex is OperationCanceledException) { failed = true; }
+            await Assert.That(failed).IsTrue();
+            await Assert.That((await File.ReadAllBytesAsync(path)).Length).IsEqualTo(1);
+            await VerifiedArchiveAsync(path, digest, _ => Task.FromResult(archive), CancellationToken.None);
+            await Assert.That(Convert.ToHexStringLower(SHA256.HashData(await File.ReadAllBytesAsync(path)))).IsEqualTo(digest);
+            await Assert.That(Directory.GetFiles(root, "*.tmp").Length).IsEqualTo(0);
+        }
+        finally { Directory.Delete(root, recursive: true); }
     }
 
     [Test]
