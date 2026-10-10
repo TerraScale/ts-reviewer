@@ -67,13 +67,17 @@ internal sealed class ReviewProvider : IAsyncDisposable
         Url = _app.Urls.Single();
     }
 
-    private async Task<IResult> HandleAsync(HttpRequest request, CancellationToken ct)
+    private async Task HandleAsync(HttpContext context)
     {
+        var request = context.Request;
         if (!CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(request.Headers["x-api-key"].ToString()), Encoding.UTF8.GetBytes(Token))
             && !CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(request.Headers.Authorization.ToString()), Encoding.UTF8.GetBytes("Bearer " + Token)))
-            return Results.Unauthorized();
-        using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetime!.Token);
-        ct = lifetime.Token;
+        {
+            await Results.Unauthorized().ExecuteAsync(context);
+            return;
+        }
+        using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted, _lifetime!.Token);
+        var ct = lifetime.Token;
         try
         {
             var body = await JsonNode.ParseAsync(request.Body, cancellationToken: ct) as JsonObject
@@ -81,16 +85,28 @@ internal sealed class ReviewProvider : IAsyncDisposable
             // OCR 1.12.12 uses Anthropic Messages.New, not NewStreaming; reject incompatible callers.
             if (body["stream"]?.GetValue<bool>() == true)
                 throw new InvalidOperationException("OCR provider accepts only non-streaming requests");
-            return Results.Text(await SendAsync(body, ct), "application/json");
+            await SendAsync(body, ct, async (json, token) =>
+            {
+                context.Response.ContentType = "application/json";
+                context.Response.ContentLength = Encoding.UTF8.GetByteCount(json);
+                await context.Response.WriteAsync(json, token);
+                await context.Response.CompleteAsync().WaitAsync(token);
+                token.ThrowIfCancellationRequested();
+            });
         }
         catch (Exception ex) when (ex is InvalidOperationException or JsonException)
         {
             // 400 is deliberately non-retryable to OCR's SDK: its five hidden retries must not reopen this budget.
-            return Results.Json(new { type = "error", error = new { type = "invalid_request_error", message = ex.Message } }, statusCode: 400);
+            if (context.Response.HasStarted) context.Abort();
+            else
+            {
+                context.Response.Clear();
+                await Results.Json(new { type = "error", error = new { type = "invalid_request_error", message = ex.Message } }, statusCode: 400).ExecuteAsync(context);
+            }
         }
     }
 
-    internal async Task<string> SendAsync(JsonObject body, CancellationToken ct)
+    internal async Task<string> SendAsync(JsonObject body, CancellationToken ct, Func<string, CancellationToken, Task>? deliver = null)
     {
         await _serial.WaitAsync(ct);
         // OCR may be idle between calls, but active calls retain their complete retry budget.
@@ -110,6 +126,7 @@ internal sealed class ReviewProvider : IAsyncDisposable
                 if (!_models.Contains(model)) _models.Add(model);
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 timeout.CancelAfter(AttemptTimeout);
+                string? completed = null;
                 try
                 {
                     var endpoint = _options.ProxyUrl.TrimEnd('/');
@@ -125,13 +142,28 @@ internal sealed class ReviewProvider : IAsyncDisposable
                         ValidateResponse(json, model, body["tools"] as JsonArray);
                         _logger.LogInformation("review {Review}; step {Step}; model {Model}; attempts {Attempts}; retries {Retries}; succeeded",
                             _review, step, model, attempt, attempt - 1);
-                        return json;
+                        completed = json;
                     }
-                    // User decision 2026-10-10: exhaust 30 attempts before reporting any upstream failure, including 401/403.
-                    reason = $"HTTP {(int)response.StatusCode}: {ProviderError(json)}";
+                    else
+                    {
+                        // User decision 2026-10-10: exhaust 30 attempts before reporting any upstream failure, including 401/403.
+                        reason = $"HTTP {(int)response.StatusCode}: {ProviderError(json)}";
+                    }
                 }
                 catch (OperationCanceledException) when (!ct.IsCancellationRequested) { reason = $"provider timed out after {AttemptTimeout}"; }
                 catch (Exception ex) when (ex is HttpRequestException or IOException or JsonException or InvalidOperationException) { reason = ex.Message; }
+                if (completed is not null)
+                {
+                    // Keep delivery under the call lock; a lost response must not reopen the spent budget.
+                    try { if (deliver is not null) await deliver(completed, ct); }
+                    catch (Exception ex) when (_lifetime is { IsCancellationRequested: false })
+                    {
+                        Failure = $"OCR response delivery failed; review stopped to preserve its retry budget: {ex.Message}";
+                        _logger.LogError("review {Review}; step {Step}; {Reason}", _review, step, Failure);
+                        throw new InvalidOperationException(Failure, ex);
+                    }
+                    return completed;
+                }
                 _logger.LogWarning("review {Review}; step {Step}; model {Model}; attempt {Attempt}/{MaxAttempts} failed: {Reason}",
                     _review, step, model, attempt, MaxAttempts, reason);
                 if (attempt < MaxAttempts) await _delay(RetryDelay(attempt, Random.Shared.NextDouble()), ct);

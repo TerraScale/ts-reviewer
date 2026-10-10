@@ -488,6 +488,39 @@ public sealed class ReviewProviderTests
     [Test]
     [Arguments(false)]
     [Arguments(true)]
+    public async Task DisconnectDuringResponseDeliveryCannotReopenTheRetryBudget(bool reviewCancellation)
+    {
+        var transport = new Transport((attempt, model, _) => Task.FromResult(attempt < 30
+            ? new HttpResponseMessage(HttpStatusCode.TooManyRequests)
+            : Success(model, [new { type = "text", text = new string('x', 32 * 1024 * 1024) }])));
+        await using var provider = Create(transport);
+        using var review = new CancellationTokenSource();
+        await provider.StartAsync(review.Token);
+        using var client = new HttpClient();
+        client.DefaultRequestHeaders.Add("x-api-key", provider.Token);
+        using var request = new HttpRequestMessage(HttpMethod.Post, provider.Url + "/v1/messages") { Content = JsonContent.Create(Request()) };
+        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead).WaitAsync(TimeSpan.FromSeconds(5));
+        await Assert.That(response.StatusCode).IsEqualTo(HttpStatusCode.OK);
+        await Assert.That(response.Content.Headers.ContentLength > 32 * 1024 * 1024).IsTrue();
+        await Assert.That(transport.Models.Count).IsEqualTo(30);
+        if (reviewCancellation) review.Cancel();
+        // Disposing an unread body closes the local connection while the large response is still being written.
+        response.Dispose();
+        using var retry = await client.PostAsJsonAsync(provider.Url + "/v1/messages", Request()).WaitAsync(TimeSpan.FromSeconds(5));
+        await Assert.That(retry.IsSuccessStatusCode).IsFalse();
+        await Assert.That(transport.Models.Count).IsEqualTo(30);
+        if (reviewCancellation) await Assert.That(provider.Failure).IsNull();
+        else
+        {
+            await Assert.That(retry.StatusCode).IsEqualTo(HttpStatusCode.BadRequest);
+            await Assert.That(await retry.Content.ReadAsStringAsync()).Contains("OCR response delivery failed");
+            await Assert.That(provider.Failure).Contains("preserve its retry budget");
+        }
+    }
+
+    [Test]
+    [Arguments(false)]
+    [Arguments(true)]
     public async Task InactivityWatchdogPausesForActiveCallsAndRetryBackoff(bool backoff)
     {
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
