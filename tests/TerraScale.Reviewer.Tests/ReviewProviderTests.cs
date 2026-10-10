@@ -14,7 +14,27 @@ public sealed class ReviewProviderTests
     private static readonly ReviewerOptions Options = new("http://+:8080", "https://forgejo.test", "forgejo",
         "https://router.test/v1", "proxy-secret", "TerraScale", "bot", TimeSpan.FromHours(4), "webhook", "context", "unused", 100);
 
-    private static JsonObject Request() => new() { ["model"] = "ignored", ["messages"] = new JsonArray(), ["stream"] = false };
+    private static JsonObject Request() => new()
+    {
+        ["model"] = "ignored",
+        ["messages"] = new JsonArray(),
+        ["stream"] = false,
+        ["tools"] = JsonNode.Parse("""
+            [{"name":"code_search","input_schema":{"type":"object","properties":{
+              "search_text":{"type":"string"},"file_patterns":{"type":"array","items":{"type":"string"}},
+              "case_sensitive":{"type":"boolean"},"use_perl_regexp":{"type":"boolean"}},"required":["search_text"]}},
+             {"name":"file_read","input_schema":{"type":"object","properties":{
+              "file_path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["file_path"]}},
+             {"name":"task_done","input_schema":{"type":"object","properties":{
+              "state":{"type":"string","enum":["DONE","FAILED"]}},"required":["state"]}},
+             {"name":"code_comment","input_schema":{"type":"object","properties":{
+              "comments":{"type":"array","items":{"type":"object","properties":{
+                "content":{"type":"string"},"existing_code":{"type":"string"},"suggestion_code":{"type":"string"},
+                "category":{"type":"string","enum":["bug","security","performance","maintainability","test","style","documentation","other"]},
+                "severity":{"type":"string","enum":["critical","high","medium","low"]},"path":{"type":"string"}},
+                "required":["content","existing_code","category","severity","path"]}}},"required":["comments"]}}]
+            """)
+    };
 
     private static HttpResponseMessage Success(string model, object[]? content = null, string stopReason = "end_turn") => new(HttpStatusCode.OK)
     {
@@ -170,8 +190,8 @@ public sealed class ReviewProviderTests
                 "malformed-tool" => Success(model, [new { type = "tool_use", id = "tool_1", name = "review", input = "invalid" }]),
                 "truncated" => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("{\"type\":\"message\",\"stop_reason\":\"max_tokens\"}") },
                 "text-with-tool-stop" => Success(model, stopReason: "tool_use"),
-                "tool-with-end-stop" => Success(model, [new { type = "tool_use", id = "tool_1", name = "review", input = new { } }]),
-                "tool-with-sequence-stop" => Success(model, [new { type = "tool_use", id = "tool_1", name = "review", input = new { } }], "stop_sequence"),
+                "tool-with-end-stop" => Success(model, [new { type = "tool_use", id = "tool_1", name = "code_search", input = new { search_text = "failure" } }]),
+                "tool-with-sequence-stop" => Success(model, [new { type = "tool_use", id = "tool_1", name = "code_search", input = new { search_text = "failure" } }], "stop_sequence"),
                 _ => Success(model, [new { type = "thinking", thinking = "reasoning" }])
             };
             return Task.FromResult(response);
@@ -186,10 +206,63 @@ public sealed class ReviewProviderTests
     public async Task AcceptsAnthropicToolCallsAndDoesNotRetryThem()
     {
         var transport = new Transport((_, model, _) => Task.FromResult(Success(model,
-            [new { type = "text", text = "" }, new { type = "tool_use", id = "tool_1", name = "code_search", input = new { query = "failure" } }], "tool_use")));
+            [new { type = "text", text = "" }, new { type = "tool_use", id = "tool_1", name = "code_search", input = new { search_text = "failure" } }], "tool_use")));
         await using var provider = Create(transport);
         var result = await provider.SendAsync(Request(), CancellationToken.None);
         await Assert.That(result.Contains("code_search")).IsTrue();
+        await Assert.That(transport.Models.Count).IsEqualTo(1);
+    }
+
+    [Test]
+    [Arguments("unknown_tool", "{}")]
+    [Arguments("code_search", "{}")]
+    [Arguments("code_search", "{\"search_text\":null}")]
+    [Arguments("code_search", "{\"search_text\":\"x\",\"case_sensitive\":\"true\"}")]
+    [Arguments("code_search", "{\"search_text\":\"x\",\"file_patterns\":\"a.cs\"}")]
+    [Arguments("code_search", "{\"search_text\":\"x\",\"file_patterns\":[1]}")]
+    [Arguments("file_read", "{\"file_path\":\"a.cs\",\"start_line\":1.5}")]
+    [Arguments("file_read", "{\"file_path\":\"a.cs\",\"start_line\":\"1\"}")]
+    [Arguments("task_done", "{\"state\":\"UNKNOWN\"}")]
+    [Arguments("code_comment", "{\"comments\":[{}]}")]
+    [Arguments("code_comment", "{\"comments\":[{\"content\":\"bug\",\"existing_code\":\"x\",\"category\":\"bug\",\"severity\":\"blocker\",\"path\":\"a.cs\"}]}")]
+    [Arguments("code_comment", "{\"comments\":[{\"content\":\"bug\",\"existing_code\":\"x\",\"category\":\"bug\",\"severity\":\"high\",\"path\":false}]}")]
+    public async Task UnknownToolsAndSchemaInvalidArgumentsAreRetried(string name, string arguments)
+    {
+        var transport = new Transport((attempt, model, _) => Task.FromResult(attempt == 1
+            ? Success(model, [new { type = "tool_use", id = "tool_1", name, input = JsonSerializer.Deserialize<JsonElement>(arguments) }], "tool_use")
+            : Success(model)));
+        var log = new CaptureLogger();
+        await using var provider = new ReviewProvider(Options, log, "review", new HttpClient(transport), (_, _) => Task.CompletedTask);
+        await provider.SendAsync(Request(), CancellationToken.None);
+        await Assert.That(transport.Models.Count).IsEqualTo(2);
+        await Assert.That(log.Messages.Any(x => x.Contains(name == "unknown_tool" ? "tool not declared" : "schema-invalid tool arguments"))).IsTrue();
+        await Assert.That(provider.Failure).IsNull();
+    }
+
+    [Test]
+    public async Task ToolCallsWithoutDeclaredToolsAreRetried()
+    {
+        var transport = new Transport((attempt, model, _) => Task.FromResult(attempt == 1
+            ? Success(model, [new { type = "tool_use", id = "tool_1", name = "code_search", input = new { search_text = "failure" } }], "tool_use")
+            : Success(model)));
+        await using var provider = Create(transport);
+        var request = Request();
+        request.Remove("tools");
+        await provider.SendAsync(request, CancellationToken.None);
+        await Assert.That(transport.Models.Count).IsEqualTo(2);
+    }
+
+    [Test]
+    [Arguments("code_search", "{\"search_text\":\"x\",\"file_patterns\":[\"*.cs\"],\"case_sensitive\":false}")]
+    [Arguments("file_read", "{\"file_path\":\"a.cs\",\"start_line\":1.0,\"end_line\":10}")]
+    [Arguments("task_done", "{\"state\":\"DONE\"}")]
+    [Arguments("code_comment", "{\"comments\":[{\"content\":\"bug\",\"existing_code\":\"x\",\"category\":\"bug\",\"severity\":\"high\",\"path\":\"a.cs\"}]}")]
+    public async Task SchemaValidToolArgumentsDoNotRetry(string name, string arguments)
+    {
+        var transport = new Transport((_, model, _) => Task.FromResult(Success(model,
+            [new { type = "tool_use", id = "tool_1", name, input = JsonSerializer.Deserialize<JsonElement>(arguments) }], "tool_use")));
+        await using var provider = Create(transport);
+        await provider.SendAsync(Request(), CancellationToken.None);
         await Assert.That(transport.Models.Count).IsEqualTo(1);
     }
 

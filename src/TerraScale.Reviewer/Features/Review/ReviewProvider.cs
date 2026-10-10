@@ -104,7 +104,7 @@ internal sealed class ReviewProvider : IAsyncDisposable
                     var json = await response.Content.ReadAsStringAsync(timeout.Token);
                     if (response.IsSuccessStatusCode)
                     {
-                        ValidateResponse(json, model);
+                        ValidateResponse(json, model, body["tools"] as JsonArray);
                         _logger.LogInformation("review {Review}; step {Step}; model {Model}; attempts {Attempts}; retries {Retries}; succeeded",
                             _review, step, model, attempt, attempt - 1);
                         return json;
@@ -132,7 +132,7 @@ internal sealed class ReviewProvider : IAsyncDisposable
         return TimeSpan.FromSeconds(ceiling * (0.5 + Math.Clamp(jitter, 0, 1) / 2));
     }
 
-    private static void ValidateResponse(string json, string model)
+    private static void ValidateResponse(string json, string model, JsonArray? tools)
     {
         using var document = JsonDocument.Parse(json);
         var root = document.RootElement;
@@ -165,6 +165,9 @@ internal sealed class ReviewProvider : IAsyncDisposable
                         || !block.TryGetProperty("name", out var name) || name.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(name.GetString())
                         || !block.TryGetProperty("input", out var input) || input.ValueKind != JsonValueKind.Object)
                         throw new InvalidOperationException("provider returned a malformed tool call");
+                    var schema = tools?.FirstOrDefault(tool => tool?["name"]?.GetValue<string>() == name.GetString())?["input_schema"] as JsonObject
+                        ?? throw new InvalidOperationException("provider returned a tool not declared in the request");
+                    ValidateToolInput(input, schema);
                     usable = true;
                     hasTool = true;
                     break;
@@ -175,6 +178,38 @@ internal sealed class ReviewProvider : IAsyncDisposable
         if (!usable) throw new InvalidOperationException("provider returned no text or tool call");
         if (hasTool != (stop.GetString() == "tool_use"))
             throw new InvalidOperationException("provider returned content inconsistent with stop_reason");
+    }
+
+    private static void ValidateToolInput(JsonElement input, JsonObject schema)
+    {
+        // shortcut: covers pinned OCR 1.12.12 schema keywords; extend when its tool schemas change.
+        var validType = schema["type"]?.GetValue<string>() switch
+        {
+            null => true,
+            "object" => input.ValueKind == JsonValueKind.Object,
+            "array" => input.ValueKind == JsonValueKind.Array,
+            "string" => input.ValueKind == JsonValueKind.String,
+            "boolean" => input.ValueKind is JsonValueKind.True or JsonValueKind.False,
+            "number" => input.ValueKind == JsonValueKind.Number,
+            "integer" => input.ValueKind == JsonValueKind.Number && input.TryGetDecimal(out var number) && decimal.Truncate(number) == number,
+            "null" => input.ValueKind == JsonValueKind.Null,
+            _ => false,
+        };
+        if (!validType || (schema["enum"] is JsonArray choices && !choices.Any(value => JsonElement.DeepEquals(input, JsonSerializer.SerializeToElement(value)))))
+            throw new InvalidOperationException("provider returned schema-invalid tool arguments");
+        if (input.ValueKind == JsonValueKind.Object)
+        {
+            if (schema["required"] is JsonArray required)
+                foreach (var field in required)
+                    if (!input.TryGetProperty(field!.GetValue<string>(), out _))
+                        throw new InvalidOperationException("provider returned schema-invalid tool arguments: missing required field");
+            if (schema["properties"] is JsonObject properties)
+                foreach (var (field, property) in properties)
+                    if (input.TryGetProperty(field, out var value) && property is JsonObject propertySchema)
+                        ValidateToolInput(value, propertySchema);
+        }
+        if (input.ValueKind == JsonValueKind.Array && schema["items"] is JsonObject items)
+            foreach (var item in input.EnumerateArray()) ValidateToolInput(item, items);
     }
 
     private static string ProviderError(string json)
