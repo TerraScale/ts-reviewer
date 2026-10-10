@@ -21,6 +21,10 @@ public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> 
     internal const string ZeroConfigurationRule = "TerraScale zero configuration (user decision 2026-10-09): request changes on every newly added production or CI on/off switch, feature-flag library, ENABLE_*, DISABLE_*, *_ENABLED, *_DISABLED variable, boolean enabled configuration key, opt-in setting, deploy toggle, kill switch, or workflow if: vars.* deployment gate. Boolean declarations that act as operator on/off configuration require changes requested, regardless of name, visibility or default value: const/readonly bool flags, boolean configuration properties or parameters, and boolean environment/JSON/YAML values used to gate production or CI behavior. Follow how the value is supplied and used; a flag hardcoded to true is still a switch. Review this semantically even when CI has no switch scanner. Every feature and region is always on. NetBird network membership admits nodes automatically; nodes discover all regions and infer their own region from where they run. Correct settings belong in code, not tuning configuration. OCI Vault automatically creates, delivers and configures first-party production secrets; vendor-issued keys are stored once in Vault and picked up automatically. Fakes, demos and skip-auth belong only in test code and test binaries. Permit vendor-owned names only with a narrow exception and a one-line reason. Review added switches, not historical inventory entries or policy prose. Preserve authentication, authorization, customer consent and data-loss safeguards; entity state and transient UI disabled attributes are not feature configuration.";
     internal const string UserDecisionsRule = "Recorded TerraScale user decisions take precedence over generic review advice and repository guidance that contradicts them. Greenfield, closed beta (2026-10-08): never request or introduce migrations, backfills, compatibility shims, dual-read/dual-write paths, legacy fallbacks or workarounds. When a data shape, ID format or storage contract changes, delete the obsolete code and affected old data and recreate; state must re-bootstrap automatically. Retiring old data and policy is intentional, including applying the fixed replacement retention policy to existing owned history; do not demand a migration or new-data-only compatibility generation. Still require exact target/ownership verification, authorization and fencing for destructive effects; unrelated/customer data is outside this permission. API and schema versions are always v1, never v2; change the v1 contract directly and remove the old contract. Do not report the absence of backward compatibility as a defect. For TerraScale/ts-reviewer itself (user decision 2026-10-10), only glm-5.3 and glm-5.3-flash may be used, with thirty total attempts per model call and fixed two-PR and one-file-group concurrency limits. Never suggest reducing the thirty-attempt budget, introducing another model or adding tuning switches. Tests must protect these exact fixed requirements; literal assertions for two PRs or thirty attempts are intentional.";
     private readonly string _ocrPath = ocrPath ?? "ocr";
+    private readonly TimeProvider _time = TimeProvider.System;
+
+    internal ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> logger, string ocrPath, TimeProvider time)
+        : this(options, logger, ocrPath) => _time = time;
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private const int FetchAttempts = 3;
@@ -70,7 +74,7 @@ public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> 
             // each changed file (rename detection included).
             await RunGitAsync(home, repository, ct, "checkout", "--quiet", "--detach", head);
             await RunGitAsync(home, repository, ct, "diff", "--shortstat", "--find-renames", "--no-ext-diff", "--no-textconv", $"{@base}...{head}");
-            await using var provider = new ReviewProvider(options, logger, $"{pr.Head.Repo.Owner.Login}/{pr.Head.Repo.Name}#{pr.Number}@{head}");
+            await using var provider = new ReviewProvider(options, logger, $"{pr.Head.Repo.Owner.Login}/{pr.Head.Repo.Name}#{pr.Number}@{head}", _time);
             await provider.StartAsync(ct);
             var run = await ReviewOnceAsync(home, repository, root, @base, head, provider, ct);
             if (provider.Failure is { } failure) throw new InvalidOperationException(failure);
@@ -197,18 +201,27 @@ public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> 
         }
     }
 
-    private Task<ProcessResult> RunOcrAsync(string home, string repository, ReviewProvider provider, string[] arguments, CancellationToken ct) =>
-        RunProcessAsync(_ocrPath, repository, environment =>
+    private async Task<ProcessResult> RunOcrAsync(string home, string repository, ReviewProvider provider, string[] arguments, CancellationToken ct)
+    {
+        try
         {
-            environment["HOME"] = home;
-            environment["GIT_NO_LAZY_FETCH"] = "1";
-            environment["OCR_LLM_URL"] = provider.Url;
-            environment["OCR_LLM_TOKEN"] = provider.Token;
-            environment["OCR_LLM_PROTOCOL"] = "anthropic";
-            // The local endpoint owns all retries, including response validation.
-            environment["OCR_LLM_TIMEOUT"] = ReviewProvider.StepTimeout.TotalSeconds.ToString(CultureInfo.InvariantCulture);
-            environment["OCR_ENABLE_TELEMETRY"] = "false";
-        }, ct, arguments);
+            return await RunProcessAsync(_ocrPath, repository, environment =>
+            {
+                environment["HOME"] = home;
+                environment["GIT_NO_LAZY_FETCH"] = "1";
+                environment["OCR_LLM_URL"] = provider.Url;
+                environment["OCR_LLM_TOKEN"] = provider.Token;
+                environment["OCR_LLM_PROTOCOL"] = "anthropic";
+                // The local endpoint owns all retries, including response validation.
+                environment["OCR_LLM_TIMEOUT"] = ReviewProvider.StepTimeout.TotalSeconds.ToString(CultureInfo.InvariantCulture);
+                environment["OCR_ENABLE_TELEMETRY"] = "false";
+            }, provider.Lifetime, arguments);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw new InvalidOperationException($"OCR made no model-call progress for {ReviewProvider.InactivityTimeout}");
+        }
+    }
 
     private static async Task<ProcessResult> RunProcessAsync(string fileName, string workingDirectory, Action<IDictionary<string, string?>> configureEnvironment, CancellationToken ct, string[] arguments)
     {

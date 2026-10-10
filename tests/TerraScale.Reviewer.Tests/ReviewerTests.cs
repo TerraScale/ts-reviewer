@@ -89,21 +89,24 @@ public sealed class ReviewerTests
     [Test, NotInParallel]
     public async Task ReviewPolicyHasNoConfigurationOverrides()
     {
-        foreach (var key in new[] { "model", "fallback-model", "escalation-model", "max-concurrent", "ocr-concurrency",
-            "ocr-max-attempts", "ocr-retry-base-delay", "sol-weight", "glm-weight", "sol-slots", "glm-slots",
-            "model-slot-wait", "model-backoff-base-delay", "model-backoff-max-delay", "ocr-llm-timeout", "ocr-item-timeout", "timeout" })
-        {
-            var rejected = false;
-            try { ReviewerOptions.Load([.. Credentials, "--" + key + "=1"]); }
-            catch (InvalidOperationException) { rejected = true; }
-            await Assert.That(rejected).IsTrue();
-        }
         // Retired environment overrides cannot select another model or raise the limits.
-        string[] names = ["TS_REVIEWER_MODEL", "TS_REVIEWER_MAX_CONCURRENT", "TS_REVIEWER_OCR_CONCURRENCY", "TS_REVIEWER_TIMEOUT"];
+        string[] retired = ["TS_REVIEWER_MODEL", "TS_REVIEWER_MAX_CONCURRENT", "TS_REVIEWER_OCR_CONCURRENCY", "TS_REVIEWER_TIMEOUT"];
+        string[] names = [.. retired, "TS_REVIEWER_PROXY_URL", "TS_REVIEWER_CONFIG"];
         var previous = names.ToDictionary(x => x, Environment.GetEnvironmentVariable);
         try
         {
-            foreach (var name in names) Environment.SetEnvironmentVariable(name, "retired-override");
+            foreach (var name in names) Environment.SetEnvironmentVariable(name, null);
+            foreach (var name in retired) Environment.SetEnvironmentVariable(name, "retired-override");
+
+            foreach (var key in new[] { "model", "fallback-model", "escalation-model", "max-concurrent", "ocr-concurrency",
+                "ocr-max-attempts", "ocr-retry-base-delay", "sol-weight", "glm-weight", "sol-slots", "glm-slots",
+                "model-slot-wait", "model-backoff-base-delay", "model-backoff-max-delay", "ocr-llm-timeout", "ocr-item-timeout", "timeout" })
+            {
+                var rejected = false;
+                try { ReviewerOptions.Load([.. Credentials, "--" + key + "=1"]); }
+                catch (InvalidOperationException) { rejected = true; }
+                await Assert.That(rejected).IsTrue();
+            }
             var options = ReviewerOptions.Load(Credentials);
             await Assert.That(options.ProxyUrl).IsEqualTo("http://10.11.99.1:8318");
         }

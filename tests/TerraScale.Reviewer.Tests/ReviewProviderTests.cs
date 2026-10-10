@@ -439,6 +439,41 @@ public sealed class ReviewProviderTests
     }
 
     [Test]
+    [Arguments(false)]
+    [Arguments(true)]
+    public async Task InactivityWatchdogPausesForActiveCallsAndRetryBackoff(bool backoff)
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var clock = new ManualTimeProvider();
+        var transport = new Transport(async (attempt, model, ct) =>
+        {
+            if (backoff && attempt == 1) return new HttpResponseMessage(HttpStatusCode.TooManyRequests);
+            if (!backoff) { started.TrySetResult(); await release.Task.WaitAsync(ct); }
+            return Success(model);
+        });
+        await using var provider = new ReviewProvider(Options, NullLogger.Instance, "review", new HttpClient(transport),
+            async (_, ct) => { started.TrySetResult(); await release.Task.WaitAsync(ct); }, clock);
+        await provider.StartAsync(CancellationToken.None);
+        using var client = new HttpClient();
+        client.DefaultRequestHeaders.Add("x-api-key", provider.Token);
+        var request = client.PostAsJsonAsync(provider.Url + "/v1/messages", Request());
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        clock.Advance(ReviewProvider.StepTimeout);
+        await Assert.That(provider.Lifetime.IsCancellationRequested).IsFalse();
+        await Assert.That(request.IsCompleted).IsFalse();
+        release.TrySetResult();
+        using var response = await request.WaitAsync(TimeSpan.FromSeconds(5));
+        await Assert.That(response.StatusCode).IsEqualTo(HttpStatusCode.OK);
+        await Assert.That(transport.Models.Count).IsEqualTo(backoff ? 2 : 1);
+        clock.Advance(ReviewProvider.InactivityTimeout - TimeSpan.FromTicks(1));
+        await Assert.That(provider.Lifetime.IsCancellationRequested).IsFalse();
+        clock.Advance(TimeSpan.FromTicks(1));
+        await Assert.That(provider.Lifetime.IsCancellationRequested).IsTrue();
+        await Assert.That(provider.Failure).IsNull();
+    }
+
+    [Test]
     public async Task EachReviewSerializesModelCallsAndAuthenticatesItsLocalEndpoint()
     {
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);

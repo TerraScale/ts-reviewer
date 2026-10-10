@@ -196,6 +196,35 @@ public sealed class OcrRetryTests
     }
 
     [Test]
+    public async Task StalledOcrFailsFromItsOwnInactivityWatchdog()
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        await fixture.ScriptAsync("sleep 10\n");
+        var clock = new ManualTimeProvider();
+        var run = fixture.Engine(time: clock).RunAsync(fixture.PullRequest, CancellationToken.None);
+        try
+        {
+            var started = Stopwatch.StartNew();
+            while (!File.Exists(fixture.Runs))
+            {
+                if (started.Elapsed > TimeSpan.FromSeconds(5)) throw new TimeoutException("OCR stub did not start");
+                await Task.Delay(10);
+            }
+            clock.Advance(ReviewProvider.InactivityTimeout);
+            string? failure = null;
+            try { await run.WaitAsync(TimeSpan.FromSeconds(5)); }
+            catch (InvalidOperationException ex) { failure = ex.Message; }
+            await Assert.That(failure).IsEqualTo($"OCR made no model-call progress for {ReviewProvider.InactivityTimeout}");
+            await Assert.That((await fixture.RunsAsync()).Length).IsEqualTo(1);
+        }
+        finally
+        {
+            // The finite stub also cleans up if the watchdog regression fails.
+            try { await run; } catch (InvalidOperationException) { }
+        }
+    }
+
+    [Test]
     [Arguments(false, false)]
     [Arguments(true, false)]
     [Arguments(true, true)]
@@ -326,10 +355,10 @@ public sealed class OcrRetryTests
             if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(_stub, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
 
-        public ReviewEngine Engine(string? ocrPath = null, string? proxyUrl = null) => new(new ReviewerOptions("http://+:8080", _forgejoUrl, "forgejo",
+        public ReviewEngine Engine(string? ocrPath = null, string? proxyUrl = null, TimeProvider? time = null) => new(new ReviewerOptions("http://+:8080", _forgejoUrl, "forgejo",
             proxyUrl ?? "https://proxy.test/v1", "proxy", "TerraScale", "bot",
             "webhook-test-secret", "context-test-token", Path.Combine(_root, "context.db"), 100),
-            NullLogger<ReviewEngine>.Instance, ocrPath ?? _stub);
+            NullLogger<ReviewEngine>.Instance, ocrPath ?? _stub, time ?? TimeProvider.System);
 
         public string Runs => _runs;
         public string OcrPath => _stub;

@@ -15,6 +15,7 @@ internal sealed class ReviewProvider : IAsyncDisposable
     internal const string FallbackModel = "glm-5.3-flash";
     internal const int MaxAttempts = 30;
     internal static readonly TimeSpan AttemptTimeout = TimeSpan.FromMinutes(20);
+    internal static readonly TimeSpan InactivityTimeout = TimeSpan.FromMinutes(20);
     // Leave SDK headroom beyond all attempts and worst-case retry waits.
     internal static readonly TimeSpan StepTimeout = AttemptTimeout * MaxAttempts + TimeSpan.FromMinutes(MaxAttempts + 1);
     private readonly ReviewerOptions _options;
@@ -22,30 +23,35 @@ internal sealed class ReviewProvider : IAsyncDisposable
     private readonly string _review;
     private readonly HttpClient _http;
     private readonly Func<TimeSpan, CancellationToken, Task> _delay;
+    private readonly TimeProvider _time;
     private readonly SemaphoreSlim _serial = new(1);
     private readonly List<string> _models = [];
     private CancellationTokenSource? _lifetime;
+    private CancellationTokenSource? _inactivity;
     private WebApplication? _app;
     private int _step;
 
-    public ReviewProvider(ReviewerOptions options, ILogger logger, string review)
-        : this(options, logger, review, new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false }), Task.Delay) { }
+    public ReviewProvider(ReviewerOptions options, ILogger logger, string review, TimeProvider? time = null)
+        : this(options, logger, review, new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false }), Task.Delay, time) { }
 
     internal ReviewProvider(ReviewerOptions options, ILogger logger, string review, HttpClient http,
-        Func<TimeSpan, CancellationToken, Task> delay)
+        Func<TimeSpan, CancellationToken, Task> delay, TimeProvider? time = null)
     {
         (_options, _logger, _review, _http, _delay) = (options, logger, review, http, delay);
+        _time = time ?? TimeProvider.System;
         _http.Timeout = Timeout.InfiniteTimeSpan;
     }
 
     internal string Token { get; } = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
     internal string Url { get; private set; } = "";
+    internal CancellationToken Lifetime => _lifetime!.Token;
     internal string? Failure { get; private set; }
     internal string ModelsUsed => _models.Count == 0 ? PrimaryModel : string.Join(" → ", _models);
 
     internal async Task StartAsync(CancellationToken ct)
     {
-        _lifetime = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        _inactivity = new CancellationTokenSource(InactivityTimeout, _time);
+        _lifetime = CancellationTokenSource.CreateLinkedTokenSource(ct, _inactivity.Token);
         var builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions { Args = [], ApplicationName = typeof(ReviewProvider).Assembly.FullName });
         builder.Configuration.Sources.Clear();
         builder.Logging.ClearProviders();
@@ -87,6 +93,8 @@ internal sealed class ReviewProvider : IAsyncDisposable
     internal async Task<string> SendAsync(JsonObject body, CancellationToken ct)
     {
         await _serial.WaitAsync(ct);
+        // OCR may be idle between calls, but active calls retain their complete retry budget.
+        _inactivity?.CancelAfter(Timeout.InfiniteTimeSpan);
         try
         {
             if (Failure is not null) throw new InvalidOperationException(Failure);
@@ -133,7 +141,11 @@ internal sealed class ReviewProvider : IAsyncDisposable
             Failure = $"GLM review step {step} failed after {MaxAttempts} attempts: {reason}";
             throw new InvalidOperationException(Failure);
         }
-        finally { _serial.Release(); }
+        finally
+        {
+            _inactivity?.CancelAfter(InactivityTimeout);
+            _serial.Release();
+        }
     }
 
     internal static TimeSpan RetryDelay(int failure, double jitter)
@@ -254,6 +266,7 @@ internal sealed class ReviewProvider : IAsyncDisposable
         _lifetime?.Cancel();
         if (_app is not null) await _app.DisposeAsync();
         _lifetime?.Dispose();
+        _inactivity?.Dispose();
         _http.Dispose();
         _serial.Dispose();
     }
