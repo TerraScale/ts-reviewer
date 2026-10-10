@@ -43,7 +43,7 @@ public sealed class ReviewerTests
     [Test]
     public async Task UnifiedDiffMapsAddedLines()
     {
-        var raw = "diff --git a/main.go b/main.go\n@@ -1,2 +1,3 @@\n package main\n+var value = 1\n func main() {}\n";
+        var raw = "diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -1,2 +1,3 @@\n package main\n+var value = 1\n func main() {}\n";
         var files = UnifiedDiff.Parse(raw);
         await Assert.That(files.Count).IsEqualTo(1);
         await Assert.That(files[0].Filename).IsEqualTo("main.go");
@@ -54,8 +54,8 @@ public sealed class ReviewerTests
     [Test]
     public async Task UnifiedDiffKeepsMultipleFilesAndDeletedLinesOutOfNewLineMapping()
     {
-        var raw = "diff --git a/one.cs b/one.cs\n@@ -1,3 +1,2 @@\n-old line\n kept\n+new line\n" +
-                  "diff --git a/two.cs b/two.cs\n@@ -1 +1 @@\n-old\n+new\n";
+        var raw = "diff --git a/one.cs b/one.cs\n--- a/one.cs\n+++ b/one.cs\n@@ -1,3 +1,2 @@\n-old line\n kept\n+new line\n" +
+                  "diff --git a/two.cs b/two.cs\n--- a/two.cs\n+++ b/two.cs\n@@ -1 +1 @@\n-old\n+new\n";
         var files = UnifiedDiff.Parse(raw);
         await Assert.That(files.Count).IsEqualTo(2);
         await Assert.That(files[0].Filename).IsEqualTo("one.cs");
@@ -64,6 +64,27 @@ public sealed class ReviewerTests
     }
 
     private static readonly string[] Credentials = ["--forgejo-token=forgejo", "--proxy-token=proxy", "--webhook-secret=secret", "--context-api-token=context", "--operator-token=operator"];
+
+    [Test]
+    public async Task UnifiedDiffDoesNotReadChangedContentAsFileHeaders()
+    {
+        var raw = "diff --git a/one.cs b/one.cs\n--- a/one.cs\n+++ b/one.cs\n@@ -1 +1 @@\n--- a/old-content.cs\n+++ b/new-content.cs\n";
+        var files = UnifiedDiff.Parse(raw);
+        await Assert.That(files.Single().Filename).IsEqualTo("one.cs");
+        await Assert.That(files.Single().Patch.Contains("+++ b/new-content.cs\n", StringComparison.Ordinal)).IsTrue();
+    }
+
+    [Test]
+    public async Task UnifiedDiffPositionsAreNewFileLinesAcrossHunks()
+    {
+        var patch = "similarity index 80%\nrename from a.cs\nrename to b.cs\nindex old..new\n--- a/a.cs\n+++ b/b.cs\n@@ -10,2 +20,3 @@\n-removed\n+added\n kept\n+++ literal text\n@@ -30 +40 @@\n-old\n+new\n";
+        await Assert.That(UnifiedDiff.ReviewPosition(patch, 20)).IsEqualTo(20);
+        await Assert.That(UnifiedDiff.ReviewPosition(patch, 21)).IsEqualTo(21);
+        await Assert.That(UnifiedDiff.ReviewPosition(patch, 22)).IsEqualTo(22);
+        await Assert.That(UnifiedDiff.ReviewPosition(patch, 40)).IsEqualTo(40);
+        await Assert.That(UnifiedDiff.ReviewPosition(patch, 39)).IsEqualTo(0);
+    }
+
 
     [Test, NotInParallel]
     public async Task ReviewPolicyHasNoConfigurationOverrides()
@@ -210,7 +231,12 @@ public sealed class ReviewerTests
     [Arguments(null, "APPROVED", "success", true, false)]
     [Arguments(null, "", "error", false, true)]
     [Arguments("high", "", "error", false, true)]
-    public async Task ReviewEngineRunsOcrOverAClonedPullRequestRange(string? severity, string expectedEvent, string expectedStatus, bool rejectReview, bool incomplete)
+    [Arguments("high", "REQUEST_CHANGES", "failure", false, false, true)]
+    [Arguments("high", "REQUEST_CHANGES", "failure", false, false, false, "renamed.cs")]
+    [Arguments("high", "REQUEST_CHANGES", "failure", false, false, false, "café.cs")]
+    [Arguments("high", "REQUEST_CHANGES", "failure", false, false, false, "space name.cs")]
+    [Arguments("high", "REQUEST_CHANGES", "failure", false, false, false, "tab\tquote\"back\\line\n.cs")]
+    public async Task ReviewEngineRunsOcrOverAClonedPullRequestRange(string? severity, string expectedEvent, string expectedStatus, bool rejectReview, bool incomplete = false, bool largeDiff = false, string? renamedPath = null)
     {
         if (!ToolAvailable("git") || !ToolAvailable("chmod")) throw new TUnit.Core.Exceptions.SkipTestException("requires a POSIX host with git and chmod");
 
@@ -229,14 +255,26 @@ public sealed class ReviewerTests
             await RunGitAsync(root, "clone", "--quiet", remote, work);
             await RunGitAsync(work, "config", "user.email", "review@test");
             await RunGitAsync(work, "config", "user.name", "review");
-            await File.WriteAllTextAsync(Path.Combine(work, "a.cs"), "class A {}\n");
+            var filePath = renamedPath ?? "a.cs";
+            var findingLine = renamedPath is null ? 1 : 3;
+            const string renameBase = "class A\n{\n    public void B() {}\n    public void C() {}\n    public void D() {}\n}\n";
+            await File.WriteAllTextAsync(Path.Combine(work, "a.cs"), renamedPath is null ? "class A {}\n" : renameBase);
             await RunGitAsync(work, "add", ".");
             await RunGitAsync(work, "commit", "--quiet", "-m", "base");
             var baseSha = (await RunGitAsync(work, "rev-parse", "HEAD")).Trim();
-            await File.WriteAllTextAsync(Path.Combine(work, "a.cs"), "class A { public void B() { } }\n");
+            if (renamedPath is not null) File.Move(Path.Combine(work, "a.cs"), Path.Combine(work, filePath));
+            await File.WriteAllTextAsync(Path.Combine(work, filePath), renamedPath is null ? "class A { public void B() { } }\n" : renameBase.Replace("B() {}", "B() { throw new Exception(); }", StringComparison.Ordinal));
+            if (largeDiff)
+            {
+                for (var file = 0; file < 120; file++)
+                    await File.WriteAllTextAsync(Path.Combine(work, $"file{file}.cs"), $"class File{file} {{}}\n" + string.Concat(Enumerable.Repeat("// " + new string('x', 1000) + "\n", 100)));
+            }
             await RunGitAsync(work, "add", ".");
             await RunGitAsync(work, "commit", "--quiet", "-m", "head");
             var headSha = (await RunGitAsync(work, "rev-parse", "HEAD")).Trim();
+            if (largeDiff)
+                await Assert.That(Encoding.UTF8.GetByteCount(await RunGitAsync(work, "diff", baseSha, headSha))).IsGreaterThan(8 * 1024 * 1024);
+
             await RunGitAsync(work, "push", "--quiet", "origin", baseSha + ":refs/heads/main", headSha + ":refs/pull/9/head");
 
             // The ocr stub records its arguments AND the OCR_LLM_* endpoint
@@ -255,7 +293,7 @@ public sealed class ReviewerTests
                 message = incomplete ? "A file group failed" : "Review complete.",
                 comments = severity is null ? [] : new object[]
                 {
-                    new { path = "a.cs", content = "Empty method body hides the failure path.", suggestion_code = "public void B() { throw new NotSupportedException(); }", existing_code = "public void B() { }", start_line = 1, end_line = 1, category = "bug", severity },
+                    new { path = filePath, content = "Empty method body hides the failure path.", suggestion_code = "public void B() { throw new NotSupportedException(); }", existing_code = "public void B() { }", start_line = findingLine, end_line = findingLine, category = "bug", severity },
                 },
             }));
             var expectedFindings = severity is null ? 0 : 1;
@@ -265,6 +303,7 @@ public sealed class ReviewerTests
             var engine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, Path.Combine(stub, "ocr"));
             var repository = new Repository(new Owner("TerraScale"), "widgets");
             var pullRequest = new PullRequest(9, "Test change", "", new Branch(baseSha, "main", repository), new Branch(headSha, "feature", repository));
+            ReviewResult? result = null;
             if (incomplete)
             {
                 var failed = false;
@@ -274,19 +313,30 @@ public sealed class ReviewerTests
             }
             else
             {
-                var result = await engine.RunAsync(pullRequest, CancellationToken.None);
+                result = await engine.RunAsync(pullRequest, CancellationToken.None);
                 await Assert.That(result.Findings.Count).IsEqualTo(expectedFindings);
                 if (severity is not null)
                 {
-                    await Assert.That(result.Findings[0].Path).IsEqualTo("a.cs");
+                    await Assert.That(result.Findings[0].Path).IsEqualTo(filePath);
                     await Assert.That(result.Findings[0].Severity).IsEqualTo(severity);
                 }
+            }
+            if (renamedPath is not null)
+            {
+                var file = result!.Files.Single();
+                await Assert.That(file.Filename).IsEqualTo(filePath);
+                await Assert.That(file.Patch.Contains("rename from a.cs\n", StringComparison.Ordinal)).IsTrue();
+                await Assert.That(file.Patch.Contains("@@ -", StringComparison.Ordinal)).IsTrue();
+                var complete = UnifiedDiff.Parse(await RunGitAsync(work, "diff", "--find-renames", $"{baseSha}...{headSha}"));
+                await Assert.That(file.Patch).IsEqualTo(complete.Single().Patch);
             }
             var recorded = await File.ReadAllTextAsync(log);
             await Assert.That(recorded.Contains("--from " + baseSha)).IsTrue();
             await Assert.That(recorded.Contains("--to " + headSha)).IsTrue();
             await Assert.That(recorded.Contains("--format json")).IsTrue();
-            await Assert.That(recorded.Contains("--background " + ReviewEngine.ZeroConfigurationRule)).IsTrue();
+            await Assert.That(recorded.Contains("--background " + ReviewEngine.UserDecisionsRule + " " + ReviewEngine.ZeroConfigurationRule)).IsTrue();
+            await Assert.That(recorded.Contains("Boolean declarations that act as operator on/off configuration require changes requested")).IsTrue();
+            await Assert.That(recorded.Contains("entity state and transient UI disabled attributes are not feature configuration")).IsTrue();
             await Assert.That(recorded.Contains("--concurrency 1")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_URL=http://127.0.0.1:")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_TOKEN=")).IsTrue();
@@ -320,6 +370,7 @@ public sealed class ReviewerTests
             var publishedStatus = await transport.Status.Task.WaitAsync(TimeSpan.FromSeconds(30));
             await Assert.That(pendingStatus.GetProperty("state").GetString()).IsEqualTo("pending");
             await Assert.That(publishedStatus.GetProperty("state").GetString()).IsEqualTo(expectedStatus);
+            JsonElement publishedReview = default;
             if (incomplete)
             {
                 await Assert.That(transport.Review.Task.IsCompleted).IsFalse();
@@ -327,12 +378,35 @@ public sealed class ReviewerTests
             }
             else
             {
-                var publishedReview = await transport.Review.Task.WaitAsync(TimeSpan.FromSeconds(30));
+                publishedReview = await transport.Review.Task.WaitAsync(TimeSpan.FromSeconds(30));
                 await Assert.That(publishedReview.GetProperty("event").GetString()).IsEqualTo(expectedEvent);
                 await Assert.That(publishedReview.GetProperty("commit_id").GetString()).IsEqualTo(headSha);
                 await Assert.That(publishedReview.GetProperty("comments").GetArrayLength()).IsEqualTo(expectedFindings);
+                if (renamedPath is not null)
+                {
+                    var comment = publishedReview.GetProperty("comments")[0];
+                    await Assert.That(comment.GetProperty("path").GetString()).IsEqualTo(filePath);
+                    await Assert.That(comment.GetProperty("new_position").GetInt32()).IsEqualTo(findingLine);
+                }
             }
             await queue.StopAsync(CancellationToken.None);
+            if (largeDiff)
+            {
+                await Assert.That(result!.Files.Count).IsEqualTo(1);
+                await Assert.That(publishedReview.GetProperty("comments")[0].GetProperty("new_position").GetInt32()).IsGreaterThan(0);
+                // Exhausted OCR failures must resolve the pending head with a clear error.
+                await File.WriteAllTextAsync(Path.Combine(stub, "ocr"), "#!/bin/sh\necho 'Error: model context exhausted' >&2\nexit 1\n");
+                var failingEngine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, Path.Combine(stub, "ocr"));
+                var failedTransport = new ReviewPublicationHandler(pullRequest);
+                using var failedHttp = new HttpClient(failedTransport);
+                var reviewer = new PullRequestReviewer(new ForgejoClient(failedHttp, apiOptions), failingEngine, apiOptions, NullLogger<PullRequestReviewer>.Instance);
+                await reviewer.RunAsync(new ReviewRequest("TerraScale", "widgets", 9, HeadSha: headSha), CancellationToken.None);
+                var error = await failedTransport.Status.Task.WaitAsync(TimeSpan.FromSeconds(30));
+                await Assert.That(error.GetProperty("state").GetString()).IsEqualTo("error");
+                await Assert.That(error.GetProperty("description").GetString()!.Contains("review incomplete: ocr failed with exit code 1: model context exhausted")).IsTrue();
+                await Assert.That(failedTransport.Review.Task.IsCompleted).IsFalse();
+            }
+
         }
         finally
         {
@@ -725,10 +799,10 @@ public sealed class ReviewerTests
             {
                 if (path.EndsWith("/pulls/9", StringComparison.Ordinal))
                     return new(HttpStatusCode.OK) { Content = JsonContent.Create(pullRequest) };
-                if (path.EndsWith("/pulls/9.diff", StringComparison.Ordinal))
-                    return new(HttpStatusCode.OK) { Content = new StringContent("diff --git a/a.cs b/a.cs\n@@ -1 +1 @@\n-class A {}\n+class A { public void B() { } }\n") };
-                if (path.EndsWith("/files", StringComparison.Ordinal) || path.EndsWith("/comments", StringComparison.Ordinal))
+                if (path.EndsWith("/comments", StringComparison.Ordinal))
                     return new(HttpStatusCode.OK) { Content = new StringContent("[]", Encoding.UTF8, "application/json") };
+                if (path.EndsWith(".diff", StringComparison.Ordinal) || path.EndsWith("/files", StringComparison.Ordinal))
+                    throw new InvalidOperationException("review must use its local checkout, not the patch API");
             }
             else if (request.Method == HttpMethod.Post)
             {

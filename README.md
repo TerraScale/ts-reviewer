@@ -15,7 +15,13 @@ At most **two PRs run concurrently**, with **one file group at a time in each PR
 Every OCR review receives the TerraScale policy
 as review background. New production or CI switches, feature-flag libraries,
 opt-in deployment or region gates, tuning configuration and production test
-modes require changes. The reviewer preserves the repository's normal OCR
+modes require changes. Boolean declarations used as operator on/off configuration
+also require changes requested, including hardcoded `const`/`readonly bool`
+flags and boolean configuration properties, regardless of their name or
+whether the default is `true`. The reviewer follows how the value is supplied
+and used; entity state, authorization, consent and data-loss safeguards remain
+valid. This semantic check runs even when CI does not scan for switches.
+The reviewer preserves the repository's normal OCR
 rules and distinguishes policy prose, historical inventories and entity state
 from new feature configuration. Only documented vendor-owned names can have
 a narrow exception.
@@ -24,6 +30,21 @@ OCI Vault automatically creates and delivers production service credentials;
 manual secret-copy procedures are retired. Region and service discovery are
 automatic. Existing runtime options below describe implementation debt for
 removal, rather than setup steps or feature activation instructions.
+
+## Recorded user decisions and large pull requests
+
+Every OCR attempt receives the recorded greenfield and v1-only decisions as
+well as the zero-configuration policy. Changes replace the v1 contract directly;
+reviews must never request migrations, backfills, shims, compatibility generations
+or v2 APIs/schemas. Removing obsolete code and affected old data is intentional;
+exact target/ownership checks and destructive-effect authorization still apply.
+
+Ingestion uses the authenticated exact-head clone, with no Forgejo patch download
+or patch-size cap. OCR reviews one local file group at a time using the fixed
+GLM 5.3 → GLM 5.3 Flash retry policy above. Only paths with findings need local
+patches for inline comment positions, retained after full-diff rename detection.
+A review that cannot finish publishes an explicit error status with the reason
+and submits no verdict, even when some groups produced findings.
 
 ## Runtime
 

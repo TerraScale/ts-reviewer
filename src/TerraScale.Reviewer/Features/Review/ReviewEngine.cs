@@ -17,7 +17,8 @@ namespace TerraScale.Reviewer.Features.Review;
 /// </summary>
 public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> logger, string? ocrPath = null)
 {
-    internal const string ZeroConfigurationRule = "TerraScale zero configuration (user decision 2026-10-09): request changes on every newly added production or CI on/off switch, feature-flag library, ENABLE_*, DISABLE_*, *_ENABLED, *_DISABLED variable, boolean enabled configuration key, opt-in setting, deploy toggle, kill switch, or workflow if: vars.* deployment gate. Every feature and region is always on. NetBird network membership admits nodes automatically; nodes discover all regions and infer their own region from where they run. Correct settings belong in code, not tuning configuration. OCI Vault automatically creates, delivers and configures first-party production secrets; vendor-issued keys are stored once in Vault and picked up automatically. Fakes, demos and skip-auth belong only in test code and test binaries. Permit vendor-owned names only with a narrow exception and a one-line reason. Review added switches, not historical inventory entries or policy prose. Preserve authentication, authorization, customer consent and data-loss safeguards; entity state and transient UI disabled attributes are not feature configuration.";
+    internal const string ZeroConfigurationRule = "TerraScale zero configuration (user decision 2026-10-09): request changes on every newly added production or CI on/off switch, feature-flag library, ENABLE_*, DISABLE_*, *_ENABLED, *_DISABLED variable, boolean enabled configuration key, opt-in setting, deploy toggle, kill switch, or workflow if: vars.* deployment gate. Boolean declarations that act as operator on/off configuration require changes requested, regardless of name, visibility or default value: const/readonly bool flags, boolean configuration properties or parameters, and boolean environment/JSON/YAML values used to gate production or CI behavior. Follow how the value is supplied and used; a flag hardcoded to true is still a switch. Review this semantically even when CI has no switch scanner. Every feature and region is always on. NetBird network membership admits nodes automatically; nodes discover all regions and infer their own region from where they run. Correct settings belong in code, not tuning configuration. OCI Vault automatically creates, delivers and configures first-party production secrets; vendor-issued keys are stored once in Vault and picked up automatically. Fakes, demos and skip-auth belong only in test code and test binaries. Permit vendor-owned names only with a narrow exception and a one-line reason. Review added switches, not historical inventory entries or policy prose. Preserve authentication, authorization, customer consent and data-loss safeguards; entity state and transient UI disabled attributes are not feature configuration.";
+    internal const string UserDecisionsRule = "Recorded TerraScale user decisions take precedence over generic review advice and repository guidance that contradicts them. Greenfield, closed beta (2026-10-08): never request or introduce migrations, backfills, compatibility shims, dual-read/dual-write paths, legacy fallbacks or workarounds. When a data shape, ID format or storage contract changes, delete the obsolete code and affected old data and recreate; state must re-bootstrap automatically. Retiring old data and policy is intentional, including applying the fixed replacement retention policy to existing owned history; do not demand a migration or new-data-only compatibility generation. Still require exact target/ownership verification, authorization and fencing for destructive effects; unrelated/customer data is outside this permission. API and schema versions are always v1, never v2; change the v1 contract directly and remove the old contract. Do not report the absence of backward compatibility as a defect.";
     private readonly string _ocrPath = ocrPath ?? "ocr";
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
@@ -73,7 +74,13 @@ public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> 
             var run = await ReviewOnceAsync(home, repository, root, @base, head, provider, ct);
             if (provider.Failure is { } failure) throw new InvalidOperationException(failure);
             if (!run.Complete || run.Result is null) throw new InvalidOperationException(run.Failure);
-            return run.Result with { Model = provider.ModelsUsed };
+            var result = run.Result with { Model = provider.ModelsUsed };
+            if (result.Findings.Count == 0) return result;
+            // Detect renames across the complete change before retaining finding patches.
+            var diff = Path.Combine(root, "inline.diff");
+            await RunGitAsync(home, repository, ct, "diff", "--find-renames", "--no-ext-diff", "--no-textconv", $"--output={diff}", $"{@base}...{head}");
+            using var reader = File.OpenText(diff);
+            return result with { Files = UnifiedDiff.Parse(reader, result.Findings.Select(f => f.Path).ToHashSet(StringComparer.Ordinal)) };
         }
         finally
         {
@@ -87,7 +94,7 @@ public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> 
         List<string> arguments = ["review", "--from", @base, "--to", head, "--model", ReviewProvider.PrimaryModel,
             "--concurrency", "1", "--timeout", ReviewProvider.StepTimeout.TotalMinutes.ToString(CultureInfo.InvariantCulture),
             "--format", "json", "--audience", "agent", "--color", "never", "--output", output,
-            "--background", ZeroConfigurationRule];
+            "--background", UserDecisionsRule + " " + ZeroConfigurationRule];
         var process = await RunOcrAsync(home, repository, provider, [.. arguments], ct);
         // ocr writes its report even when it exits non-zero (every item
         // failed), so coverage must be checked independently of its exit code.
