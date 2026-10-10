@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.Extensions.Logging;
@@ -142,6 +143,32 @@ public sealed class ReviewProviderTests
         using var buffered = await client.PostAsJsonAsync(provider.Url + "/v1/messages", Request());
         await Assert.That(buffered.StatusCode).IsEqualTo(HttpStatusCode.OK);
         await Assert.That(transport.Models.Count).IsEqualTo(1);
+    }
+
+    [Test]
+    [NotInParallel]
+    [Arguments(false)]
+    [Arguments(true)]
+    public async Task LargePromptsReachTheRouterWithKnownLengthOrChunkedBodies(bool chunked)
+    {
+        var transport = new Transport((_, model, _) => Task.FromResult(Success(model)));
+        await using var provider = Create(transport);
+        await provider.StartAsync(CancellationToken.None);
+        using var client = new HttpClient();
+        client.DefaultRequestHeaders.Add("Authorization", "Bearer " + provider.Token);
+        var body = Request();
+        body["messages"] = new JsonArray(new JsonObject { ["role"] = "user", ["content"] = new string('x', 30_000_001) });
+        using var request = new HttpRequestMessage(HttpMethod.Post, provider.Url + "/v1/messages")
+        {
+            Content = new PromptContent(Encoding.UTF8.GetBytes(body.ToJsonString()))
+        };
+        request.Content.Headers.ContentType = new("application/json");
+        await Assert.That(request.Content.Headers.ContentLength!.Value).IsGreaterThan(30_000_000L);
+        if (chunked) request.Headers.TransferEncodingChunked = true;
+        using var response = await client.SendAsync(request);
+        await Assert.That(response.StatusCode).IsEqualTo(HttpStatusCode.OK);
+        await Assert.That(transport.Models.Single()).IsEqualTo("glm-5.3");
+        await Assert.That(provider.Failure).IsNull();
     }
 
     [Test]
@@ -354,6 +381,18 @@ public sealed class ReviewProviderTests
     }
 
     private static ReviewProvider Create(Transport transport) => new(Options, NullLogger.Instance, "review", new HttpClient(transport), (_, _) => Task.CompletedTask);
+
+    private sealed class PromptContent(byte[] payload) : HttpContent
+    {
+        protected override bool TryComputeLength(out long length) { length = payload.Length; return true; }
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) => SerializeToStreamAsync(stream, context, CancellationToken.None);
+        protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context, CancellationToken ct)
+        {
+            // Keep uploads in bounded writes instead of one 30 MB socket write.
+            for (var offset = 0; offset < payload.Length; offset += 64 * 1024)
+                await stream.WriteAsync(payload.AsMemory(offset, Math.Min(64 * 1024, payload.Length - offset)), ct);
+        }
+    }
 
     private sealed class Transport(Func<int, string, CancellationToken, Task<HttpResponseMessage>> send) : HttpMessageHandler
     {

@@ -46,7 +46,12 @@ internal sealed class ReviewProvider : IAsyncDisposable
         var builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions { Args = [], ApplicationName = typeof(ReviewProvider).Assembly.FullName });
         builder.Configuration.Sources.Clear();
         builder.Logging.ClearProviders();
-        builder.WebHost.ConfigureKestrel(server => server.Listen(IPAddress.Loopback, 0));
+        builder.WebHost.ConfigureKestrel(server =>
+        {
+            server.Listen(IPAddress.Loopback, 0);
+            // OCR prompts must not acquire an extra size cap at this authenticated local hop.
+            server.Limits.MaxRequestBodySize = null;
+        });
         _app = builder.Build();
         _app.MapPost("/v1/messages", HandleAsync);
         await _app.StartAsync(ct);
