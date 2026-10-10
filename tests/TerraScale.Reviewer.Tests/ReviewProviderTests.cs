@@ -230,6 +230,24 @@ public sealed class ReviewProviderTests
     }
 
     [Test]
+    [Arguments(false)]
+    [Arguments(true)]
+    public async Task ToolCallIdsMustBeUniqueWithinEachResponse(bool duplicate)
+    {
+        var transport = new Transport((attempt, model, _) => Task.FromResult(Success(model,
+            [new { type = "tool_use", id = "tool_1", name = "code_search", input = new { search_text = "first" } },
+             new { type = "tool_use", id = duplicate && attempt == 1 ? "tool_1" : "tool_2", name = "code_search", input = new { search_text = "second" } }], "tool_use")));
+        var log = new CaptureLogger();
+        await using var provider = new ReviewProvider(Options, log, "review", new HttpClient(transport), (_, _) => Task.CompletedTask);
+        await provider.SendAsync(Request(), CancellationToken.None);
+        await Assert.That(transport.Models.Count).IsEqualTo(duplicate ? 2 : 1);
+        await Assert.That(log.Messages.Any(x => x.Contains("duplicate tool-call IDs"))).IsEqualTo(duplicate);
+        await provider.SendAsync(Request(), CancellationToken.None);
+        await Assert.That(transport.Models.Count).IsEqualTo(duplicate ? 3 : 2);
+        await Assert.That(provider.Failure).IsNull();
+    }
+
+    [Test]
     public async Task AcceptsAnthropicToolCallsAndDoesNotRetryThem()
     {
         var transport = new Transport((_, model, _) => Task.FromResult(Success(model,

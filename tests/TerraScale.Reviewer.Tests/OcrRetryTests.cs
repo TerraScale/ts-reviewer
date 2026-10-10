@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Formats.Tar;
 using System.IO.Compression;
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -25,6 +26,8 @@ public sealed class OcrRetryTests
     [Test]
     public async Task PinnedOcrCompletesReviewThroughLocalProvider()
     {
+        if (!OperatingSystem.IsLinux() || RuntimeInformation.ProcessArchitecture != Architecture.X64)
+            throw new TUnit.Core.Exceptions.SkipTestException("requires the production Linux x64 OCR binary");
         using var deadline = new CancellationTokenSource(TimeSpan.FromMinutes(2));
         var binary = await PinnedOcrAsync(deadline.Token);
         await using var fixture = await Fixture.CreateAsync(servePartialClones: true);

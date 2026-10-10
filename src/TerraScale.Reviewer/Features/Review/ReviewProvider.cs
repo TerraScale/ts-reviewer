@@ -154,6 +154,7 @@ internal sealed class ReviewProvider : IAsyncDisposable
             throw new InvalidOperationException("provider returned an empty, malformed or unexpected-model response");
         var usable = false;
         var hasTool = false;
+        var toolIds = new HashSet<string>(StringComparer.Ordinal);
         foreach (var block in content.EnumerateArray())
         {
             if (block.ValueKind != JsonValueKind.Object || !block.TryGetProperty("type", out var kind))
@@ -170,6 +171,8 @@ internal sealed class ReviewProvider : IAsyncDisposable
                         || !block.TryGetProperty("name", out var name) || name.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(name.GetString())
                         || !block.TryGetProperty("input", out var input) || input.ValueKind != JsonValueKind.Object)
                         throw new InvalidOperationException("provider returned a malformed tool call");
+                    if (!toolIds.Add(id.GetString()!))
+                        throw new InvalidOperationException("provider returned duplicate tool-call IDs");
                     var schema = tools?.FirstOrDefault(tool => tool?["name"]?.GetValue<string>() == name.GetString())?["input_schema"] as JsonObject
                         ?? throw new InvalidOperationException("provider returned a tool not declared in the request");
                     ValidateToolInput(input, schema);
