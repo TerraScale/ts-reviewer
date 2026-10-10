@@ -17,19 +17,17 @@ public sealed class PullRequestReviewer(ForgejoClient forgejo, ReviewEngine engi
     /// Runs one review. <paramref name="cancellation"/> fires when the queue
     /// drops the request or shuts down, which publishes nothing here: the queue
     /// marks a dropped head skipped once the review stops, and a shutdown leaves
-    /// it pending for startup recovery. The review deadline is separate and
-    /// reports a timed-out review on the head.
+    /// it pending for startup recovery. Individual operations have deadlines;
+    /// review size must not truncate model retry budgets.
     /// </summary>
     public async Task RunAsync(ReviewRequest request, CancellationToken cancellation)
     {
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
-        deadline.CancelAfter(options.ReviewTimeout);
-        var ct = deadline.Token;
+        var ct = cancellation;
         var (owner, name, number) = (request.Owner, request.Name, request.Number);
         var sha = request.HeadSha;
         try
         {
-            logger.LogInformation("review started for {Repository}#{Number} with model {Model}", owner + "/" + name, number, request.Model ?? options.Model);
+            logger.LogInformation("review started for {Repository}#{Number} with model {Model}", owner + "/" + name, number, ReviewProvider.PrimaryModel);
             var pr = await forgejo.PullAsync(owner, name, number, ct) ?? throw new InvalidOperationException("pull request not found");
             if (sha is not null && !string.Equals(sha, pr.Head.Sha, StringComparison.OrdinalIgnoreCase))
             {
@@ -38,16 +36,11 @@ public sealed class PullRequestReviewer(ForgejoClient forgejo, ReviewEngine engi
             }
             sha = pr.Head.Sha;
             await PublishStatusAsync(owner, name, sha, "pending", "Review in progress");
-            await ReviewAsync(pr, owner, name, number, request.Model, ct);
+            await ReviewAsync(pr, owner, name, number, ct);
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
         {
             logger.LogInformation("review for {Repository}#{Number} was superseded or cancelled", owner + "/" + name, number);
-        }
-        catch (OperationCanceledException) when (deadline.IsCancellationRequested)
-        {
-            logger.LogWarning("review for {Repository}#{Number} timed out after {Timeout}", owner + "/" + name, number, options.ReviewTimeout);
-            if (sha is not null) await PublishStatusAsync(owner, name, sha, "error", $"review timed out after {options.ReviewTimeout} — raise TS_REVIEWER_TIMEOUT if this recurs");
         }
         catch (Exception ex)
         {
@@ -86,10 +79,10 @@ public sealed class PullRequestReviewer(ForgejoClient forgejo, ReviewEngine engi
         return builder.ToString();
     }
 
-    private async Task ReviewAsync(PullRequest pr, string owner, string name, int number, string? model, CancellationToken ct)
+    private async Task ReviewAsync(PullRequest pr, string owner, string name, int number, CancellationToken ct)
     {
         ReviewResult result;
-        try { result = await engine.RunAsync(pr, ct, model); }
+        try { result = await engine.RunAsync(pr, ct); }
         catch (Exception ex) when (ex is not OperationCanceledException)
         { await PublishStatusAsync(owner, name, pr.Head.Sha, "error", "review incomplete: " + ex.Message); return; }
         var latest = await forgejo.PullAsync(owner, name, number, ct);
@@ -100,7 +93,7 @@ public sealed class PullRequestReviewer(ForgejoClient forgejo, ReviewEngine engi
             return;
         }
         var hasFindings = result.Findings.Count > 0;
-        var body = Format(pr, result, result.Model ?? model ?? options.Model);
+        var body = Format(pr, result, result.Model ?? ReviewProvider.PrimaryModel);
         var existing = await forgejo.CommentsAsync(owner, name, number, ct);
         var marked = existing.FirstOrDefault(x => string.Equals(x.User.Login, options.BotLogin, StringComparison.OrdinalIgnoreCase) && x.Body.StartsWith("<!-- ts-reviewer:", StringComparison.Ordinal));
         if (marked is not null) await forgejo.UpdateCommentAsync(owner, name, marked.Id, body, ct);

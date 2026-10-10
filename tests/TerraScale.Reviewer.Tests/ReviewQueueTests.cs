@@ -20,10 +20,9 @@ public sealed class ReviewQueueTests
     private static readonly TimeSpan Wait = TimeSpan.FromSeconds(10);
 
     private static ReviewerOptions Options(string database) =>
-        new("http://+:8080", "https://forgejo.test", "forgejo", "https://proxy.test/v1", "proxy", "review", "TerraScale", "bot", 1,
-            TimeSpan.FromMinutes(1), "webhook-test-secret", "context-test-token", database, 100, 5, null, "operator-test-token");
+        new("http://+:8080", "https://forgejo.test", "forgejo", "https://proxy.test/v1", "proxy", "TerraScale", "bot", "webhook-test-secret", "context-test-token", database, 100, 5, null, "operator-test-token");
 
-    private static ReviewRequest Request(int number, string? head, string? model = null) => new("TerraScale", "widgets", number, head, model);
+    private static ReviewRequest Request(int number, string? head) => new("TerraScale", "widgets", number, head);
 
     [Test]
     [Arguments(false)]
@@ -348,25 +347,6 @@ public sealed class ReviewQueueTests
     }
 
     [Test]
-    public async Task EscalationSurvivesAPlainRequestForTheSameHead()
-    {
-        var runner = new ScriptedRunner();
-        var queue = await StartAsync(runner, workers: 1);
-        try
-        {
-            queue.Enqueue(Request(1, "a"));
-            await runner.Started(1, "a").WaitAsync(Wait);
-            queue.Enqueue(Request(2, "b", "strong-model"));
-            await Assert.That(queue.Enqueue(Request(2, "b"))).IsEqualTo(ReviewAdmission.Superseded);
-            runner.Release(1, "a");
-            await runner.Started(2, "b").WaitAsync(Wait);
-            await Assert.That(runner.Runs.Single(x => x.Number == 2).Model).IsEqualTo("strong-model");
-            runner.Release(2, "b");
-        }
-        finally { await queue.StopAsync(CancellationToken.None); }
-    }
-
-    [Test]
     public async Task CancelDropsWaitingWorkAndStopsTheRunningReview()
     {
         var runner = new ScriptedRunner();
@@ -398,10 +378,10 @@ public sealed class ReviewQueueTests
         var queue = await StartAsync(runner, workers: 1);
         try
         {
-            // An escalation of the running head waits without cancelling it.
+            // An unresolved command waits until its head is resolved.
             queue.Enqueue(Request(1, "old"));
             await runner.Started(1, "old").WaitAsync(Wait);
-            await Assert.That(queue.Enqueue(Request(1, "old", "strong-model"))).IsEqualTo(ReviewAdmission.Queued);
+            await Assert.That(queue.Enqueue(Request(1, null))).IsEqualTo(ReviewAdmission.Queued);
             await Assert.That(queue.Enqueue(Request(1, "new"))).IsEqualTo(ReviewAdmission.Superseded);
             await Assert.That(await runner.Cancelled(1, "old").WaitAsync(Wait)).IsTrue();
             await runner.Started(1, "new").WaitAsync(Wait);
@@ -468,7 +448,7 @@ public sealed class ReviewQueueTests
                 Interlocked.Decrement(ref running);
                 Interlocked.Increment(ref completed);
             }
-        }, (_, _) => Task.CompletedTask, workers: 2, NullLogger<ReviewQueue>.Instance);
+        }, (_, _) => Task.CompletedTask, workers: ReviewQueue.WorkerCount, NullLogger<ReviewQueue>.Instance);
         await queue.StartAsync(CancellationToken.None);
         try
         {

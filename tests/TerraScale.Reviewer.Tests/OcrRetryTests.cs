@@ -1,5 +1,15 @@
 using System.Diagnostics;
+using System.Formats.Tar;
+using System.IO.Compression;
+using System.Net;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text.Json;
+using System.Text.Json.Nodes;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using TerraScale.Reviewer.Features.Configuration;
 using TerraScale.Reviewer.Features.Forgejo;
@@ -13,191 +23,222 @@ using TUnit.Core;
 /// </summary>
 public sealed class OcrRetryTests
 {
-    private static readonly object FindingA = new { path = "a.cs", content = "Empty method body hides the failure path.", start_line = 1, end_line = 1, severity = "high" };
-    private static readonly object FindingB = new { path = "b.cs", content = "Unchecked null dereference in the new branch.", start_line = 2, end_line = 2, severity = "medium" };
-
     [Test]
-    public async Task FailedItemsAreRetriedByResumingTheSession()
+    public async Task PinnedOcrCompletesReviewThroughLocalProvider()
     {
-        await using var fixture = await Fixture.CreateAsync();
-        await fixture.ScriptAsync(
-            // Run 1: one of two items failed; the finding from the other is kept.
-            Report(Partial(1, 1, 2), "sess-1", [FindingA], failedPath: "b.cs"),
-            // Run 2 must resume run 1 and completes the missing item.
-            "case \"$args\" in *'--resume sess-1'*) ;; *) echo 'expected --resume sess-1' >&2; exit 2 ;; esac\n" +
-            Report("Review complete: 2 finding(s) across 2 selected item(s).", "sess-2", [FindingA, FindingB], status: "complete"));
-
-        var result = await fixture.Engine(attempts: 3).RunAsync(fixture.PullRequest, CancellationToken.None);
-
-        await Assert.That(result.Findings.Count).IsEqualTo(2);
-        await Assert.That(result.Summary.Contains("partial", StringComparison.OrdinalIgnoreCase)).IsFalse();
-        var runs = await fixture.RunsAsync();
-        await Assert.That(runs.Length).IsEqualTo(2);
-        await Assert.That(runs[0].Contains("--resume")).IsFalse();
-        await Assert.That(runs[1].Contains("--resume sess-1")).IsTrue();
-        foreach (var run in runs)
-            await Assert.That(run.Contains("--background " + ReviewEngine.UserDecisionsRule + " " + ReviewEngine.ZeroConfigurationRule)).IsTrue();
-    }
-
-    [Test]
-    public async Task AFailedRunIsResumedAndARefusedResumeStartsOver()
-    {
-        await using var fixture = await Fixture.CreateAsync();
-        await fixture.ScriptAsync(
-            // Run 1: every item failed. ocr still writes its report, then exits non-zero.
-            Report("Review failed: 0 finding(s); 2 of 2 selected item(s) failed.", "sess-1", [], status: "failed") +
-            "echo 'review failed: all 2 file review(s) failed' >&2\necho '[ocr] Session: sess-1 (retry with: --resume sess-1)' >&2\nexit 1\n",
-            // Run 2: ocr refuses the resume before reviewing anything.
-            "echo 'load resume session: open sess-1.jsonl: no such file or directory' >&2\nexit 1\n",
-            // Run 3 must start over without --resume.
-            "case \"$args\" in *--resume*) echo 'unexpected resume' >&2; exit 2 ;; esac\n" +
-            Report("Review complete: 0 finding(s) across 2 selected item(s).", "sess-3", [], status: "complete"));
-
-        var result = await fixture.Engine(attempts: 3).RunAsync(fixture.PullRequest, CancellationToken.None);
-
-        await Assert.That(result.Findings.Count).IsEqualTo(0);
-        var runs = await fixture.RunsAsync();
-        await Assert.That(runs.Length).IsEqualTo(3);
-        await Assert.That(runs[1].Contains("--resume sess-1")).IsTrue();
-        await Assert.That(runs[2].Contains("--resume")).IsFalse();
-    }
-
-    [Test]
-    public async Task ExhaustedAttemptsPublishPartialFindingsButNeverAPartialPass()
-    {
-        await using var withFindings = await Fixture.CreateAsync();
-        await withFindings.ScriptAsync(Report(Partial(1, 1, 2), "sess-1", [FindingA], failedPath: "b.cs"));
-        var partial = await withFindings.Engine(attempts: 2).RunAsync(withFindings.PullRequest, CancellationToken.None);
-        await Assert.That(partial.Findings.Count).IsEqualTo(1);
-        await Assert.That(partial.Summary.Contains("partial review", StringComparison.Ordinal)).IsTrue();
-        await Assert.That((await withFindings.RunsAsync()).Length).IsEqualTo(2);
-
-        await using var clean = await Fixture.CreateAsync();
-        await clean.ScriptAsync(Report(Partial(0, 1, 2), "sess-1", [], failedPath: "b.cs"));
-        string? failure = null;
-        try { await clean.Engine(attempts: 2).RunAsync(clean.PullRequest, CancellationToken.None); }
-        catch (InvalidOperationException ex) { failure = ex.Message; }
-        await Assert.That(failure).IsEqualTo("ocr review failed: " + Partial(0, 1, 2));
-    }
-
-    [Test]
-    public async Task AnIncompleteReviewFallsBackToTheFallbackModelOnTheSameSession()
-    {
-        await using var fixture = await Fixture.CreateAsync();
-        await fixture.ScriptAsync(
-            // Runs 1-2: the review model keeps failing one of two items.
-            Report(Partial(1, 1, 2), "sess-1", [FindingA], failedPath: "b.cs"),
-            Report(Partial(1, 1, 2), "sess-2", [FindingA], failedPath: "b.cs"),
-            // Run 3 must resume run 2 on the fallback model and completes the missing item.
-            "case \"$args\" in *'--model glm-5.3 '*'--resume sess-2'*) ;; *) echo 'expected fallback resume of sess-2' >&2; exit 2 ;; esac\n" +
-            Report("Review complete: 2 finding(s) across 2 selected item(s).", "sess-3", [FindingA, FindingB], status: "complete"));
-
-        var result = await fixture.Engine(attempts: 2, fallback: "glm-5.3").RunAsync(fixture.PullRequest, CancellationToken.None);
-
-        await Assert.That(result.Findings.Count).IsEqualTo(2);
-        await Assert.That(result.Summary.Contains("fallback model `glm-5.3` took over", StringComparison.Ordinal)).IsTrue();
-        await Assert.That(result.Summary.Contains("partial", StringComparison.OrdinalIgnoreCase)).IsFalse();
-        var runs = await fixture.RunsAsync();
-        await Assert.That(runs.Length).IsEqualTo(3);
-        await Assert.That(runs[0].Contains("--model gpt-6.1-sol ")).IsTrue();
-        await Assert.That(runs[1].Contains("--model gpt-6.1-sol ")).IsTrue();
-        await Assert.That(runs[2].Contains("--model glm-5.3 ")).IsTrue();
-    }
-
-    [Test]
-    public async Task AnExhaustedFallbackPublishesPartialFindingsAndNeverFallsBackToItself()
-    {
-        await using var fixture = await Fixture.CreateAsync();
-        await fixture.ScriptAsync(Report(Partial(1, 1, 2), "sess-1", [FindingA], failedPath: "b.cs"));
-        var engine = fixture.Engine(attempts: 2, fallback: "glm-5.3");
-
-        var partial = await engine.RunAsync(fixture.PullRequest, CancellationToken.None);
-
-        await Assert.That(partial.Findings.Count).IsEqualTo(1);
-        await Assert.That(partial.Summary.Contains("fallback model `glm-5.3` took over", StringComparison.Ordinal)).IsTrue();
-        await Assert.That(partial.Summary.Contains("partial review", StringComparison.Ordinal)).IsTrue();
-        var runs = await fixture.RunsAsync();
-        await Assert.That(runs.Length).IsEqualTo(4);
-        await Assert.That(runs[3].Contains("--model glm-5.3 ")).IsTrue();
-
-        // A review already running on the fallback model (e.g. an escalation
-        // to it) has nothing left to fall back to.
-        await engine.RunAsync(fixture.PullRequest, CancellationToken.None, "glm-5.3");
-        await Assert.That((await fixture.RunsAsync()).Length).IsEqualTo(6);
-    }
-
-    [Test]
-    public async Task OccupiedFallbackSpillsToIdleSolAndLetsTheNextQueuedReviewRun()
-    {
-        await using var fixture = await Fixture.CreateAsync();
-        await fixture.ScriptAsync(
-            Report(Partial(0, 1, 1), "retry", [], failedPath: "a.cs"),
-            "case \"$args\" in *'--model gpt-6.1-sol '*'--resume retry'*) ;; *) echo 'expected Sol spill' >&2; exit 2 ;; esac\n" +
-            Report("Review complete.", "done", [], status: "complete"));
-        var scheduler = fixture.Scheduler(slotWait: TimeSpan.FromMilliseconds(30));
-        using var occupiedGlm = await scheduler.AcquireAsync("glm-5.3", CancellationToken.None);
-        var engine = fixture.Engine(1, "glm-5.3", scheduler);
-        var nextRan = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        ReviewResult? reviewed = null;
-        var queue = new ReviewQueue(async (request, ct) =>
+        if (!OperatingSystem.IsLinux() || RuntimeInformation.ProcessArchitecture != Architecture.X64)
+            throw new TUnit.Core.Exceptions.SkipTestException("requires the production Linux x64 OCR binary");
+        await using var fixture = await Fixture.CreateAsync(servePartialClones: true);
+        string binary;
+        using (var preparation = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
+            binary = await PinnedOcrAsync(fixture.OcrPath, preparation.Token);
+        using var deadline = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+        var builder = WebApplication.CreateSlimBuilder();
+        builder.Configuration.Sources.Clear();
+        builder.Logging.ClearProviders();
+        builder.WebHost.ConfigureKestrel(server => server.Listen(IPAddress.Loopback, 0));
+        await using var upstream = builder.Build();
+        var calls = 0;
+        var decodedRead = false;
+        var correctRequests = true;
+        upstream.MapPost("/v1/messages", async (HttpRequest request) =>
         {
-            if (request.Number == 1) reviewed = await engine.RunAsync(fixture.PullRequest, ct, "gpt-6.1-sol");
-            else nextRan.TrySetResult();
-        }, (_, _) => Task.CompletedTask, 1, NullLogger<ReviewQueue>.Instance);
-        queue.Enqueue(new ReviewRequest("TerraScale", "widgets", 1, fixture.PullRequest.Head.Sha));
-        queue.Enqueue(new ReviewRequest("TerraScale", "widgets", 2, "next"));
-        await queue.StartAsync(CancellationToken.None);
+            using var document = await JsonDocument.ParseAsync(request.Body);
+            var body = document.RootElement;
+            correctRequests &= request.Headers.Authorization == "Bearer proxy"
+                && body.GetProperty("model").GetString() == ReviewProvider.PrimaryModel
+                && (!body.TryGetProperty("stream", out var stream) || !stream.GetBoolean());
+            foreach (var message in body.GetProperty("messages").EnumerateArray())
+                if (message.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.Array)
+                    foreach (var block in content.EnumerateArray())
+                        if (block.TryGetProperty("type", out var type) && type.GetString() == "tool_result"
+                            && block.GetProperty("tool_use_id").GetString() == "read_1")
+                            decodedRead |= block.GetRawText().Contains("LINE_RANGE: 1-1", StringComparison.Ordinal)
+                                && block.GetRawText().Contains("class A", StringComparison.Ordinal)
+                                && (!block.TryGetProperty("is_error", out var error) || !error.GetBoolean());
+            var first = ++calls == 1;
+            return Results.Json(new
+            {
+                id = "msg_" + calls,
+                type = "message",
+                role = "assistant",
+                model = ReviewProvider.PrimaryModel,
+                stop_reason = "tool_use",
+                usage = new { input_tokens = 10, output_tokens = 3 },
+                content = new[] { new {
+                    type = "tool_use", id = first ? "read_1" : "done_" + calls,
+                    name = first ? "file_read" : "task_done",
+                    input = JsonNode.Parse(first
+                        ? """{"file_path":"a.cs","start_line":1.0,"end_line":1.0}"""
+                        : """{"state":"DONE"}""")
+                } }
+            });
+        });
+        await upstream.StartAsync(deadline.Token);
+        var result = await fixture.Engine(binary, upstream.Urls.Single()).RunAsync(fixture.PullRequest, deadline.Token);
+        await Assert.That(result.Findings.Count).IsEqualTo(0);
+        await Assert.That(result.Model).IsEqualTo(ReviewProvider.PrimaryModel);
+        await Assert.That(calls).IsGreaterThan(1);
+        await Assert.That(correctRequests).IsTrue();
+        await Assert.That(decodedRead).IsTrue();
+    }
+
+    private static async Task<string> PinnedOcrAsync(string binary, CancellationToken ct)
+    {
+        var root = MultiProcessQualificationTests.RepositoryRoot();
+        var containerfile = await File.ReadAllLinesAsync(Path.Combine(root, "Containerfile"), ct);
+        var version = containerfile.Single(line => line.StartsWith("ARG OCR_VERSION=", StringComparison.Ordinal)).Split('=', 2)[1];
+        var digest = containerfile.Single(line => line.StartsWith("ARG OCR_SHA256=", StringComparison.Ordinal)).Split('=', 2)[1];
+        var assets = Path.Combine(root, "artifacts", "ci", "ocr");
+        Directory.CreateDirectory(assets);
+        using var http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+        byte[] archive;
         try
         {
-            await nextRan.Task.WaitAsync(TimeSpan.FromSeconds(10));
-            await Assert.That(reviewed?.Model).IsEqualTo("gpt-6.1-sol");
-            await Assert.That(scheduler.Snapshot().Glm.InFlight).IsEqualTo(1);
-            await Assert.That((await fixture.RunsAsync()).Length).IsEqualTo(2);
+            archive = await VerifiedArchiveAsync(Path.Combine(assets, $"ocr-{version}-{digest}.tgz"), digest,
+                token => http.GetByteArrayAsync($"https://registry.npmjs.org/@alibaba-group/ocr-linux-x64/-/ocr-linux-x64-{version}.tgz", token), ct);
         }
-        finally { await queue.StopAsync(CancellationToken.None); }
+        catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException)
+        {
+            throw new InvalidOperationException($"Pinned OCR {version} preparation from registry.npmjs.org failed (five-minute preparation budget): {ex.Message}", ex);
+        }
+        using var compressed = new GZipStream(new MemoryStream(archive), CompressionMode.Decompress);
+        using var tar = new TarReader(compressed);
+        while (tar.GetNextEntry() is { } entry)
+        {
+            if (entry.Name != "package/bin/opencodereview") continue;
+            await using (var output = File.Create(binary)) await entry.DataStream!.CopyToAsync(output, ct);
+            if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(binary, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            return binary;
+        }
+        throw new InvalidOperationException("Pinned OCR archive contains no production binary");
+    }
+
+    private static async Task<byte[]> VerifiedArchiveAsync(string path, string digest,
+        Func<CancellationToken, Task<byte[]>> download, CancellationToken ct)
+    {
+        if (File.Exists(path))
+        {
+            var cached = await File.ReadAllBytesAsync(path, ct);
+            if (Convert.ToHexStringLower(SHA256.HashData(cached)) == digest) return cached;
+        }
+        var archive = await download(ct);
+        if (Convert.ToHexStringLower(SHA256.HashData(archive)) != digest)
+            throw new InvalidOperationException("Pinned OCR archive checksum mismatch");
+        var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            await File.WriteAllBytesAsync(temporary, archive, ct);
+            ct.ThrowIfCancellationRequested();
+            File.Move(temporary, path, overwrite: true);
+            return archive;
+        }
+        finally { File.Delete(temporary); }
     }
 
     [Test]
-    public async Task RateLimitImmediatelyResumesOnOtherModelAndBacksOffTheFirst()
+    [Arguments("missing")]
+    [Arguments("valid")]
+    [Arguments("corrupt")]
+    public async Task VerifiedArchiveReusesValidCacheAndRepairsCorruption(string initial)
+    {
+        var root = Directory.CreateTempSubdirectory("ts-reviewer-archive-").FullName;
+        try
+        {
+            var path = Path.Combine(root, "pinned.tgz");
+            byte[] archive = [1, 2, 3];
+            var digest = Convert.ToHexStringLower(SHA256.HashData(archive));
+            if (initial != "missing") await File.WriteAllBytesAsync(path, initial == "valid" ? archive : [0]);
+            var downloads = 0;
+            Task<byte[]> Download(CancellationToken _) { downloads++; return Task.FromResult(archive); }
+            await VerifiedArchiveAsync(path, digest, Download, CancellationToken.None);
+            await VerifiedArchiveAsync(path, digest, Download, CancellationToken.None);
+            await Assert.That(downloads).IsEqualTo(initial == "valid" ? 0 : 1);
+            await Assert.That(Convert.ToHexStringLower(SHA256.HashData(await File.ReadAllBytesAsync(path)))).IsEqualTo(digest);
+            await Assert.That(Directory.GetFiles(root, "*.tmp").Length).IsEqualTo(0);
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Test]
+    [Arguments("checksum")]
+    [Arguments("download")]
+    [Arguments("write")]
+    public async Task FailedArchivePreparationDoesNotPublishAndCanRecover(string failure)
+    {
+        var root = Directory.CreateTempSubdirectory("ts-reviewer-archive-").FullName;
+        try
+        {
+            var path = Path.Combine(root, "pinned.tgz");
+            byte[] archive = [1, 2, 3];
+            var digest = Convert.ToHexStringLower(SHA256.HashData(archive));
+            await File.WriteAllBytesAsync(path, [0]);
+            using var cancellation = new CancellationTokenSource();
+            Task<byte[]> Download(CancellationToken _)
+            {
+                if (failure == "download") return Task.FromCanceled<byte[]>(new CancellationToken(true));
+                if (failure == "write") cancellation.Cancel();
+                return Task.FromResult(failure == "checksum" ? new byte[] { 9 } : archive);
+            }
+            var failed = false;
+            try
+            {
+                await VerifiedArchiveAsync(path, digest, Download, cancellation.Token);
+            }
+            catch (Exception ex) when (failure == "checksum" ? ex is InvalidOperationException : ex is OperationCanceledException) { failed = true; }
+            await Assert.That(failed).IsTrue();
+            await Assert.That((await File.ReadAllBytesAsync(path)).Length).IsEqualTo(1);
+            await VerifiedArchiveAsync(path, digest, _ => Task.FromResult(archive), CancellationToken.None);
+            await Assert.That(Convert.ToHexStringLower(SHA256.HashData(await File.ReadAllBytesAsync(path)))).IsEqualTo(digest);
+            await Assert.That(Directory.GetFiles(root, "*.tmp").Length).IsEqualTo(0);
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Test]
+    public async Task StalledOcrFailsFromItsOwnInactivityWatchdog()
     {
         await using var fixture = await Fixture.CreateAsync();
-        await fixture.ScriptAsync(
-            "echo 'Error: HTTP 429 Too Many Requests' >&2\necho '[ocr] Session: limited (retry with: --resume limited)' >&2\nexit 1\n",
-            "case \"$args\" in *'--model glm-5.3 '*'--concurrency 1 '*'--resume limited'*) ;; *) echo 'expected GLM resume' >&2; exit 2 ;; esac\n" +
-            Report("Review complete.", "done", [], status: "complete"));
-        var scheduler = fixture.Scheduler();
-        var engine = fixture.Engine(attempts: 3, fallback: "glm-5.3", scheduler: scheduler);
-        var result = await engine.RunAsync(fixture.PullRequest, CancellationToken.None);
-        await Assert.That(result.Model).IsEqualTo("glm-5.3");
-        await Assert.That((await fixture.RunsAsync()).Length).IsEqualTo(2);
-        await Assert.That(scheduler.Snapshot().Sol.RateLimits).IsEqualTo(1L);
-        await Assert.That(scheduler.Snapshot().InFlight).IsEqualTo(0);
-        using var next = await scheduler.AcquireAsync(null, CancellationToken.None);
-        await Assert.That(next.Model).IsEqualTo("glm-5.3");
+        await fixture.ScriptAsync("sleep 10\n");
+        var clock = new ManualTimeProvider();
+        var run = fixture.Engine(time: clock).RunAsync(fixture.PullRequest, CancellationToken.None);
+        try
+        {
+            var started = Stopwatch.StartNew();
+            while (!File.Exists(fixture.Runs))
+            {
+                if (started.Elapsed > TimeSpan.FromSeconds(5)) throw new TimeoutException("OCR stub did not start");
+                await Task.Delay(10);
+            }
+            clock.Advance(ReviewProvider.InactivityTimeout);
+            string? failure = null;
+            try { await run.WaitAsync(TimeSpan.FromSeconds(5)); }
+            catch (InvalidOperationException ex) { failure = ex.Message; }
+            await Assert.That(failure).IsEqualTo($"OCR made no model-call progress for {ReviewProvider.InactivityTimeout}");
+            await Assert.That((await fixture.RunsAsync()).Length).IsEqualTo(1);
+        }
+        finally
+        {
+            // The finite stub also cleans up if the watchdog regression fails.
+            try { await run; } catch (InvalidOperationException) { }
+        }
     }
 
     [Test]
-    public async Task GlmRateLimitResumesOnSolWithoutLoopingBack()
+    [Arguments(false, false)]
+    [Arguments(true, false)]
+    [Arguments(true, true)]
+    public async Task IncompleteReviewsThrowEvenWithPartialFindings(bool findings, bool reportsComplete)
     {
         await using var fixture = await Fixture.CreateAsync();
-        await fixture.ScriptAsync(
-            Report(Partial(0, 1, 1), "limited", [], failedPath: "a.cs").Replace("provider or subtask request failed", "rate_limit_error"),
-            "case \"$args\" in *'--model gpt-6.1-sol '*'--resume limited'*) ;; *) echo 'expected Sol resume' >&2; exit 2 ;; esac\n" +
-            Report("Review complete.", "done", [], status: "complete"));
-        var result = await fixture.Engine(attempts: 3, fallback: "glm-5.3")
-            .RunAsync(fixture.PullRequest, CancellationToken.None, "glm-5.3");
-        await Assert.That(result.Model).IsEqualTo("gpt-6.1-sol");
-        await Assert.That((await fixture.RunsAsync()).Length).IsEqualTo(2);
+        await fixture.ScriptAsync(Report("Provider failed", "sess-1", findings
+            ? [new { path = "a.cs", content = "A finding", start_line = 1, severity = "high" }] : [], status: reportsComplete ? "complete" : "partial", failedPath: "b.cs"));
+        string? failure = null;
+        try { await fixture.Engine().RunAsync(fixture.PullRequest, CancellationToken.None); }
+        catch (InvalidOperationException ex) { failure = ex.Message; }
+        await Assert.That(failure).IsEqualTo("ocr review failed: Provider failed");
+        await Assert.That((await fixture.RunsAsync()).Length).IsEqualTo(1);
     }
-
-    [Test]
-    [Arguments("HTTP 429: upstream exhausted", true)]
-    [Arguments("rate_limit_error", true)]
-    [Arguments("Rate limit reached", true)]
-    [Arguments("Too many requests", true)]
-    [Arguments("file 4290.cs could not be read", false)]
-    public async Task RecognizesRateLimits(string failure, bool expected) =>
-        await Assert.That(ReviewEngine.IsRateLimited(failure)).IsEqualTo(expected);
 
     [Test]
     public async Task OcrRunsOfflineOnAPartialCloneWithEverythingItReadsDownloaded()
@@ -216,7 +257,7 @@ public sealed class OcrRetryTests
             "git show \"$to:b.cs\" >/dev/null || fail 'head file missing'\n" +
             Report("Review complete: 0 finding(s) across 2 selected item(s).", "sess-1", [], status: "complete"));
 
-        var result = await fixture.Engine(attempts: 1).RunAsync(fixture.PullRequest, CancellationToken.None);
+        var result = await fixture.Engine().RunAsync(fixture.PullRequest, CancellationToken.None);
 
         await Assert.That(result.Findings.Count).IsEqualTo(0);
     }
@@ -233,9 +274,6 @@ public sealed class OcrRetryTests
             .IsEqualTo("fatal: fetch-pack: invalid index-pack output");
         await Assert.That(ReviewEngine.ErrorLine("")).IsEqualTo("no error output");
     }
-
-    private static string Partial(int findings, int failed, int selected) =>
-        $"Review partially complete: {findings} finding(s); {failed} of {selected} selected item(s) failed.";
 
     /// <summary>Shell that writes an ocr JSON report to the <c>--output</c> path.</summary>
     private static string Report(string message, string session, object[] comments, string status = "partial", string? failedPath = null)
@@ -317,20 +355,13 @@ public sealed class OcrRetryTests
             if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(_stub, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
 
-        /// <summary>An engine on the <c>review</c> model; the fallback model is off unless named.</summary>
-        public ReviewModelScheduler Scheduler(TimeSpan? slotWait = null) => new(Options(3, "glm-5.3") with { ModelSlotWaitDuration = slotWait }, NullLogger<ReviewModelScheduler>.Instance);
-
-        private ReviewerOptions Options(int attempts, string fallback) =>
-            new("http://+:8080", _forgejoUrl, "forgejo", "https://proxy.test/v1", "proxy", "gpt-6.1-sol", "TerraScale", "bot", 2,
-                TimeSpan.FromMinutes(1), "webhook-test-secret", "context-test-token", Path.Combine(_root, "context.db"), 100,
-                OcrMaxAttempts: attempts, OcrRetryBaseDelay: TimeSpan.FromMilliseconds(10), FallbackModel: fallback);
-
-        public ReviewEngine Engine(int attempts, string fallback = "", ReviewModelScheduler? scheduler = null)
-        {
-            return new ReviewEngine(Options(attempts, fallback), NullLogger<ReviewEngine>.Instance, _stub, scheduler);
-        }
+        public ReviewEngine Engine(string? ocrPath = null, string? proxyUrl = null, TimeProvider? time = null) => new(new ReviewerOptions("http://+:8080", _forgejoUrl, "forgejo",
+            proxyUrl ?? "https://proxy.test/v1", "proxy", "TerraScale", "bot",
+            "webhook-test-secret", "context-test-token", Path.Combine(_root, "context.db"), 100),
+            NullLogger<ReviewEngine>.Instance, ocrPath ?? _stub, time ?? TimeProvider.System);
 
         public string Runs => _runs;
+        public string OcrPath => _stub;
 
         public async Task<string[]> RunsAsync() => await File.ReadAllLinesAsync(_runs);
 

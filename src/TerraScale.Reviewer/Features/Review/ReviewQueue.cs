@@ -1,13 +1,11 @@
 using System.Threading.Channels;
 using System.Diagnostics;
-using TerraScale.Reviewer.Features.Configuration;
 
 namespace TerraScale.Reviewer.Features.Review;
 
 /// <summary>A request to review the current head of one pull request.</summary>
 /// <param name="HeadSha">Head the request was raised for, when known. An outdated head is skipped before reviewing; the SHA also drives deduplication.</param>
-/// <param name="Model">Model override (escalation), or <c>null</c> for the default model.</param>
-public sealed record ReviewRequest(string Owner, string Name, int Number, string? HeadSha, string? Model = null)
+public sealed record ReviewRequest(string Owner, string Name, int Number, string? HeadSha)
 {
     internal Task QueuedStatus { get; init; } = Task.CompletedTask;
     public string Key => $"{Owner}/{Name}#{Number}".ToLowerInvariant();
@@ -20,7 +18,7 @@ public enum ReviewAdmission
     Queued,
     /// <summary>The request replaced an older request that was still waiting for a worker.</summary>
     Superseded,
-    /// <summary>The same head and model is already being reviewed; the request was dropped.</summary>
+    /// <summary>The same head is already being reviewed; the request was dropped.</summary>
     Duplicate,
 }
 
@@ -41,6 +39,7 @@ public enum ReviewAdmission
 /// </remarks>
 public sealed class ReviewQueue : BackgroundService
 {
+    public const int WorkerCount = 2;
     public const string NewerHead = "a newer push replaced this head";
     public const string Closed = "the pull request was closed";
 
@@ -53,8 +52,8 @@ public sealed class ReviewQueue : BackgroundService
     private readonly Dictionary<string, Task> _publications = new(StringComparer.Ordinal);
     private readonly Channel<string> _ready = Channel.CreateUnbounded<string>(new UnboundedChannelOptions { AllowSynchronousContinuations = false });
 
-    public ReviewQueue(PullRequestReviewer reviewer, ReviewerOptions options, ILogger<ReviewQueue> logger)
-        : this(reviewer.RunAsync, reviewer.SkipAsync, options.MaxConcurrent, logger) { }
+    public ReviewQueue(PullRequestReviewer reviewer, ILogger<ReviewQueue> logger)
+        : this(reviewer.RunAsync, reviewer.SkipAsync, WorkerCount, logger) { }
 
     internal ReviewQueue(Func<ReviewRequest, CancellationToken, Task> runner, Func<ReviewRequest, string, Task> skip, int workers, ILogger<ReviewQueue> logger)
     {
@@ -73,7 +72,7 @@ public sealed class ReviewQueue : BackgroundService
             if (!_slots.TryGetValue(request.Key, out var slot)) _slots[request.Key] = slot = new PullRequestSlot();
             if (slot is { Running: { } running, StopReason: null })
             {
-                if (SameHead(running, request) && request.Model == running.Model && slot.Waiting is null)
+                if (SameHead(running, request) && slot.Waiting is null)
                 {
                     _logger.LogInformation("review for {PullRequest} at {Head} is already running; duplicate request dropped", request.Key, request.HeadSha);
                     return ReviewAdmission.Duplicate;
@@ -90,8 +89,6 @@ public sealed class ReviewQueue : BackgroundService
             if (slot.Waiting is { } waiting)
             {
                 if (NewHead(waiting, request) || request.HeadSha is null) SkipUnderLock(waiting, NewerHead);
-                // Keep an escalation alive when a plain request for the same head replaces it.
-                if (request.Model is null && SameHead(waiting, request)) request = request with { Model = waiting.Model };
                 _logger.LogInformation("review request for {PullRequest} at {Head} replaced a waiting request", request.Key, request.HeadSha);
                 admission = ReviewAdmission.Superseded;
             }
@@ -105,7 +102,9 @@ public sealed class ReviewQueue : BackgroundService
             }
             // All queued/skip writes for a PR share a chain, even across A -> B -> A
             // and across idle slots. The next runner waits for the chain here.
-            request = request with { QueuedStatus = PublishUnderLock(request.Key,
+            request = request with
+            {
+                QueuedStatus = PublishUnderLock(request.Key,
                 () =>
                 {
                     ReviewRequest admitted;
@@ -117,7 +116,8 @@ public sealed class ReviewQueue : BackgroundService
                         admitted = request;
                     }
                     return publishQueued?.Invoke(admitted) ?? Task.CompletedTask;
-                }) };
+                })
+            };
             slot.Waiting = request;
             _logger.LogInformation("review queue_depth {QueueDepth}; in_flight {InFlight}",
                 _slots.Values.Count(x => x.Waiting is not null), _slots.Values.Count(x => x.Running is not null));
@@ -138,7 +138,7 @@ public sealed class ReviewQueue : BackgroundService
             if (slot.Waiting?.QueuedStatus == request.QueuedStatus)
             {
                 if (slot is { Running: { } running, StopReason: null }
-                    && SameHead(running, prepared) && running.Model == prepared.Model)
+                    && SameHead(running, prepared))
                 { slot.Waiting = null; return null; }
                 slot.Waiting = prepared;
                 resolved = prepared;

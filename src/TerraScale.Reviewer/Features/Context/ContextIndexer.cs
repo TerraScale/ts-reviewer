@@ -14,6 +14,7 @@ public sealed class ContextIndexer : BackgroundService
     private readonly ILogger<ContextIndexer> _logger;
     private readonly string _workerId = Environment.MachineName + ":" + Environment.ProcessId + ":" + Guid.NewGuid().ToString("N");
     private const int QueueCapacity = 1024;
+    private const int FetchParallelism = 2; // Bound simultaneous Forgejo file downloads independently of review workers.
     private readonly Channel<IndexRequest> _queue;
     private readonly ConcurrentDictionary<string, TaskCompletionSource<bool>> _pending = new(StringComparer.OrdinalIgnoreCase);
 
@@ -162,7 +163,7 @@ public sealed class ContextIndexer : BackgroundService
         var tree = await _forgejo.TreeAsync(request.Owner, request.Name, request.Commit, ct);
         var files = tree.Where(x => x.Type == "blob" && x.Size is > 0 and <= 1_000_000 && IsSourceFile(x.Path)).Take(_options.ContextMaxFiles).ToList();
         var chunks = new ConcurrentBag<CodeChunk>();
-        await Parallel.ForEachAsync(files, new ParallelOptions { MaxDegreeOfParallelism = Math.Min(_options.MaxConcurrent, 16), CancellationToken = ct }, async (file, token) =>
+        await Parallel.ForEachAsync(files, new ParallelOptions { MaxDegreeOfParallelism = FetchParallelism, CancellationToken = ct }, async (file, token) =>
         {
             var content = await _forgejo.FileAsync(request.Owner, request.Name, request.Commit, file.Path, token);
             foreach (var chunk in CodeChunker.Split(file.Path, content)) chunks.Add(chunk);

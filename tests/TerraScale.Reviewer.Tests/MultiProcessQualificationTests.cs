@@ -20,7 +20,7 @@ public sealed partial class MultiProcessQualificationTests
     private const long LeaseMs = 5_000;
 
     private static ReviewerOptions Options(string database) =>
-        new("http://+:8080", "https://forgejo.test", "forgejo", "https://proxy.test/v1", "proxy", "review", "TerraScale", "bot", 2, TimeSpan.FromMinutes(1), "webhook-test-secret", "context-test-token", database, 100, 5, null, "operator-test-token");
+        new("http://+:8080", "https://forgejo.test", "forgejo", "https://proxy.test/v1", "proxy", "TerraScale", "bot", "webhook-test-secret", "context-test-token", database, 100, 5, null, "operator-test-token");
 
     /// <summary>
     /// Two real child processes share one LiteDB file. The crash child claims a
@@ -76,7 +76,6 @@ public sealed partial class MultiProcessQualificationTests
                 "--context-api-token=qualification",
                 "--operator-token=qualification",
                 $"--context-database={database}",
-                "--max-concurrent=2",
             ]);
             var workerStdout = worker.StandardOutput.ReadToEndAsync();
             var workerStderr = worker.StandardError.ReadToEndAsync();
@@ -280,7 +279,7 @@ public sealed partial class MultiProcessQualificationTests
 
     private static string Sha256(string path) => Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path))).ToLowerInvariant();
 
-    private static string RepositoryRoot()
+    internal static string RepositoryRoot()
     {
         var directory = new DirectoryInfo(AppContext.BaseDirectory);
         while (directory is not null && !directory.EnumerateFileSystemInfos(".git").Any())
