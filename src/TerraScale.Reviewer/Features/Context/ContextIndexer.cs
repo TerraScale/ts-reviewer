@@ -162,7 +162,7 @@ public sealed class ContextIndexer : BackgroundService
         var tree = await _forgejo.TreeAsync(request.Owner, request.Name, request.Commit, ct);
         var files = tree.Where(x => x.Type == "blob" && x.Size is > 0 and <= 1_000_000 && IsSourceFile(x.Path)).Take(_options.ContextMaxFiles).ToList();
         var chunks = new ConcurrentBag<CodeChunk>();
-        await Parallel.ForEachAsync(files, new ParallelOptions { MaxDegreeOfParallelism = Math.Min(_options.MaxConcurrent, 16), CancellationToken = ct }, async (file, token) =>
+        await Parallel.ForEachAsync(files, new ParallelOptions { MaxDegreeOfParallelism = 2, CancellationToken = ct }, async (file, token) =>
         {
             var content = await _forgejo.FileAsync(request.Owner, request.Name, request.Commit, file.Path, token);
             foreach (var chunk in CodeChunker.Split(file.Path, content)) chunks.Add(chunk);

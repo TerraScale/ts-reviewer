@@ -29,7 +29,7 @@ public sealed class PullRequestReviewer(ForgejoClient forgejo, ReviewEngine engi
         var sha = request.HeadSha;
         try
         {
-            logger.LogInformation("review started for {Repository}#{Number} with model {Model}", owner + "/" + name, number, request.Model ?? options.Model);
+            logger.LogInformation("review started for {Repository}#{Number} with model {Model}", owner + "/" + name, number, ReviewProvider.PrimaryModel);
             var pr = await forgejo.PullAsync(owner, name, number, ct) ?? throw new InvalidOperationException("pull request not found");
             if (sha is not null && !string.Equals(sha, pr.Head.Sha, StringComparison.OrdinalIgnoreCase))
             {
@@ -38,7 +38,7 @@ public sealed class PullRequestReviewer(ForgejoClient forgejo, ReviewEngine engi
             }
             sha = pr.Head.Sha;
             await PublishStatusAsync(owner, name, sha, "pending", "Review in progress");
-            await ReviewAsync(pr, owner, name, number, request.Model, ct);
+            await ReviewAsync(pr, owner, name, number, ct);
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
         {
@@ -86,7 +86,7 @@ public sealed class PullRequestReviewer(ForgejoClient forgejo, ReviewEngine engi
         return builder.ToString();
     }
 
-    private async Task ReviewAsync(PullRequest pr, string owner, string name, int number, string? model, CancellationToken ct)
+    private async Task ReviewAsync(PullRequest pr, string owner, string name, int number, CancellationToken ct)
     {
         var files = await forgejo.FilesAsync(owner, name, number, ct);
         string raw;
@@ -96,7 +96,7 @@ public sealed class PullRequestReviewer(ForgejoClient forgejo, ReviewEngine engi
         var parsed = UnifiedDiff.Parse(raw);
         if (parsed.Count > 0) files = parsed;
         ReviewResult result;
-        try { result = await engine.RunAsync(pr, ct, model); }
+        try { result = await engine.RunAsync(pr, ct); }
         catch (Exception ex) when (ex is not OperationCanceledException)
         { await PublishStatusAsync(owner, name, pr.Head.Sha, "error", "review incomplete: " + ex.Message); return; }
         var latest = await forgejo.PullAsync(owner, name, number, ct);
@@ -107,7 +107,7 @@ public sealed class PullRequestReviewer(ForgejoClient forgejo, ReviewEngine engi
             return;
         }
         var hasFindings = result.Findings.Count > 0;
-        var body = Format(pr, result, result.Model ?? model ?? options.Model);
+        var body = Format(pr, result, result.Model ?? ReviewProvider.PrimaryModel);
         var existing = await forgejo.CommentsAsync(owner, name, number, ct);
         var marked = existing.FirstOrDefault(x => string.Equals(x.User.Login, options.BotLogin, StringComparison.OrdinalIgnoreCase) && x.Body.StartsWith("<!-- ts-reviewer:", StringComparison.Ordinal));
         if (marked is not null) await forgejo.UpdateCommentAsync(owner, name, marked.Id, body, ct);

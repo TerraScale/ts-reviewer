@@ -83,7 +83,7 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewQueue queue, Pul
         var words = body.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         var mention = "@" + bot.ToLowerInvariant();
         for (var i = 0; i + 1 < words.Length; i++)
-            if (string.Equals(words[i], mention, StringComparison.OrdinalIgnoreCase) && words[i + 1].ToLowerInvariant() is "review" or "recheck" or "explain" or "dismiss" or "escalate") return words[i + 1].ToLowerInvariant();
+            if (string.Equals(words[i], mention, StringComparison.OrdinalIgnoreCase) && words[i + 1].ToLowerInvariant() is "review" or "recheck" or "explain" or "dismiss") return words[i + 1].ToLowerInvariant();
         return null;
     }
 
@@ -135,11 +135,8 @@ public sealed class WebhookHandler(ForgejoClient forgejo, ReviewQueue queue, Pul
                 case "review" or "recheck":
                     QueueReview(new ReviewRequest(owner, name, number, head));
                     break;
-                case "escalate":
-                    QueueReview(new ReviewRequest(owner, name, number, head, options.EscalationModel));
-                    break;
                 case "explain":
-                    await forgejo.CommentAsync(owner, name, number, $"ts-reviewer: the latest evidence and suggested fix are in the marked review comment. Use `@{options.BotLogin} recheck` after pushing a correction or `@{options.BotLogin} escalate` to re-review with {options.EscalationModel}.", CancellationToken.None);
+                    await forgejo.CommentAsync(owner, name, number, $"ts-reviewer: the latest evidence and suggested fix are in the marked review comment. Use `@{options.BotLogin} recheck` after pushing a correction.", CancellationToken.None);
                     break;
                 case "dismiss":
                     await forgejo.CommentAsync(owner, name, number, "ts-reviewer: dismissals require a maintainer workflow and are not accepted from an unverified comment.", CancellationToken.None);

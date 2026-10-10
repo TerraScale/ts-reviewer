@@ -19,7 +19,7 @@ public sealed class ReviewerTests
     private static readonly ContextEmbedder Embedder = new();
 
     private static ReviewerOptions Options(string database) =>
-        new("http://+:8080", "https://forgejo.test", "forgejo", "https://proxy.test/v1", "proxy", "gpt-6.1-sol", "TerraScale", "bot", 2, TimeSpan.FromMinutes(1), "webhook-test-secret", "context-test-token", database, 100, 5, null, "operator-test-token");
+        new("http://+:8080", "https://forgejo.test", "forgejo", "https://proxy.test/v1", "proxy", "TerraScale", "bot", TimeSpan.FromMinutes(1), "webhook-test-secret", "context-test-token", database, 100, 5, null, "operator-test-token");
 
     private static float[] UnitVector(int index)
     {
@@ -37,7 +37,7 @@ public sealed class ReviewerTests
         await Assert.That(WebhookHandler.ParseCommand("please @terrascale-bot recheck", "terrascale-bot")).IsEqualTo("recheck");
         await Assert.That(WebhookHandler.ParseCommand("@other-bot review", "terrascale-bot")).IsNull();
         await Assert.That(WebhookHandler.ParseCommand("@terrascale-bot dismiss now", "terrascale-bot")).IsEqualTo("dismiss");
-        await Assert.That(WebhookHandler.ParseCommand("please @terrascale-bot escalate this", "terrascale-bot")).IsEqualTo("escalate");
+        await Assert.That(WebhookHandler.ParseCommand("please @terrascale-bot escalate this", "terrascale-bot")).IsNull();
     }
 
     [Test]
@@ -63,103 +63,30 @@ public sealed class ReviewerTests
         await Assert.That(UnifiedDiff.ReviewPosition(files[0].Patch, 2)).IsGreaterThan(0);
     }
 
-    [Test, NotInParallel]
-    public async Task ConfigurationAcceptsExplicitArgumentsAndRejectsInvalidLimits()
-    {
-        var options = ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy", "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token", "--operator-token=operator-test-token", "--forgejo-url=https://forgejo.test/", "--proxy-url=https://proxy.test/v1/", "--timeout=00:00:05", "--max-concurrent=2", "--ocr-concurrency=2", "--ocr-max-attempts=4", "--ocr-llm-timeout=00:20:00", "--ocr-item-timeout=00:30:00"]);
-        await Assert.That(options.ForgejoUrl).IsEqualTo("https://forgejo.test");
-        await Assert.That(options.ProxyUrl).IsEqualTo("https://proxy.test/v1");
-        await Assert.That(options.MaxConcurrent).IsEqualTo(2);
-        await Assert.That(options.OcrConcurrency).IsEqualTo(2);
-        await Assert.That(options.ContextMaxAttempts).IsEqualTo(5);
-        await Assert.That(options.ContextRetryDelay).IsEqualTo(TimeSpan.FromSeconds(1));
-        await Assert.That(options.OcrMaxAttempts).IsEqualTo(4);
-        await Assert.That(options.OcrLlmTimeout).IsEqualTo(TimeSpan.FromMinutes(20));
-        await Assert.That(options.OcrItemTimeout).IsEqualTo(TimeSpan.FromMinutes(30));
+    private static readonly string[] Credentials = ["--forgejo-token=forgejo", "--proxy-token=proxy", "--webhook-secret=secret", "--context-api-token=context", "--operator-token=operator"];
 
-        foreach (var invalid in new[] { "--max-concurrent=0", "--max-concurrent=3", "--sol-slots=0", "--sol-slots=3", "--glm-slots=0", "--glm-slots=2",
-            "--sol-weight=0", "--glm-weight=-1", "--sol-weight=61", "--glm-weight=1.5", "--sol-weight=2147483647",
-            "--model-slot-wait=00:00:00", "--model-slot-wait=invalid", "--model-backoff-base-delay=-00:00:01",
-            "--model-backoff-base-delay=00:10:01", "--model-backoff-max-delay=00:00:00", "--model-backoff-max-delay=00:00:29", "--ocr-max-attempts=0", "--ocr-max-attempts=21", "--ocr-retry-base-delay=00:00:00", "--ocr-retry-base-delay=00:05:01",
-            "--ocr-llm-timeout=00:00:30", "--ocr-llm-timeout=02:00:01", "--ocr-item-timeout=00:00:59", "--ocr-item-timeout=1.00:00:01",
-            "--ocr-concurrency=0", "--ocr-concurrency=65" })
+    [Test, NotInParallel]
+    public async Task ReviewPolicyHasNoConfigurationOverrides()
+    {
+        foreach (var key in new[] { "model", "fallback-model", "escalation-model", "max-concurrent", "ocr-concurrency",
+            "ocr-max-attempts", "ocr-retry-base-delay", "sol-weight", "glm-weight", "sol-slots", "glm-slots",
+            "model-slot-wait", "model-backoff-base-delay", "model-backoff-max-delay", "ocr-llm-timeout", "ocr-item-timeout" })
         {
             var rejected = false;
-            try { ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy", "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token", "--operator-token=operator-test-token", invalid]); }
+            try { ReviewerOptions.Load([.. Credentials, "--" + key + "=1"]); }
             catch (InvalidOperationException) { rejected = true; }
             await Assert.That(rejected).IsTrue();
         }
-    }
-
-    [Test, NotInParallel]
-    public async Task ConfigurationDefaults()
-    {
-        string[] names = ["TS_REVIEWER_TIMEOUT", "TS_REVIEWER_MODEL", "TS_REVIEWER_ESCALATION_MODEL", "TS_REVIEWER_FALLBACK_MODEL", "TS_REVIEWER_MAX_CONCURRENT",
-            "TS_REVIEWER_OCR_CONCURRENCY", "TS_REVIEWER_PROXY_URL", "TS_REVIEWER_OCR_MAX_ATTEMPTS", "TS_REVIEWER_OCR_RETRY_BASE_DELAY",
-            "TS_REVIEWER_OCR_LLM_TIMEOUT", "TS_REVIEWER_OCR_ITEM_TIMEOUT", "TS_REVIEWER_CONFIG",
-            "TS_REVIEWER_SOL_WEIGHT", "TS_REVIEWER_GLM_WEIGHT", "TS_REVIEWER_SOL_SLOTS", "TS_REVIEWER_GLM_SLOTS",
-            "TS_REVIEWER_MODEL_SLOT_WAIT", "TS_REVIEWER_MODEL_BACKOFF_BASE_DELAY", "TS_REVIEWER_MODEL_BACKOFF_MAX_DELAY"];
+        // Retired environment overrides cannot select another model or raise the limits.
+        string[] names = ["TS_REVIEWER_MODEL", "TS_REVIEWER_MAX_CONCURRENT", "TS_REVIEWER_OCR_CONCURRENCY"];
         var previous = names.ToDictionary(x => x, Environment.GetEnvironmentVariable);
         try
         {
-            foreach (var name in names) Environment.SetEnvironmentVariable(name, null);
-            var options = ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy",
-                "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token",
-                "--operator-token=operator-test-token"]);
-            await Assert.That(options.Model).IsEqualTo("gpt-6.1-sol");
-            await Assert.That(options.EscalationModel).IsEqualTo("gpt-6.1-sol");
-            await Assert.That(options.FallbackModel).IsEqualTo("glm-5.3");
-            await Assert.That(options.ReviewTimeout).IsEqualTo(TimeSpan.FromHours(4));
-            await Assert.That(options.MaxConcurrent).IsEqualTo(2);
-            await Assert.That(options.SolWeight).IsEqualTo(60);
-            await Assert.That(options.GlmWeight).IsEqualTo(40);
-            await Assert.That(options.SolSlots).IsEqualTo(2);
-            await Assert.That(options.GlmSlots).IsEqualTo(1);
-            await Assert.That(options.ModelSlotWait).IsEqualTo(TimeSpan.FromMinutes(2));
-            await Assert.That(options.ModelBackoffDelay).IsEqualTo(TimeSpan.FromSeconds(30));
-            await Assert.That(options.ModelBackoffMaxDelay).IsEqualTo(TimeSpan.FromMinutes(10));
-            var constructed = Options("unused");
-            await Assert.That(constructed.ModelSlotWait).IsEqualTo(options.ModelSlotWait);
-            await Assert.That(constructed.ModelBackoffDelay).IsEqualTo(options.ModelBackoffDelay);
-            await Assert.That(constructed.ModelBackoffMaxDelay).IsEqualTo(options.ModelBackoffMaxDelay);
-            await Assert.That(options.OcrConcurrency).IsEqualTo(16);
+            foreach (var name in names) Environment.SetEnvironmentVariable(name, "retired-override");
+            var options = ReviewerOptions.Load(Credentials);
             await Assert.That(options.ProxyUrl).IsEqualTo("http://10.11.99.1:8318");
-            await Assert.That(options.OcrMaxAttempts).IsEqualTo(3);
-            await Assert.That(options.OcrRetryDelay).IsEqualTo(TimeSpan.FromSeconds(10));
-            await Assert.That(options.OcrLlmTimeout).IsEqualTo(TimeSpan.FromMinutes(20));
-            await Assert.That(options.OcrItemTimeout).IsEqualTo(TimeSpan.FromHours(1));
         }
-        finally
-        {
-            foreach (var (name, value) in previous) Environment.SetEnvironmentVariable(name, value);
-        }
-    }
-
-    [Test, NotInParallel]
-    public async Task ConfigurationRejectsAstraInAnyConfiguredModel()
-    {
-        var common = new[] { "--forgejo-token=forgejo", "--proxy-token=proxy", "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token", "--operator-token=operator-test-token" };
-        foreach (var key in new[] { "model", "fallback-model", "escalation-model" })
-        {
-            var rejected = false;
-            try { ReviewerOptions.Load([.. common, "--" + key + "=provider-Astra-v1"]); }
-            catch (InvalidOperationException ex) { rejected = ex.Message.Contains("astra", StringComparison.OrdinalIgnoreCase); }
-            await Assert.That(rejected).IsTrue();
-        }
-    }
-
-    [Test, NotInParallel]
-    public async Task ConfigurationRejectsNonCanonicalModels()
-    {
-        string[] common = ["--forgejo-token=forgejo", "--proxy-token=proxy", "--webhook-secret=secret", "--context-api-token=context", "--operator-token=operator"];
-        foreach (var invalid in new[] { "--model=glm-5.3", "--fallback-model=gpt-6.1-sol", "--fallback-model=",
-            "--escalation-model=glm-5.3", "--model=provider/gpt-6.1-sol", "--model=GPT-6.1-SOL", "--fallback-model=glm-5" })
-        {
-            var rejected = false;
-            try { ReviewerOptions.Load([.. common, invalid]); }
-            catch (InvalidOperationException) { rejected = true; }
-            await Assert.That(rejected).IsTrue();
-        }
+        finally { foreach (var (name, value) in previous) Environment.SetEnvironmentVariable(name, value); }
     }
 
     [Test, NotInParallel]
@@ -167,55 +94,20 @@ public sealed class ReviewerTests
     {
         var path = Path.GetTempFileName();
         var overridePath = Path.GetTempFileName();
-        string[] names = ["TS_REVIEWER_CONFIG", "TS_REVIEWER_SOL_WEIGHT", "TS_REVIEWER_GLM_WEIGHT", "TS_REVIEWER_SOL_SLOTS",
-            "TS_REVIEWER_GLM_SLOTS", "TS_REVIEWER_MODEL_SLOT_WAIT", "TS_REVIEWER_MODEL_BACKOFF_BASE_DELAY", "TS_REVIEWER_MODEL_BACKOFF_MAX_DELAY"];
+        string[] names = ["TS_REVIEWER_CONFIG", "TS_REVIEWER_CONTEXT_MAX_FILES"];
         var previous = names.ToDictionary(x => x, Environment.GetEnvironmentVariable);
-        string[] common = ["--forgejo-token=forgejo", "--proxy-token=proxy", "--webhook-secret=secret", "--context-api-token=context", "--operator-token=operator"];
         try
         {
             foreach (var name in names) Environment.SetEnvironmentVariable(name, null);
-            await File.WriteAllTextAsync(path, """
-                { "sol-weight": 70, "glm-weight": "30", "sol-slots": 1, "model-slot-wait": "00:03:00" }
-                """);
-            await File.WriteAllTextAsync(overridePath, """
-                { "sol-weight": 80, "glm-weight": 20, "sol-slots": 2, "model-slot-wait": "00:04:00" }
-                """);
+            await File.WriteAllTextAsync(path, "{ \"context-max-files\": 70 }");
+            await File.WriteAllTextAsync(overridePath, "{ \"context-max-files\": \"80\" }");
             Environment.SetEnvironmentVariable("TS_REVIEWER_CONFIG", path);
-            var fromFile = ReviewerOptions.Load(common);
-            await Assert.That(fromFile.SolWeight).IsEqualTo(70);
-            await Assert.That(fromFile.GlmWeight).IsEqualTo(30);
-            await Assert.That(fromFile.SolSlots).IsEqualTo(1);
-            await Assert.That(fromFile.GlmSlots).IsEqualTo(1);
-            await Assert.That(fromFile.ModelSlotWait).IsEqualTo(TimeSpan.FromMinutes(3));
-            await Assert.That(fromFile.ModelBackoffDelay).IsEqualTo(TimeSpan.FromSeconds(30));
-            var selectedFile = ReviewerOptions.Load([.. common, "--config=" + overridePath]);
-            await Assert.That(selectedFile.SolWeight).IsEqualTo(80);
-            await Assert.That(selectedFile.GlmWeight).IsEqualTo(20);
-            await Assert.That(selectedFile.ModelSlotWait).IsEqualTo(TimeSpan.FromMinutes(4));
-
-            Environment.SetEnvironmentVariable("TS_REVIEWER_SOL_WEIGHT", "55");
-            Environment.SetEnvironmentVariable("TS_REVIEWER_GLM_WEIGHT", "45");
-            Environment.SetEnvironmentVariable("TS_REVIEWER_SOL_SLOTS", "2");
-            Environment.SetEnvironmentVariable("TS_REVIEWER_GLM_SLOTS", "1");
-            Environment.SetEnvironmentVariable("TS_REVIEWER_MODEL_SLOT_WAIT", "00:05:00");
-            Environment.SetEnvironmentVariable("TS_REVIEWER_MODEL_BACKOFF_BASE_DELAY", "00:00:45");
-            Environment.SetEnvironmentVariable("TS_REVIEWER_MODEL_BACKOFF_MAX_DELAY", "00:12:00");
-            var fromEnvironment = ReviewerOptions.Load(common);
-            await Assert.That(fromEnvironment.SolWeight).IsEqualTo(55);
-            await Assert.That(fromEnvironment.GlmWeight).IsEqualTo(45);
-            await Assert.That(fromEnvironment.SolSlots).IsEqualTo(2);
-            await Assert.That(fromEnvironment.GlmSlots).IsEqualTo(1);
-            await Assert.That(fromEnvironment.ModelSlotWait).IsEqualTo(TimeSpan.FromMinutes(5));
-            await Assert.That(fromEnvironment.ModelBackoffDelay).IsEqualTo(TimeSpan.FromSeconds(45));
-            await Assert.That(fromEnvironment.ModelBackoffMaxDelay).IsEqualTo(TimeSpan.FromMinutes(12));
-            var fromArguments = ReviewerOptions.Load([.. common, "--sol-weight=65", "--glm-weight=35", "--sol-slots=1",
-                "--model-slot-wait=00:06:00", "--model-backoff-base-delay=00:01:00", "--model-backoff-max-delay=00:15:00"]);
-            await Assert.That(fromArguments.SolWeight).IsEqualTo(65);
-            await Assert.That(fromArguments.GlmWeight).IsEqualTo(35);
-            await Assert.That(fromArguments.SolSlots).IsEqualTo(1);
-            await Assert.That(fromArguments.ModelSlotWait).IsEqualTo(TimeSpan.FromMinutes(6));
-            await Assert.That(fromArguments.ModelBackoffDelay).IsEqualTo(TimeSpan.FromMinutes(1));
-            await Assert.That(fromArguments.ModelBackoffMaxDelay).IsEqualTo(TimeSpan.FromMinutes(15));
+            await Assert.That(ReviewerOptions.Load(Credentials).ContextMaxFiles).IsEqualTo(70);
+            await Assert.That(ReviewerOptions.Load([.. Credentials, "--config=" + overridePath]).ContextMaxFiles).IsEqualTo(80);
+            Environment.SetEnvironmentVariable("TS_REVIEWER_CONTEXT_MAX_FILES", "55");
+            await Assert.That(ReviewerOptions.Load(Credentials).ContextMaxFiles).IsEqualTo(55);
+            await Assert.That(ReviewerOptions.Load([.. Credentials, "--context-max-files=65"]).ContextMaxFiles).IsEqualTo(65);
+            await Assert.That(ReviewerOptions.Load([.. Credentials, "--forgejo-url=https://forgejo.test/"]).ForgejoUrl).IsEqualTo("https://forgejo.test");
         }
         finally
         {
@@ -249,19 +141,6 @@ public sealed class ReviewerTests
             await Assert.That(rejected).IsTrue();
         }
         finally { File.Delete(path); }
-    }
-
-    [Test]
-    public async Task ReviewEngineRejectsAnAstraModelOverride()
-    {
-        var options = Options(Path.Combine(Path.GetTempPath(), "ts-reviewer-model-" + Guid.NewGuid().ToString("N") + ".db"));
-        var engine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance);
-        var repository = new Repository(new Owner("TerraScale"), "widgets");
-        var pullRequest = new PullRequest(14, "Test", "", new Branch("base", "main", repository), new Branch("head", "feature", repository));
-        var rejected = false;
-        try { await engine.RunAsync(pullRequest, CancellationToken.None, "provider-Astra-v1"); }
-        catch (InvalidOperationException ex) { rejected = ex.Message.Contains("astra", StringComparison.OrdinalIgnoreCase); }
-        await Assert.That(rejected).IsTrue();
     }
 
     [Test]
@@ -316,17 +195,19 @@ public sealed class ReviewerTests
         await Assert.That(formatted.Contains("<summary>Suggested fix</summary>")).IsTrue();
         await Assert.That(formatted.Contains("model")).IsFalse();
 
-        var escalated = PullRequestReviewer.Format(pullRequest, new ReviewResult("ignored", [finding]), "gpt-6.1-sol");
-        await Assert.That(escalated.Contains("model `gpt-6.1-sol`")).IsTrue();
+        var withModel = PullRequestReviewer.Format(pullRequest, new ReviewResult("ignored", [finding]), "glm-5.3");
+        await Assert.That(withModel.Contains("model `glm-5.3`")).IsTrue();
     }
 
     [Test]
-    [Arguments("high", "REQUEST_CHANGES", "failure", false)]
-    [Arguments("medium", "REQUEST_CHANGES", "failure", false)]
-    [Arguments("low", "REQUEST_CHANGES", "failure", false)]
-    [Arguments(null, "APPROVED", "success", false)]
-    [Arguments(null, "APPROVED", "success", true)]
-    public async Task ReviewEngineRunsOcrOverAClonedPullRequestRange(string? severity, string expectedEvent, string expectedStatus, bool rejectReview)
+    [Arguments("high", "REQUEST_CHANGES", "failure", false, false)]
+    [Arguments("medium", "REQUEST_CHANGES", "failure", false, false)]
+    [Arguments("low", "REQUEST_CHANGES", "failure", false, false)]
+    [Arguments(null, "APPROVED", "success", false, false)]
+    [Arguments(null, "APPROVED", "success", true, false)]
+    [Arguments(null, "", "error", false, true)]
+    [Arguments("high", "", "error", false, true)]
+    public async Task ReviewEngineRunsOcrOverAClonedPullRequestRange(string? severity, string expectedEvent, string expectedStatus, bool rejectReview, bool incomplete)
     {
         if (!ToolAvailable("git") || !ToolAvailable("chmod")) throw new TUnit.Core.Exceptions.SkipTestException("requires a POSIX host with git and chmod");
 
@@ -367,8 +248,8 @@ public sealed class ReviewerTests
                 "cat \"" + review + "\" > \"$out\"\n");
             await File.WriteAllTextAsync(review, JsonSerializer.Serialize(new
             {
-                status = "complete",
-                message = "Review complete.",
+                status = incomplete ? "partial" : "complete",
+                message = incomplete ? "A file group failed" : "Review complete.",
                 comments = severity is null ? [] : new object[]
                 {
                     new { path = "a.cs", content = "Empty method body hides the failure path.", suggestion_code = "public void B() { throw new NotSupportedException(); }", existing_code = "public void B() { }", start_line = 1, end_line = 1, category = "bug", severity },
@@ -381,34 +262,38 @@ public sealed class ReviewerTests
             var engine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, Path.Combine(stub, "ocr"));
             var repository = new Repository(new Owner("TerraScale"), "widgets");
             var pullRequest = new PullRequest(9, "Test change", "", new Branch(baseSha, "main", repository), new Branch(headSha, "feature", repository));
-            var result = await engine.RunAsync(pullRequest, CancellationToken.None);
-            await Assert.That(result.Findings.Count).IsEqualTo(expectedFindings);
-            if (severity is not null)
+            if (incomplete)
             {
-                await Assert.That(result.Findings[0].Path).IsEqualTo("a.cs");
-                await Assert.That(result.Findings[0].Severity).IsEqualTo(severity);
+                var failed = false;
+                try { await engine.RunAsync(pullRequest, CancellationToken.None); }
+                catch (InvalidOperationException) { failed = true; }
+                await Assert.That(failed).IsTrue();
+            }
+            else
+            {
+                var result = await engine.RunAsync(pullRequest, CancellationToken.None);
+                await Assert.That(result.Findings.Count).IsEqualTo(expectedFindings);
+                if (severity is not null)
+                {
+                    await Assert.That(result.Findings[0].Path).IsEqualTo("a.cs");
+                    await Assert.That(result.Findings[0].Severity).IsEqualTo(severity);
+                }
             }
             var recorded = await File.ReadAllTextAsync(log);
             await Assert.That(recorded.Contains("--from " + baseSha)).IsTrue();
             await Assert.That(recorded.Contains("--to " + headSha)).IsTrue();
             await Assert.That(recorded.Contains("--format json")).IsTrue();
-            await Assert.That(recorded.Contains("--concurrency 16")).IsTrue();
-            await Assert.That(recorded.Contains("OCR_LLM_URL=https://proxy.test/v1")).IsTrue();
-            await Assert.That(recorded.Contains("OCR_LLM_TOKEN=proxy")).IsTrue();
-            await Assert.That(recorded.Contains("--model gpt-6.1-sol ")).IsTrue();
+            await Assert.That(recorded.Contains("--background " + ReviewEngine.ZeroConfigurationRule)).IsTrue();
+            await Assert.That(recorded.Contains("--concurrency 1")).IsTrue();
+            await Assert.That(recorded.Contains("OCR_LLM_URL=http://127.0.0.1:")).IsTrue();
+            await Assert.That(recorded.Contains("OCR_LLM_TOKEN=")).IsTrue();
+            await Assert.That(recorded.Contains("--model glm-5.3 ")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_MODEL")).IsFalse();
             await Assert.That(recorded.Contains("OCR_LLM_PROTOCOL=anthropic")).IsTrue();
-            await Assert.That(recorded.Contains("--timeout 60 ")).IsTrue();
+            await Assert.That(recorded.Contains("--timeout 180 ")).IsTrue();
             await Assert.That(recorded.Contains("--resume")).IsFalse();
-            await Assert.That(recorded.Contains("OCR_LLM_TIMEOUT=1200")).IsTrue();
+            await Assert.That(recorded.Contains("OCR_LLM_TIMEOUT=10800")).IsTrue();
             await Assert.That(recorded.Contains("OCR_ENABLE_TELEMETRY=false")).IsTrue();
-
-            // An escalated review re-runs the same head on the escalation model.
-            await engine.RunAsync(pullRequest, CancellationToken.None, "gpt-6.1-sol");
-            recorded = await File.ReadAllTextAsync(log);
-            await Assert.That(recorded.Contains("--model gpt-6.1-sol ")).IsTrue();
-            await Assert.That(recorded.Contains("--from " + baseSha)).IsTrue();
-            await Assert.That(recorded.Contains("--to " + headSha)).IsTrue();
 
             // Exercise the real webhook-to-HTTP publication path. Forgejo uses
             // APPROVED, not GitHub's APPROVE; the latter creates a pending draft.
@@ -430,97 +315,21 @@ public sealed class ReviewerTests
             });
             var pendingStatus = await transport.PendingStatus.Task.WaitAsync(TimeSpan.FromSeconds(30));
             var publishedStatus = await transport.Status.Task.WaitAsync(TimeSpan.FromSeconds(30));
-            var publishedReview = await transport.Review.Task.WaitAsync(TimeSpan.FromSeconds(30));
             await Assert.That(pendingStatus.GetProperty("state").GetString()).IsEqualTo("pending");
-            await Assert.That(publishedReview.GetProperty("event").GetString()).IsEqualTo(expectedEvent);
-            await Assert.That(publishedReview.GetProperty("commit_id").GetString()).IsEqualTo(headSha);
-            await Assert.That(publishedReview.GetProperty("comments").GetArrayLength()).IsEqualTo(expectedFindings);
             await Assert.That(publishedStatus.GetProperty("state").GetString()).IsEqualTo(expectedStatus);
+            if (incomplete)
+            {
+                await Assert.That(transport.Review.Task.IsCompleted).IsFalse();
+                await Assert.That(publishedStatus.GetProperty("description").GetString()!.Contains("A file group failed")).IsTrue();
+            }
+            else
+            {
+                var publishedReview = await transport.Review.Task.WaitAsync(TimeSpan.FromSeconds(30));
+                await Assert.That(publishedReview.GetProperty("event").GetString()).IsEqualTo(expectedEvent);
+                await Assert.That(publishedReview.GetProperty("commit_id").GetString()).IsEqualTo(headSha);
+                await Assert.That(publishedReview.GetProperty("comments").GetArrayLength()).IsEqualTo(expectedFindings);
+            }
             await queue.StopAsync(CancellationToken.None);
-        }
-        finally
-        {
-            try { Directory.Delete(root, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
-        }
-    }
-
-    [Test]
-    public async Task OcrRetryDelayDoublesAndCapsAtTenMinutes()
-    {
-        await Assert.That(ReviewEngine.RetryDelay(TimeSpan.FromSeconds(30), 1)).IsEqualTo(TimeSpan.FromSeconds(30));
-        await Assert.That(ReviewEngine.RetryDelay(TimeSpan.FromSeconds(30), 3)).IsEqualTo(TimeSpan.FromMinutes(2));
-        await Assert.That(ReviewEngine.RetryDelay(TimeSpan.FromSeconds(30), 5)).IsEqualTo(TimeSpan.FromMinutes(8));
-        await Assert.That(ReviewEngine.RetryDelay(TimeSpan.FromMinutes(5), 10)).IsEqualTo(TimeSpan.FromMinutes(10));
-        await Assert.That(ReviewEngine.RetryDelay(TimeSpan.FromSeconds(30), int.MaxValue)).IsEqualTo(TimeSpan.FromMinutes(10));
-    }
-
-    [Test]
-    public async Task ResumeSessionIsReadFromOcrsRetryHint()
-    {
-        await Assert.That(ReviewEngine.ResumeSession("review failed: all 8 file review(s) failed\n[ocr] Session: 01J9Z-abc_1 (retry with: --resume 01J9Z-abc_1)\n")).IsEqualTo("01J9Z-abc_1");
-        await Assert.That(ReviewEngine.ResumeSession("load resume session: open: no such file")).IsNull();
-    }
-
-    [Test]
-    public async Task ReviewEngineRetriesFailedOcrRuns()
-    {
-        if (!ToolAvailable("git") || !ToolAvailable("chmod")) throw new TUnit.Core.Exceptions.SkipTestException("requires a POSIX host with git and chmod");
-
-        var root = Path.Combine(Path.GetTempPath(), "ts-reviewer-retry-" + Guid.NewGuid().ToString("N"));
-        var stub = Path.Combine(root, "stub");
-        Directory.CreateDirectory(stub);
-        var work = Path.Combine(root, "work");
-        try
-        {
-            var remote = Path.Combine(root, "TerraScale", "widgets.git");
-            Directory.CreateDirectory(Path.GetDirectoryName(remote)!);
-            await RunGitAsync(root, "init", "--quiet", "-b", "main", "--bare", remote);
-            Directory.CreateDirectory(work);
-            await RunGitAsync(root, "clone", "--quiet", remote, work);
-            await RunGitAsync(work, "config", "user.email", "review@test");
-            await RunGitAsync(work, "config", "user.name", "review");
-            await File.WriteAllTextAsync(Path.Combine(work, "a.cs"), "class A {}\n");
-            await RunGitAsync(work, "add", ".");
-            await RunGitAsync(work, "commit", "--quiet", "-m", "base");
-            var baseSha = (await RunGitAsync(work, "rev-parse", "HEAD")).Trim();
-            await File.WriteAllTextAsync(Path.Combine(work, "a.cs"), "class A { public void B() { } }\n");
-            await RunGitAsync(work, "add", ".");
-            await RunGitAsync(work, "commit", "--quiet", "-m", "head");
-            var headSha = (await RunGitAsync(work, "rev-parse", "HEAD")).Trim();
-            await RunGitAsync(work, "push", "--quiet", "origin", baseSha + ":refs/heads/main", headSha + ":refs/pull/9/head");
-
-            // Each retryable failure mode in turn: a run that fails like an
-            // exhausted LLM endpoint, one that exits cleanly without output,
-            // one that writes corrupt JSON, and a partial review with no
-            // findings; the fifth run succeeds.
-            var attempts = Path.Combine(stub, "attempts");
-            await File.WriteAllTextAsync(Path.Combine(stub, "ocr"),
-                "#!/bin/sh\n" +
-                "echo run >> \"" + attempts + "\"\n" +
-                "count=$(wc -l < \"" + attempts + "\")\n" +
-                "out=\"\"; while [ $# -gt 0 ]; do case $1 in --output) out=$2 ;; esac; shift; done\n" +
-                "if [ \"$count\" -eq 1 ]; then echo 'all 1 file review(s) failed' >&2; exit 1; fi\n" +
-                "if [ \"$count\" -eq 2 ]; then exit 0; fi\n" +
-                "if [ \"$count\" -eq 3 ]; then echo '{\"status\":' > \"$out\"; exit 0; fi\n" +
-                "if [ \"$count\" -eq 4 ]; then echo '{\"status\":\"partial\",\"message\":\"0 of 1 selected items reviewed\",\"comments\":[]}' > \"$out\"; exit 0; fi\n" +
-                "echo '{\"status\":\"complete\",\"message\":\"Review complete.\",\"comments\":[]}' > \"$out\"\n");
-            await RunChmodAsync(Path.Combine(stub, "ocr"));
-
-            var options = Options(Path.Combine(root, "context.db")) with { ForgejoUrl = root, OcrMaxAttempts = 5, OcrRetryBaseDelay = TimeSpan.FromMilliseconds(10) };
-            var engine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, Path.Combine(stub, "ocr"));
-            var repository = new Repository(new Owner("TerraScale"), "widgets");
-            var pullRequest = new PullRequest(9, "Test change", "", new Branch(baseSha, "main", repository), new Branch(headSha, "feature", repository));
-            var result = await engine.RunAsync(pullRequest, CancellationToken.None);
-            await Assert.That(result.Findings.Count).IsEqualTo(0);
-            await Assert.That((await File.ReadAllLinesAsync(attempts)).Length).IsEqualTo(5);
-
-            // Exhausting every attempt surfaces the last failure.
-            await File.WriteAllTextAsync(attempts, string.Empty);
-            var limited = new ReviewEngine(options with { OcrMaxAttempts = 1 }, NullLogger<ReviewEngine>.Instance, Path.Combine(stub, "ocr"));
-            var failed = false;
-            try { await limited.RunAsync(pullRequest, CancellationToken.None); }
-            catch (InvalidOperationException) { failed = true; }
-            await Assert.That(failed).IsTrue();
         }
         finally
         {
@@ -877,7 +686,7 @@ public sealed class ReviewerTests
     private static async Task<(WebhookHandler Handler, ReviewQueue Queue)> StartWebhookAsync(ForgejoClient forgejo, ReviewEngine engine, ContextIndexer indexer, ReviewerOptions options)
     {
         var reviewer = new PullRequestReviewer(forgejo, engine, options, NullLogger<PullRequestReviewer>.Instance);
-        var queue = new ReviewQueue(reviewer, options, NullLogger<ReviewQueue>.Instance);
+        var queue = new ReviewQueue(reviewer, NullLogger<ReviewQueue>.Instance);
         await queue.StartAsync(CancellationToken.None);
         return (new WebhookHandler(forgejo, queue, reviewer, indexer, options, NullLogger<WebhookHandler>.Instance), queue);
     }

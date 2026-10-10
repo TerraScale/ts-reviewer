@@ -22,10 +22,7 @@ builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
 builder.Logging.AddFilter("System.Net.Http.HttpClient", LogLevel.Warning);
 builder.Services.AddSingleton(options);
 builder.Services.AddHttpClient<ForgejoClient>();
-builder.Services.AddSingleton<ReviewModelScheduler>();
-builder.Services.AddSingleton(serviceProvider => new ReviewEngine(options,
-    serviceProvider.GetRequiredService<ILogger<ReviewEngine>>(),
-    scheduler: serviceProvider.GetRequiredService<ReviewModelScheduler>()));
+builder.Services.AddSingleton<ReviewEngine>();
 builder.Services.AddSingleton<PullRequestReviewer>();
 builder.Services.AddSingleton<ReviewQueue>();
 builder.Services.AddHostedService(serviceProvider => serviceProvider.GetRequiredService<ReviewQueue>());
@@ -50,6 +47,6 @@ app.MapGet("/context/healthz", async (ContextStore store, CancellationToken canc
 app.MapGet("/admin/context/dead-letter", ContextEndpoints.DeadLetters);
 app.MapPost("/admin/context/dead-letter/replay", ContextEndpoints.ReplayDeadLetterAsync);
 app.Lifetime.ApplicationStarted.Register(() =>
-    app.Logger.LogInformation("ts-reviewer listening on {Address}; sol_share {SolWeight}; glm_share {GlmWeight}; max_concurrent {MaxConcurrent}; sol_slots {SolSlots}; glm_slots {GlmSlots}; model_slot_wait {ModelSlotWait}",
-        options.ListenUrl, options.SolWeight, options.GlmWeight, options.MaxConcurrent, options.SolSlots, options.GlmSlots, options.ModelSlotWait));
+    app.Logger.LogInformation("ts-reviewer listening on {Address}; primary {PrimaryModel}; fallback {FallbackModel}; max_concurrent {MaxConcurrent}; file_groups 1; max_attempts {MaxAttempts}",
+        options.ListenUrl, ReviewProvider.PrimaryModel, ReviewProvider.FallbackModel, ReviewQueue.WorkerCount, ReviewProvider.MaxAttempts));
 await app.RunAsync();

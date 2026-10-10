@@ -13,8 +13,8 @@ var leaseLifetime = args.Length == 3 && long.TryParse(args[2], out var parsed) &
     : TimeSpan.FromMilliseconds(100);
 
 var options = new ReviewerOptions(
-    "http://localhost:0", "https://forgejo.test", "forgejo", "https://proxy.test/v1", "proxy", "review",
-    "TerraScale", "bot", 1, TimeSpan.FromMinutes(1), "webhook", "context", args[0], 10);
+    "http://localhost:0", "https://forgejo.test", "forgejo", "https://proxy.test/v1", "proxy",
+    "TerraScale", "bot", TimeSpan.FromMinutes(1), "webhook", "context", args[0], 10);
 using var store = new ContextStore(options);
 var token = store.TryClaimIndexJob("TerraScale/widgets", commit, "crash-child", leaseLifetime);
 if (token is null)
