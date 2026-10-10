@@ -12,29 +12,27 @@ concurrency:
   cancel-in-progress: ${{ forgejo.ref != 'refs/heads/main' }}
 
 jobs:
-  zero-config:
-    name: Reject new configuration switches
+  # TS-795 switch guard: fails when the change adds an on/off setting.
+  # Same text in every repo; ts-builder's scripts/bump-ci-ref.sh moves the pinned ref.
+  guard:
     runs-on: terrascale-builder
     timeout-minutes: 10
     steps:
-      - name: Check out the exact change with its history
-        uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           github-server-url: https://git.terrascale.tech
           ref: ${{ forgejo.event.pull_request.head.sha || forgejo.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Check out the shared TerraScale policy
-        uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           github-server-url: https://git.terrascale.tech
           repository: TerraScale/ts-builder
-          ref: deb6b6011710d8d80f8482f636406ca1390983f0
+          ref: deb6b6011710d8d80f8482f636406ca1390983f0 # guard ref
           path: .zero-config-policy
           token: ${{ secrets.TERRASCALE_BOT_TOKEN }}
           persist-credentials: false
-      - name: Check the added lines
-        env:
+      - env:
           ZERO_CONFIG_BASE: ${{ forgejo.event.pull_request.base.sha || forgejo.event.before }}
           ZERO_CONFIG_HEAD: ${{ forgejo.event.pull_request.head.sha || forgejo.sha }}
         run: |
@@ -44,20 +42,13 @@ jobs:
           fi
           python3 .zero-config-policy/scripts/zero-config-check.py "$ZERO_CONFIG_BASE" "$ZERO_CONFIG_HEAD"
 
-  ci:
-    needs: [zero-config]
-    name: Check and build ts-reviewer
+  check:
     runs-on: terrascale-builder
     timeout-minutes: 30
-    env:
-      FORGEJO_SHA: ${{ forgejo.sha }}
     steps:
-      - name: Check out the event revision
-        uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          github-server-url: "https://git.terrascale.tech"
-          ref: ${{ forgejo.sha }}
-          fetch-depth: 1
+          github-server-url: https://git.terrascale.tech
           persist-credentials: false
 
       - name: Restore reviewer tests
@@ -73,6 +64,23 @@ jobs:
           dotnet run scripts/check-nuget-vulnerabilities.cs
           src/TerraScale.Reviewer/TerraScale.Reviewer.csproj
           tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj
+
+  build:
+    needs: [guard, check]
+    runs-on: terrascale-builder
+    timeout-minutes: 30
+    env:
+      FORGEJO_SHA: ${{ forgejo.sha }}
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          github-server-url: https://git.terrascale.tech
+          persist-credentials: false
+
+      - name: Restore reviewer tests
+        run: >-
+          dotnet restore tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj
+          --runtime linux-x64 --nologo
 
       - name: Build reviewer tests and service
         run: >-
