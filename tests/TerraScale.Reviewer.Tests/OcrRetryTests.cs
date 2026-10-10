@@ -28,11 +28,11 @@ public sealed class OcrRetryTests
     {
         if (!OperatingSystem.IsLinux() || RuntimeInformation.ProcessArchitecture != Architecture.X64)
             throw new TUnit.Core.Exceptions.SkipTestException("requires the production Linux x64 OCR binary");
+        await using var fixture = await Fixture.CreateAsync(servePartialClones: true);
         string binary;
         using (var preparation = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
-            binary = await PinnedOcrAsync(preparation.Token);
+            binary = await PinnedOcrAsync(fixture.OcrPath, preparation.Token);
         using var deadline = new CancellationTokenSource(TimeSpan.FromMinutes(2));
-        await using var fixture = await Fixture.CreateAsync(servePartialClones: true);
         var builder = WebApplication.CreateSlimBuilder();
         builder.Configuration.Sources.Clear();
         builder.Logging.ClearProviders();
@@ -83,7 +83,7 @@ public sealed class OcrRetryTests
         await Assert.That(decodedRead).IsTrue();
     }
 
-    private static async Task<string> PinnedOcrAsync(CancellationToken ct)
+    private static async Task<string> PinnedOcrAsync(string binary, CancellationToken ct)
     {
         var root = Path.GetFullPath("../../../../../", AppContext.BaseDirectory);
         var containerfile = await File.ReadAllLinesAsync(Path.Combine(root, "Containerfile"), ct);
@@ -99,7 +99,6 @@ public sealed class OcrRetryTests
         while (tar.GetNextEntry() is { } entry)
         {
             if (entry.Name != "package/bin/opencodereview") continue;
-            var binary = Path.Combine(assets, "ocr");
             await using (var output = File.Create(binary)) await entry.DataStream!.CopyToAsync(output, ct);
             if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(binary, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
             return binary;
@@ -325,6 +324,7 @@ public sealed class OcrRetryTests
             NullLogger<ReviewEngine>.Instance, ocrPath ?? _stub);
 
         public string Runs => _runs;
+        public string OcrPath => _stub;
 
         public async Task<string[]> RunsAsync() => await File.ReadAllLinesAsync(_runs);
 
