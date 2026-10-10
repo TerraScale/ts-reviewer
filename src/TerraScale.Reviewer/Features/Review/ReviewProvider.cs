@@ -141,6 +141,13 @@ internal sealed class ReviewProvider : IAsyncDisposable
             Failure = $"GLM review step {step} failed after {MaxAttempts} attempts: {reason}";
             throw new InvalidOperationException(Failure);
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested && _lifetime is { IsCancellationRequested: false })
+        {
+            // Latch before releasing the call lock so OCR cannot reopen a partly spent budget.
+            Failure = "OCR disconnected during a model call; review stopped to preserve its retry budget";
+            _logger.LogError("review {Review}; step {Step}; {Reason}", _review, _step, Failure);
+            throw new InvalidOperationException(Failure);
+        }
         finally
         {
             _inactivity?.CancelAfter(InactivityTimeout);

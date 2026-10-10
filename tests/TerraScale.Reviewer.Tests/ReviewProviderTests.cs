@@ -441,6 +441,53 @@ public sealed class ReviewProviderTests
     [Test]
     [Arguments(false)]
     [Arguments(true)]
+    public async Task LocalDisconnectCannotReopenAPartlySpentRetryBudget(bool backoff)
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stopped = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var log = new CaptureLogger();
+        var transport = new Transport(async (attempt, _, ct) =>
+        {
+            if (!backoff && attempt == 29)
+            {
+                started.TrySetResult();
+                try { await Task.Delay(Timeout.InfiniteTimeSpan, ct); }
+                finally { stopped.TrySetResult(); }
+            }
+            return new HttpResponseMessage(HttpStatusCode.TooManyRequests);
+        });
+        await using var provider = new ReviewProvider(Options, log, "review", new HttpClient(transport), async (_, ct) =>
+        {
+            if (backoff && transport.Models.Count == 29)
+            {
+                started.TrySetResult();
+                try { await Task.Delay(Timeout.InfiniteTimeSpan, ct); }
+                finally { stopped.TrySetResult(); }
+            }
+        });
+        await provider.StartAsync(CancellationToken.None);
+        using var client = new HttpClient();
+        client.DefaultRequestHeaders.Add("x-api-key", provider.Token);
+        using var disconnect = new CancellationTokenSource();
+        var request = client.PostAsJsonAsync(provider.Url + "/v1/messages", Request(), disconnect.Token);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        disconnect.Cancel();
+        var cancelled = false;
+        try { using var response = await request; } catch (OperationCanceledException) { cancelled = true; }
+        await Assert.That(cancelled).IsTrue();
+        await stopped.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        using var retry = await client.PostAsJsonAsync(provider.Url + "/v1/messages", Request());
+        await Assert.That(retry.StatusCode).IsEqualTo(HttpStatusCode.BadRequest);
+        await Assert.That(await retry.Content.ReadAsStringAsync()).Contains("OCR disconnected during a model call");
+        await Assert.That(provider.Failure).Contains("preserve its retry budget");
+        await Assert.That(transport.Models.Count).IsEqualTo(29);
+        await Assert.That(provider.Lifetime.IsCancellationRequested).IsFalse();
+        await Assert.That(log.Messages.Any(x => x.Contains("review review; step 1; OCR disconnected"))).IsTrue();
+    }
+
+    [Test]
+    [Arguments(false)]
+    [Arguments(true)]
     public async Task InactivityWatchdogPausesForActiveCallsAndRetryBackoff(bool backoff)
     {
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
