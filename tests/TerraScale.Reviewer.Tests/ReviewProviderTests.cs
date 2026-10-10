@@ -367,6 +367,49 @@ public sealed class ReviewProviderTests
     }
 
     [Test]
+    [Arguments(false)]
+    [Arguments(true)]
+    public async Task ReviewCancellationOrDisposalStopsAnActiveLocalHttpCall(bool dispose)
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stopped = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var transport = new Transport(async (_, model, ct) =>
+        {
+            started.TrySetResult();
+            try { await Task.Delay(Timeout.InfiniteTimeSpan, ct); }
+            finally { stopped.TrySetResult(); }
+            return Success(model);
+        });
+        using var review = new CancellationTokenSource();
+        var provider = Create(transport);
+        using var client = new HttpClient();
+        Task? disposal = null;
+        try
+        {
+            await provider.StartAsync(review.Token);
+            client.DefaultRequestHeaders.Add("x-api-key", provider.Token);
+            var request = client.PostAsJsonAsync(provider.Url + "/v1/messages", Request());
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            if (dispose) disposal = provider.DisposeAsync().AsTask();
+            else review.Cancel();
+            await stopped.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            try
+            {
+                using var response = await request.WaitAsync(TimeSpan.FromSeconds(5));
+                await Assert.That(response.IsSuccessStatusCode).IsFalse();
+            }
+            catch (HttpRequestException) when (dispose) { } // Disposing the listener can close its client connection.
+            await Assert.That(transport.Models.Count).IsEqualTo(1);
+            await Assert.That(provider.Failure).IsNull();
+        }
+        finally
+        {
+            client.Dispose();
+            await (disposal ?? provider.DisposeAsync().AsTask());
+        }
+    }
+
+    [Test]
     public async Task EachReviewSerializesModelCallsAndAuthenticatesItsLocalEndpoint()
     {
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);

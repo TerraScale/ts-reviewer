@@ -23,6 +23,7 @@ internal sealed class ReviewProvider : IAsyncDisposable
     private readonly Func<TimeSpan, CancellationToken, Task> _delay;
     private readonly SemaphoreSlim _serial = new(1);
     private readonly HashSet<string> _models = [];
+    private CancellationTokenSource? _lifetime;
     private WebApplication? _app;
     private int _step;
 
@@ -43,6 +44,7 @@ internal sealed class ReviewProvider : IAsyncDisposable
 
     internal async Task StartAsync(CancellationToken ct)
     {
+        _lifetime = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions { Args = [], ApplicationName = typeof(ReviewProvider).Assembly.FullName });
         builder.Configuration.Sources.Clear();
         builder.Logging.ClearProviders();
@@ -63,6 +65,8 @@ internal sealed class ReviewProvider : IAsyncDisposable
         if (!CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(request.Headers["x-api-key"].ToString()), Encoding.UTF8.GetBytes(Token))
             && !CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(request.Headers.Authorization.ToString()), Encoding.UTF8.GetBytes("Bearer " + Token)))
             return Results.Unauthorized();
+        using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetime!.Token);
+        ct = lifetime.Token;
         try
         {
             var body = await JsonNode.ParseAsync(request.Body, cancellationToken: ct) as JsonObject
@@ -238,7 +242,9 @@ internal sealed class ReviewProvider : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        _lifetime?.Cancel();
         if (_app is not null) await _app.DisposeAsync();
+        _lifetime?.Dispose();
         _http.Dispose();
         _serial.Dispose();
     }
