@@ -148,6 +148,7 @@ internal sealed class ReviewProvider : IAsyncDisposable
             || !root.TryGetProperty("content", out var content) || content.ValueKind != JsonValueKind.Array || content.GetArrayLength() == 0)
             throw new InvalidOperationException("provider returned an empty, malformed or unexpected-model response");
         var usable = false;
+        var hasTool = false;
         foreach (var block in content.EnumerateArray())
         {
             if (block.ValueKind != JsonValueKind.Object || !block.TryGetProperty("type", out var kind))
@@ -165,12 +166,15 @@ internal sealed class ReviewProvider : IAsyncDisposable
                         || !block.TryGetProperty("input", out var input) || input.ValueKind != JsonValueKind.Object)
                         throw new InvalidOperationException("provider returned a malformed tool call");
                     usable = true;
+                    hasTool = true;
                     break;
                 case "thinking" or "redacted_thinking": break;
                 default: throw new InvalidOperationException("provider returned an unsupported content block");
             }
         }
         if (!usable) throw new InvalidOperationException("provider returned no text or tool call");
+        if (hasTool != (stop.GetString() == "tool_use"))
+            throw new InvalidOperationException("provider returned content inconsistent with stop_reason");
     }
 
     private static string ProviderError(string json)

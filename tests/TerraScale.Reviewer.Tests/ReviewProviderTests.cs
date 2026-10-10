@@ -16,7 +16,7 @@ public sealed class ReviewProviderTests
 
     private static JsonObject Request() => new() { ["model"] = "ignored", ["messages"] = new JsonArray(), ["stream"] = false };
 
-    private static HttpResponseMessage Success(string model, object[]? content = null) => new(HttpStatusCode.OK)
+    private static HttpResponseMessage Success(string model, object[]? content = null, string stopReason = "end_turn") => new(HttpStatusCode.OK)
     {
         Content = JsonContent.Create(new
         {
@@ -24,7 +24,7 @@ public sealed class ReviewProviderTests
             type = "message",
             role = "assistant",
             model,
-            stop_reason = "end_turn",
+            stop_reason = stopReason,
             usage = new { input_tokens = 10, output_tokens = 3 },
             content = content ?? [new { type = "text", text = "Reviewed." }]
         })
@@ -46,6 +46,36 @@ public sealed class ReviewProviderTests
         await Assert.That(log.Messages.Any(x => x.Contains("model glm-5.3-flash; attempts 4; retries 3; succeeded"))).IsTrue();
         await Assert.That(log.Messages.Any(x => x.Contains("step 2; model glm-5.3; attempts 1; retries 0; succeeded"))).IsTrue();
         await Assert.That(provider.ModelsUsed).IsEqualTo("glm-5.3 → glm-5.3-flash");
+    }
+
+    [Test]
+    public async Task SuccessiveLongStepsRetainTheirOwnRetryBudgets()
+    {
+        // Simulate elapsed time: two calls fit the review deadline but exceed one call's deadline together.
+        var elapsed = TimeSpan.Zero;
+        var failures = 12;
+        var stepAttempt = 0;
+        var log = new CaptureLogger();
+        var transport = new Transport((_, model, _) =>
+        {
+            var failed = ++stepAttempt <= failures;
+            elapsed += failed ? ReviewProvider.AttemptTimeout : TimeSpan.FromSeconds(1);
+            return Task.FromResult(failed ? new HttpResponseMessage(HttpStatusCode.GatewayTimeout) : Success(model));
+        });
+        await using var provider = new ReviewProvider(Options, log, "review", new HttpClient(transport),
+            (wait, _) => { elapsed += wait; return Task.CompletedTask; });
+        await provider.SendAsync(Request(), CancellationToken.None);
+        var firstCallElapsed = elapsed;
+        failures = 25;
+        stepAttempt = 0;
+        await provider.SendAsync(Request(), CancellationToken.None);
+        await Assert.That(firstCallElapsed < ReviewProvider.StepTimeout).IsTrue();
+        await Assert.That(elapsed - firstCallElapsed < ReviewProvider.StepTimeout).IsTrue();
+        await Assert.That(elapsed > ReviewProvider.StepTimeout).IsTrue();
+        await Assert.That(elapsed < Options.ReviewTimeout).IsTrue();
+        await Assert.That(transport.Models.Count).IsEqualTo(39);
+        await Assert.That(log.Messages.Any(x => x.Contains("step 2; model glm-5.3; attempts 26; retries 25; succeeded"))).IsTrue();
+        await Assert.That(provider.Failure).IsNull();
     }
 
     [Test]
@@ -119,6 +149,9 @@ public sealed class ReviewProviderTests
     [Arguments("malformed-tool")]
     [Arguments("truncated")]
     [Arguments("thinking-only")]
+    [Arguments("text-with-tool-stop")]
+    [Arguments("tool-with-end-stop")]
+    [Arguments("tool-with-sequence-stop")]
     public async Task ProviderFailuresAreRetried(string failure)
     {
         var transport = new Transport((attempt, model, _) =>
@@ -136,6 +169,9 @@ public sealed class ReviewProviderTests
                 "empty-text" => Success(model, [new { type = "text", text = " " }]),
                 "malformed-tool" => Success(model, [new { type = "tool_use", id = "tool_1", name = "review", input = "invalid" }]),
                 "truncated" => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("{\"type\":\"message\",\"stop_reason\":\"max_tokens\"}") },
+                "text-with-tool-stop" => Success(model, stopReason: "tool_use"),
+                "tool-with-end-stop" => Success(model, [new { type = "tool_use", id = "tool_1", name = "review", input = new { } }]),
+                "tool-with-sequence-stop" => Success(model, [new { type = "tool_use", id = "tool_1", name = "review", input = new { } }], "stop_sequence"),
                 _ => Success(model, [new { type = "thinking", thinking = "reasoning" }])
             };
             return Task.FromResult(response);
@@ -150,7 +186,7 @@ public sealed class ReviewProviderTests
     public async Task AcceptsAnthropicToolCallsAndDoesNotRetryThem()
     {
         var transport = new Transport((_, model, _) => Task.FromResult(Success(model,
-            [new { type = "text", text = "" }, new { type = "tool_use", id = "tool_1", name = "code_search", input = new { query = "failure" } }])));
+            [new { type = "text", text = "" }, new { type = "tool_use", id = "tool_1", name = "code_search", input = new { query = "failure" } }], "tool_use")));
         await using var provider = Create(transport);
         var result = await provider.SendAsync(Request(), CancellationToken.None);
         await Assert.That(result.Contains("code_search")).IsTrue();

@@ -92,7 +92,8 @@ public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> 
     {
         var output = Path.Combine(root, "review.json");
         List<string> arguments = ["review", "--from", @base, "--to", head, "--model", ReviewProvider.PrimaryModel,
-            "--concurrency", "1", "--timeout", ReviewProvider.StepTimeout.TotalMinutes.ToString(CultureInfo.InvariantCulture),
+            // A group can make multiple model calls; only the overall review deadline bounds it.
+            "--concurrency", "1", "--timeout", "0",
             "--format", "json", "--audience", "agent", "--color", "never", "--output", output,
             "--background", UserDecisionsRule + " " + ZeroConfigurationRule];
         var process = await RunOcrAsync(home, repository, provider, [.. arguments], ct);

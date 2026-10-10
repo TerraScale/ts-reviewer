@@ -343,7 +343,7 @@ public sealed class ReviewerTests
             await Assert.That(recorded.Contains("--model glm-5.3 ")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_MODEL")).IsFalse();
             await Assert.That(recorded.Contains("OCR_LLM_PROTOCOL=anthropic")).IsTrue();
-            await Assert.That(recorded.Contains("--timeout 180 ")).IsTrue();
+            await Assert.That(recorded.Contains("--timeout 0 ")).IsTrue();
             await Assert.That(recorded.Contains("--resume")).IsFalse();
             await Assert.That(recorded.Contains("OCR_LLM_TIMEOUT=10800")).IsTrue();
             await Assert.That(recorded.Contains("OCR_ENABLE_TELEMETRY=false")).IsTrue();
