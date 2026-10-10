@@ -19,6 +19,7 @@ namespace TerraScale.Reviewer.Features.Review;
 /// </summary>
 public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> logger, string? ocrPath = null, ReviewModelScheduler? scheduler = null)
 {
+    internal const string ZeroConfigurationRule = "TerraScale zero configuration (user decision 2026-10-09): request changes on every newly added production or CI on/off switch, feature-flag library, ENABLE_*, DISABLE_*, *_ENABLED, *_DISABLED variable, boolean enabled configuration key, opt-in setting, deploy toggle, kill switch, or workflow if: vars.* deployment gate. Every feature and region is always on. NetBird network membership admits nodes automatically; nodes discover all regions and infer their own region from where they run. Correct settings belong in code, not tuning configuration. OCI Vault automatically creates, delivers and configures first-party production secrets; vendor-issued keys are stored once in Vault and picked up automatically. Fakes, demos and skip-auth belong only in test code and test binaries. Permit vendor-owned names only with a narrow exception and a one-line reason. Review added switches, not historical inventory entries or policy prose. Preserve authentication, authorization, customer consent and data-loss safeguards; entity state and transient UI disabled attributes are not feature configuration.";
     private readonly string _ocrPath = ocrPath ?? "ocr";
 
     private readonly ReviewModelScheduler _scheduler = scheduler ?? new(options, NullLogger<ReviewModelScheduler>.Instance);
@@ -166,7 +167,8 @@ public sealed partial class ReviewEngine(ReviewerOptions options, ILogger<Review
         List<string> arguments = ["review", "--from", @base, "--to", head, "--model", model,
             "--concurrency", concurrency.ToString(CultureInfo.InvariantCulture),
             "--timeout", ((int)Math.Ceiling(options.OcrItemTimeout.TotalMinutes)).ToString(CultureInfo.InvariantCulture),
-            "--format", "json", "--audience", "agent", "--color", "never", "--output", output];
+            "--format", "json", "--audience", "agent", "--color", "never", "--output", output,
+            "--background", ZeroConfigurationRule];
         if (session is not null) arguments.AddRange(["--resume", session]);
         var process = await RunOcrAsync(home, repository, [.. arguments], ct);
         // ocr writes its report even when it exits non-zero (every item
