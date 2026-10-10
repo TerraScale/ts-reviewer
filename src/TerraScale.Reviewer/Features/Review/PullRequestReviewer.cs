@@ -17,14 +17,12 @@ public sealed class PullRequestReviewer(ForgejoClient forgejo, ReviewEngine engi
     /// Runs one review. <paramref name="cancellation"/> fires when the queue
     /// drops the request or shuts down, which publishes nothing here: the queue
     /// marks a dropped head skipped once the review stops, and a shutdown leaves
-    /// it pending for startup recovery. The review deadline is separate and
-    /// reports a timed-out review on the head.
+    /// it pending for startup recovery. Individual operations have deadlines;
+    /// review size must not truncate model retry budgets.
     /// </summary>
     public async Task RunAsync(ReviewRequest request, CancellationToken cancellation)
     {
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
-        deadline.CancelAfter(options.ReviewTimeout);
-        var ct = deadline.Token;
+        var ct = cancellation;
         var (owner, name, number) = (request.Owner, request.Name, request.Number);
         var sha = request.HeadSha;
         try
@@ -43,11 +41,6 @@ public sealed class PullRequestReviewer(ForgejoClient forgejo, ReviewEngine engi
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
         {
             logger.LogInformation("review for {Repository}#{Number} was superseded or cancelled", owner + "/" + name, number);
-        }
-        catch (OperationCanceledException) when (deadline.IsCancellationRequested)
-        {
-            logger.LogWarning("review for {Repository}#{Number} timed out after {Timeout}", owner + "/" + name, number, options.ReviewTimeout);
-            if (sha is not null) await PublishStatusAsync(owner, name, sha, "error", $"review timed out after {options.ReviewTimeout} — raise TS_REVIEWER_TIMEOUT if this recurs");
         }
         catch (Exception ex)
         {

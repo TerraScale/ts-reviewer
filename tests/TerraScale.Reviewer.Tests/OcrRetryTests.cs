@@ -85,15 +85,23 @@ public sealed class OcrRetryTests
 
     private static async Task<string> PinnedOcrAsync(string binary, CancellationToken ct)
     {
-        var root = Path.GetFullPath("../../../../../", AppContext.BaseDirectory);
+        var root = MultiProcessQualificationTests.RepositoryRoot();
         var containerfile = await File.ReadAllLinesAsync(Path.Combine(root, "Containerfile"), ct);
         var version = containerfile.Single(line => line.StartsWith("ARG OCR_VERSION=", StringComparison.Ordinal)).Split('=', 2)[1];
         var digest = containerfile.Single(line => line.StartsWith("ARG OCR_SHA256=", StringComparison.Ordinal)).Split('=', 2)[1];
         var assets = Path.Combine(root, "artifacts", "ci", "ocr");
         Directory.CreateDirectory(assets);
-        using var http = new HttpClient();
-        var archive = await VerifiedArchiveAsync(Path.Combine(assets, $"ocr-{version}-{digest}.tgz"), digest,
-            token => http.GetByteArrayAsync($"https://registry.npmjs.org/@alibaba-group/ocr-linux-x64/-/ocr-linux-x64-{version}.tgz", token), ct);
+        using var http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+        byte[] archive;
+        try
+        {
+            archive = await VerifiedArchiveAsync(Path.Combine(assets, $"ocr-{version}-{digest}.tgz"), digest,
+                token => http.GetByteArrayAsync($"https://registry.npmjs.org/@alibaba-group/ocr-linux-x64/-/ocr-linux-x64-{version}.tgz", token), ct);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException)
+        {
+            throw new InvalidOperationException($"Pinned OCR {version} preparation from registry.npmjs.org failed (five-minute preparation budget): {ex.Message}", ex);
+        }
         using var compressed = new GZipStream(new MemoryStream(archive), CompressionMode.Decompress);
         using var tar = new TarReader(compressed);
         while (tar.GetNextEntry() is { } entry)
@@ -319,7 +327,7 @@ public sealed class OcrRetryTests
         }
 
         public ReviewEngine Engine(string? ocrPath = null, string? proxyUrl = null) => new(new ReviewerOptions("http://+:8080", _forgejoUrl, "forgejo",
-            proxyUrl ?? "https://proxy.test/v1", "proxy", "TerraScale", "bot", TimeSpan.FromMinutes(1),
+            proxyUrl ?? "https://proxy.test/v1", "proxy", "TerraScale", "bot",
             "webhook-test-secret", "context-test-token", Path.Combine(_root, "context.db"), 100),
             NullLogger<ReviewEngine>.Instance, ocrPath ?? _stub);
 

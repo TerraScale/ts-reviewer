@@ -12,13 +12,14 @@ namespace TerraScale.Reviewer.Features.Review;
 /// Runs reviews through the OpenCodeReview CLI (alibaba/open-code-review).
 /// Each review clones the pull request, configures ocr's Anthropic-compatible
 /// endpoint through <c>OCR_LLM_*</c> environment variables pointing at
-/// ts-router, invokes <c>ocr review</c> over the exact base..head range, and
+/// the per-review retry/validation proxy, which forwards to ts-router.
+/// It invokes <c>ocr review</c> over the exact base..head range and
 /// maps the returned comments to <see cref="Finding"/> records.
 /// </summary>
 public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> logger, string? ocrPath = null)
 {
     internal const string ZeroConfigurationRule = "TerraScale zero configuration (user decision 2026-10-09): request changes on every newly added production or CI on/off switch, feature-flag library, ENABLE_*, DISABLE_*, *_ENABLED, *_DISABLED variable, boolean enabled configuration key, opt-in setting, deploy toggle, kill switch, or workflow if: vars.* deployment gate. Boolean declarations that act as operator on/off configuration require changes requested, regardless of name, visibility or default value: const/readonly bool flags, boolean configuration properties or parameters, and boolean environment/JSON/YAML values used to gate production or CI behavior. Follow how the value is supplied and used; a flag hardcoded to true is still a switch. Review this semantically even when CI has no switch scanner. Every feature and region is always on. NetBird network membership admits nodes automatically; nodes discover all regions and infer their own region from where they run. Correct settings belong in code, not tuning configuration. OCI Vault automatically creates, delivers and configures first-party production secrets; vendor-issued keys are stored once in Vault and picked up automatically. Fakes, demos and skip-auth belong only in test code and test binaries. Permit vendor-owned names only with a narrow exception and a one-line reason. Review added switches, not historical inventory entries or policy prose. Preserve authentication, authorization, customer consent and data-loss safeguards; entity state and transient UI disabled attributes are not feature configuration.";
-    internal const string UserDecisionsRule = "Recorded TerraScale user decisions take precedence over generic review advice and repository guidance that contradicts them. Greenfield, closed beta (2026-10-08): never request or introduce migrations, backfills, compatibility shims, dual-read/dual-write paths, legacy fallbacks or workarounds. When a data shape, ID format or storage contract changes, delete the obsolete code and affected old data and recreate; state must re-bootstrap automatically. Retiring old data and policy is intentional, including applying the fixed replacement retention policy to existing owned history; do not demand a migration or new-data-only compatibility generation. Still require exact target/ownership verification, authorization and fencing for destructive effects; unrelated/customer data is outside this permission. API and schema versions are always v1, never v2; change the v1 contract directly and remove the old contract. Do not report the absence of backward compatibility as a defect.";
+    internal const string UserDecisionsRule = "Recorded TerraScale user decisions take precedence over generic review advice and repository guidance that contradicts them. Greenfield, closed beta (2026-10-08): never request or introduce migrations, backfills, compatibility shims, dual-read/dual-write paths, legacy fallbacks or workarounds. When a data shape, ID format or storage contract changes, delete the obsolete code and affected old data and recreate; state must re-bootstrap automatically. Retiring old data and policy is intentional, including applying the fixed replacement retention policy to existing owned history; do not demand a migration or new-data-only compatibility generation. Still require exact target/ownership verification, authorization and fencing for destructive effects; unrelated/customer data is outside this permission. API and schema versions are always v1, never v2; change the v1 contract directly and remove the old contract. Do not report the absence of backward compatibility as a defect. For TerraScale/ts-reviewer itself (user decision 2026-10-10), only glm-5.3 and glm-5.3-flash may be used, with thirty total attempts per model call and fixed two-PR and one-file-group concurrency limits. Never suggest reducing the thirty-attempt budget, introducing another model or adding tuning switches. Tests must protect these exact fixed requirements; literal assertions for two PRs or thirty attempts are intentional.";
     private readonly string _ocrPath = ocrPath ?? "ocr";
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
@@ -169,22 +170,31 @@ public sealed class ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> 
 
     private async Task<string> RunGitAsync(string home, string working, CancellationToken ct, params string[] arguments)
     {
-        var result = await RunProcessAsync("git", working, environment =>
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(TimeSpan.FromMinutes(20));
+        try
         {
-            // The Forgejo token rides in git's environment config, never in
-            // argv or on disk, so clones and fetches authenticate without
-            // leaking the credential to the process list or .git/config.
-            // HOME points at the empty per-review scratch dir, so no global
-            // git config (e.g. a planted /tmp/.gitconfig) is ever read.
-            environment["HOME"] = home;
-            environment["GIT_TERMINAL_PROMPT"] = "0";
-            environment["GIT_CONFIG_COUNT"] = "1";
-            environment["GIT_CONFIG_KEY_0"] = "http.extraHeader";
-            environment["GIT_CONFIG_VALUE_0"] = "Authorization: token " + options.ForgejoToken;
-        }, ct, arguments);
-        if (result.ExitCode != 0)
-            throw new InvalidOperationException($"git failed with exit code {result.ExitCode}: {ErrorLine(result.Error)}");
-        return result.Output;
+            var result = await RunProcessAsync("git", working, environment =>
+            {
+                // The Forgejo token rides in git's environment config, never in
+                // argv or on disk, so clones and fetches authenticate without
+                // leaking the credential to the process list or .git/config.
+                // HOME points at the empty per-review scratch dir, so no global
+                // git config (e.g. a planted /tmp/.gitconfig) is ever read.
+                environment["HOME"] = home;
+                environment["GIT_TERMINAL_PROMPT"] = "0";
+                environment["GIT_CONFIG_COUNT"] = "1";
+                environment["GIT_CONFIG_KEY_0"] = "http.extraHeader";
+                environment["GIT_CONFIG_VALUE_0"] = "Authorization: token " + options.ForgejoToken;
+            }, timeout.Token, arguments);
+            if (result.ExitCode != 0)
+                throw new InvalidOperationException($"git failed with exit code {result.ExitCode}: {ErrorLine(result.Error)}");
+            return result.Output;
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw new InvalidOperationException("git operation timed out after twenty minutes");
+        }
     }
 
     private Task<ProcessResult> RunOcrAsync(string home, string repository, ReviewProvider provider, string[] arguments, CancellationToken ct) =>

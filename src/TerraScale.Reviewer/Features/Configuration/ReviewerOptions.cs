@@ -4,7 +4,7 @@ namespace TerraScale.Reviewer.Features.Configuration;
 
 public sealed record ReviewerOptions(
     string ListenUrl, string ForgejoUrl, string ForgejoToken, string ProxyUrl, string ProxyToken,
-    string Organization, string BotLogin, TimeSpan ReviewTimeout,
+    string Organization, string BotLogin,
     string WebhookSecret, string ContextApiToken, string ContextDatabasePath, int ContextMaxFiles,
     int ContextMaxAttempts = 5, TimeSpan? ContextRetryBaseDelay = null, string OperatorToken = "")
 {
@@ -20,7 +20,6 @@ public sealed record ReviewerOptions(
             ["proxy-token"] = null,
             ["organization"] = "TerraScale",
             ["bot-login"] = "terrascale-bot",
-            ["timeout"] = "04:00:00",
             ["webhook-secret"] = string.Empty,
             ["context-api-token"] = string.Empty,
             ["context-database"] = "data/reviewer-context.db",
@@ -78,8 +77,6 @@ public sealed record ReviewerOptions(
         var webhookSecret = Required(values, "webhook-secret", "TS_REVIEWER_WEBHOOK_SECRET");
         var contextApiToken = Required(values, "context-api-token", "TS_REVIEWER_CONTEXT_API_TOKEN");
         var operatorToken = Required(values, "operator-token", "TS_REVIEWER_OPERATOR_TOKEN");
-        if (!TimeSpan.TryParse(values["timeout"], out var reviewTimeout) || reviewTimeout <= TimeSpan.Zero)
-            throw new InvalidOperationException("timeout must be positive");
         var contextMaxFiles = ParseInt(values, "context-max-files");
         if (contextMaxFiles is < 1 or > 100_000) throw new InvalidOperationException("context-max-files must be between 1 and 100000");
         var contextMaxAttempts = ParseInt(values, "context-max-attempts");
@@ -89,7 +86,7 @@ public sealed record ReviewerOptions(
             throw new InvalidOperationException("context-retry-base-delay must be positive and at most one minute");
         return new ReviewerOptions(Trim(values["listen"]!), Trim(values["forgejo-url"]!), forgejoToken,
             Trim(values["proxy-url"]!), proxyToken, values["organization"]!, values["bot-login"]!,
-            reviewTimeout, webhookSecret, contextApiToken, values["context-database"]!, contextMaxFiles,
+            webhookSecret, contextApiToken, values["context-database"]!, contextMaxFiles,
             contextMaxAttempts, contextRetryBaseDelay, operatorToken);
     }
     private static string Required(IReadOnlyDictionary<string, string?> values, string key, string environmentName) =>

@@ -19,7 +19,7 @@ public sealed class ReviewerTests
     private static readonly ContextEmbedder Embedder = new();
 
     private static ReviewerOptions Options(string database) =>
-        new("http://+:8080", "https://forgejo.test", "forgejo", "https://proxy.test/v1", "proxy", "TerraScale", "bot", TimeSpan.FromMinutes(1), "webhook-test-secret", "context-test-token", database, 100, 5, null, "operator-test-token");
+        new("http://+:8080", "https://forgejo.test", "forgejo", "https://proxy.test/v1", "proxy", "TerraScale", "bot", "webhook-test-secret", "context-test-token", database, 100, 5, null, "operator-test-token");
 
     private static float[] UnitVector(int index)
     {
@@ -91,7 +91,7 @@ public sealed class ReviewerTests
     {
         foreach (var key in new[] { "model", "fallback-model", "escalation-model", "max-concurrent", "ocr-concurrency",
             "ocr-max-attempts", "ocr-retry-base-delay", "sol-weight", "glm-weight", "sol-slots", "glm-slots",
-            "model-slot-wait", "model-backoff-base-delay", "model-backoff-max-delay", "ocr-llm-timeout", "ocr-item-timeout" })
+            "model-slot-wait", "model-backoff-base-delay", "model-backoff-max-delay", "ocr-llm-timeout", "ocr-item-timeout", "timeout" })
         {
             var rejected = false;
             try { ReviewerOptions.Load([.. Credentials, "--" + key + "=1"]); }
@@ -99,7 +99,7 @@ public sealed class ReviewerTests
             await Assert.That(rejected).IsTrue();
         }
         // Retired environment overrides cannot select another model or raise the limits.
-        string[] names = ["TS_REVIEWER_MODEL", "TS_REVIEWER_MAX_CONCURRENT", "TS_REVIEWER_OCR_CONCURRENCY"];
+        string[] names = ["TS_REVIEWER_MODEL", "TS_REVIEWER_MAX_CONCURRENT", "TS_REVIEWER_OCR_CONCURRENCY", "TS_REVIEWER_TIMEOUT"];
         var previous = names.ToDictionary(x => x, Environment.GetEnvironmentVariable);
         try
         {
@@ -336,6 +336,8 @@ public sealed class ReviewerTests
             await Assert.That(recorded.Contains("--format json")).IsTrue();
             await Assert.That(recorded.Contains("--background " + ReviewEngine.UserDecisionsRule + " " + ReviewEngine.ZeroConfigurationRule)).IsTrue();
             await Assert.That(recorded.Contains("Boolean declarations that act as operator on/off configuration require changes requested")).IsTrue();
+            await Assert.That(recorded.Contains("Never suggest reducing the thirty-attempt budget")).IsTrue();
+            await Assert.That(recorded.Contains("fixed two-PR and one-file-group concurrency limits")).IsTrue();
             await Assert.That(recorded.Contains("entity state and transient UI disabled attributes are not feature configuration")).IsTrue();
             await Assert.That(recorded.Contains("--concurrency 1")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_URL=http://127.0.0.1:")).IsTrue();
@@ -345,7 +347,7 @@ public sealed class ReviewerTests
             await Assert.That(recorded.Contains("OCR_LLM_PROTOCOL=anthropic")).IsTrue();
             await Assert.That(recorded.Contains("--timeout 0 ")).IsTrue();
             await Assert.That(recorded.Contains("--resume")).IsFalse();
-            await Assert.That(recorded.Contains("OCR_LLM_TIMEOUT=10800")).IsTrue();
+            await Assert.That(recorded.Contains($"OCR_LLM_TIMEOUT={ReviewProvider.StepTimeout.TotalSeconds}")).IsTrue();
             await Assert.That(recorded.Contains("OCR_ENABLE_TELEMETRY=false")).IsTrue();
 
             // Exercise the real webhook-to-HTTP publication path. Forgejo uses

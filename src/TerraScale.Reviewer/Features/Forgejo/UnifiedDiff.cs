@@ -74,7 +74,14 @@ public static class UnifiedDiff
             }
             else bytes.WriteByte(escaped switch
             {
-                'a' => 7, 'b' => 8, 't' => 9, 'n' => 10, 'v' => 11, 'f' => 12, 'r' => 13, _ => (byte)escaped,
+                'a' => 7,
+                'b' => 8,
+                't' => 9,
+                'n' => 10,
+                'v' => 11,
+                'f' => 12,
+                'r' => 13,
+                _ => (byte)escaped,
             });
         }
         return System.Text.Encoding.UTF8.GetString(bytes.GetBuffer(), 0, (int)bytes.Length);

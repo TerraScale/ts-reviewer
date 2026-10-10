@@ -11,7 +11,7 @@ using TUnit.Core;
 public sealed class AuthenticationTests
 {
     private static ReviewerOptions Options => new("http://+:8080", "https://forgejo.test", "forgejo",
-        "https://proxy.test", "proxy", "TerraScale", "bot", TimeSpan.FromMinutes(1),
+        "https://proxy.test", "proxy", "TerraScale", "bot",
         "webhook-test-secret", "context-test-token", "unused", 100);
 
     [Test]

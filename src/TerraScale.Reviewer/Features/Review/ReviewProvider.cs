@@ -14,15 +14,16 @@ internal sealed class ReviewProvider : IAsyncDisposable
     internal const string PrimaryModel = "glm-5.3";
     internal const string FallbackModel = "glm-5.3-flash";
     internal const int MaxAttempts = 30;
-    internal static readonly TimeSpan AttemptTimeout = TimeSpan.FromMinutes(5);
-    internal static readonly TimeSpan StepTimeout = TimeSpan.FromHours(3);
+    internal static readonly TimeSpan AttemptTimeout = TimeSpan.FromMinutes(20);
+    // Leave SDK headroom beyond all attempts and worst-case retry waits.
+    internal static readonly TimeSpan StepTimeout = AttemptTimeout * MaxAttempts + TimeSpan.FromMinutes(MaxAttempts + 1);
     private readonly ReviewerOptions _options;
     private readonly ILogger _logger;
     private readonly string _review;
     private readonly HttpClient _http;
     private readonly Func<TimeSpan, CancellationToken, Task> _delay;
     private readonly SemaphoreSlim _serial = new(1);
-    private readonly HashSet<string> _models = [];
+    private readonly List<string> _models = [];
     private CancellationTokenSource? _lifetime;
     private WebApplication? _app;
     private int _step;
@@ -98,7 +99,7 @@ internal sealed class ReviewProvider : IAsyncDisposable
                 var model = ((attempt - 1) / 3) % 2 == 0 ? PrimaryModel : FallbackModel;
                 body["model"] = model;
                 body["stream"] = false;
-                _models.Add(model);
+                if (!_models.Contains(model)) _models.Add(model);
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 timeout.CancelAfter(AttemptTimeout);
                 try

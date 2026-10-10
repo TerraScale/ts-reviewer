@@ -20,8 +20,7 @@ public sealed class ReviewQueueTests
     private static readonly TimeSpan Wait = TimeSpan.FromSeconds(10);
 
     private static ReviewerOptions Options(string database) =>
-        new("http://+:8080", "https://forgejo.test", "forgejo", "https://proxy.test/v1", "proxy", "TerraScale", "bot",
-            TimeSpan.FromMinutes(1), "webhook-test-secret", "context-test-token", database, 100, 5, null, "operator-test-token");
+        new("http://+:8080", "https://forgejo.test", "forgejo", "https://proxy.test/v1", "proxy", "TerraScale", "bot", "webhook-test-secret", "context-test-token", database, 100, 5, null, "operator-test-token");
 
     private static ReviewRequest Request(int number, string? head) => new("TerraScale", "widgets", number, head);
 

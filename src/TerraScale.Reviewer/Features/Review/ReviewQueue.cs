@@ -102,7 +102,9 @@ public sealed class ReviewQueue : BackgroundService
             }
             // All queued/skip writes for a PR share a chain, even across A -> B -> A
             // and across idle slots. The next runner waits for the chain here.
-            request = request with { QueuedStatus = PublishUnderLock(request.Key,
+            request = request with
+            {
+                QueuedStatus = PublishUnderLock(request.Key,
                 () =>
                 {
                     ReviewRequest admitted;
@@ -114,7 +116,8 @@ public sealed class ReviewQueue : BackgroundService
                         admitted = request;
                     }
                     return publishQueued?.Invoke(admitted) ?? Task.CompletedTask;
-                }) };
+                })
+            };
             slot.Waiting = request;
             _logger.LogInformation("review queue_depth {QueueDepth}; in_flight {InFlight}",
                 _slots.Values.Count(x => x.Waiting is not null), _slots.Values.Count(x => x.Running is not null));

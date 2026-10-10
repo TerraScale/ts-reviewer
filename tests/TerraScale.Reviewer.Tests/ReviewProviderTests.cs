@@ -13,7 +13,7 @@ using TUnit.Core;
 public sealed class ReviewProviderTests
 {
     private static readonly ReviewerOptions Options = new("http://+:8080", "https://forgejo.test", "forgejo",
-        "https://router.test/v1", "proxy-secret", "TerraScale", "bot", TimeSpan.FromHours(4), "webhook", "context", "unused", 100);
+        "https://router.test/v1", "proxy-secret", "TerraScale", "bot", "webhook", "context", "unused", 100);
 
     private static JsonObject Request() => new()
     {
@@ -72,7 +72,7 @@ public sealed class ReviewProviderTests
     [Test]
     public async Task SuccessiveLongStepsRetainTheirOwnRetryBudgets()
     {
-        // Simulate elapsed time: two calls fit the review deadline but exceed one call's deadline together.
+        // Successive calls keep independent budgets even beyond the retired four-hour review deadline.
         var elapsed = TimeSpan.Zero;
         var failures = 12;
         var stepAttempt = 0;
@@ -93,10 +93,19 @@ public sealed class ReviewProviderTests
         await Assert.That(firstCallElapsed < ReviewProvider.StepTimeout).IsTrue();
         await Assert.That(elapsed - firstCallElapsed < ReviewProvider.StepTimeout).IsTrue();
         await Assert.That(elapsed > ReviewProvider.StepTimeout).IsTrue();
-        await Assert.That(elapsed < Options.ReviewTimeout).IsTrue();
+        await Assert.That(elapsed > TimeSpan.FromHours(4)).IsTrue();
         await Assert.That(transport.Models.Count).IsEqualTo(39);
         await Assert.That(log.Messages.Any(x => x.Contains("step 2; model glm-5.3; attempts 26; retries 25; succeeded"))).IsTrue();
         await Assert.That(provider.Failure).IsNull();
+    }
+
+    [Test]
+    public async Task ThirtyTwentyMinuteCallsAndMaximumBackoffFitTheSdkDeadline()
+    {
+        var elapsed = TimeSpan.FromMinutes(20) * 30;
+        for (var attempt = 1; attempt < 30; attempt++) elapsed += ReviewProvider.RetryDelay(attempt, 1);
+        await Assert.That(ReviewProvider.AttemptTimeout).IsEqualTo(TimeSpan.FromMinutes(20));
+        await Assert.That(elapsed < ReviewProvider.StepTimeout).IsTrue();
     }
 
     [Test]
