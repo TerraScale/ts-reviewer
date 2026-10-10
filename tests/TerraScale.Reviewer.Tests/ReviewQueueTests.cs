@@ -641,8 +641,11 @@ public sealed class ReviewQueueTests
             {
                 await ReleaseHead.Task.WaitAsync(cancellationToken);
                 var repository = new Repository(new Owner("TerraScale"), "widgets");
-                return new HttpResponseMessage(HttpStatusCode.OK) { Content = JsonContent.Create(
-                    new PullRequest(7, "change", "", new Branch("base", "main", repository), new Branch("command-head", "feature", repository))) };
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = JsonContent.Create(
+                    new PullRequest(7, "change", "", new Branch("base", "main", repository), new Branch("command-head", "feature", repository)))
+                };
             }
             if (request.RequestUri!.AbsolutePath.Contains("/statuses/", StringComparison.Ordinal))
             {
@@ -663,8 +666,11 @@ public sealed class ReviewQueueTests
             if (request.Method == HttpMethod.Get)
             {
                 var repository = new Repository(new Owner("TerraScale"), "widgets");
-                return new HttpResponseMessage(HttpStatusCode.OK) { Content = JsonContent.Create(
-                    new PullRequest(7, "change", "", new Branch("base", "main", repository), new Branch("new", "feature", repository))) };
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = JsonContent.Create(
+                    new PullRequest(7, "change", "", new Branch("base", "main", repository), new Branch("new", "feature", repository)))
+                };
             }
             var status = await request.Content!.ReadFromJsonAsync<JsonElement>(cancellationToken);
             State = status.GetProperty("state").GetString();

@@ -88,13 +88,6 @@ public sealed class PullRequestReviewer(ForgejoClient forgejo, ReviewEngine engi
 
     private async Task ReviewAsync(PullRequest pr, string owner, string name, int number, string? model, CancellationToken ct)
     {
-        var files = await forgejo.FilesAsync(owner, name, number, ct);
-        string raw;
-        try { raw = await forgejo.DiffAsync(owner, name, number, ct); }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        { await PublishStatusAsync(owner, name, pr.Head.Sha, "error", "could not retrieve patch: " + ex.Message); return; }
-        var parsed = UnifiedDiff.Parse(raw);
-        if (parsed.Count > 0) files = parsed;
         ReviewResult result;
         try { result = await engine.RunAsync(pr, ct, model); }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -113,7 +106,7 @@ public sealed class PullRequestReviewer(ForgejoClient forgejo, ReviewEngine engi
         if (marked is not null) await forgejo.UpdateCommentAsync(owner, name, marked.Id, body, ct);
         else await forgejo.CommentAsync(owner, name, number, body, ct);
         var comments = result.Findings
-            .Select(f => (f, position: files.FirstOrDefault(x => x.Filename == f.Path) is { } file ? UnifiedDiff.ReviewPosition(file.Patch, f.Line) : 0))
+            .Select(f => (f, position: result.Files.FirstOrDefault(x => x.Filename == f.Path) is { } file ? UnifiedDiff.ReviewPosition(file.Patch, f.Line) : 0))
             .Where(x => x.position > 0)
             .Select(x => new ReviewComment($"**{x.f.Severity.Trim().ToUpperInvariant()} · {x.f.Title.Trim()}**\n\n{x.f.Body.Trim()}\n\n**Suggested fix**\n{x.f.Fix.Trim()}", x.f.Path, x.position))
             .ToList();

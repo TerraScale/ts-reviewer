@@ -36,7 +36,7 @@ public sealed class OcrRetryTests
         await Assert.That(runs[0].Contains("--resume")).IsFalse();
         await Assert.That(runs[1].Contains("--resume sess-1")).IsTrue();
         foreach (var run in runs)
-            await Assert.That(run.Contains("--background " + ReviewEngine.ZeroConfigurationRule)).IsTrue();
+            await Assert.That(run.Contains("--background " + ReviewEngine.UserDecisionsRule + " " + ReviewEngine.ZeroConfigurationRule)).IsTrue();
     }
 
     [Test]

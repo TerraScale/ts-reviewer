@@ -21,18 +21,6 @@ public sealed class ForgejoClient(HttpClient http, ReviewerOptions options)
 
     public Task<PullRequest?> PullAsync(string owner, string name, int number, CancellationToken ct) =>
         GetAsync<PullRequest>($"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/pulls/{number}", ct);
-    public async Task<IReadOnlyList<ChangedFile>> FilesAsync(string owner, string name, int number, CancellationToken ct) =>
-        await GetAsync<List<ChangedFile>>($"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/pulls/{number}/files?limit=100", ct) ?? [];
-    public async Task<string> DiffAsync(string owner, string name, int number, CancellationToken ct)
-    {
-        using var response = await _http.GetAsync($"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/pulls/{number}.diff", HttpCompletionOption.ResponseHeadersRead, ct);
-        await EnsureSuccess(response, "diff", ct);
-        await using var stream = await response.Content.ReadAsStreamAsync(ct);
-        using var memory = new MemoryStream();
-        await stream.CopyToAsync(memory, ct);
-        if (memory.Length > 8 * 1024 * 1024) throw new InvalidOperationException("pull request diff exceeds limit");
-        return System.Text.Encoding.UTF8.GetString(memory.ToArray());
-    }
     public async Task<IReadOnlyList<IssueComment>> CommentsAsync(string owner, string name, int number, CancellationToken ct) =>
         await GetAsync<List<IssueComment>>($"api/v1/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(name)}/issues/{number}/comments?limit=100", ct) ?? [];
     public Task CommentAsync(string owner, string name, int number, string body, CancellationToken ct) =>

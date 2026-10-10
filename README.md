@@ -19,6 +19,20 @@ manual secret-copy procedures are retired. Region and service discovery are
 automatic. Existing runtime options below describe implementation debt for
 removal, rather than setup steps or feature activation instructions.
 
+## Recorded user decisions and large pull requests
+
+Every OCR attempt receives the recorded greenfield and v1-only decisions as
+well as the zero-configuration policy. Changes replace the v1 contract directly;
+reviews must never request migrations, backfills, shims, compatibility generations
+or v2 APIs/schemas. Removing obsolete code and affected old data is intentional;
+exact target/ownership checks and destructive-effect authorization still apply.
+
+Ingestion uses the authenticated exact-head clone, with no Forgejo patch download
+or patch-size cap. OCR reviews local file groups and resumes failed groups on the
+existing Sol → GLM 5.3 chain. Only paths with findings need local patches for
+inline comment positions. A review that cannot finish publishes an explicit error
+status; partial findings request changes and cannot approve incomplete coverage.
+
 ## Runtime
 
 Configuration precedence is defaults < optional JSON config file < environment variables < `--key=value` arguments. Select the config file with `--config=/path/reviewer.json` or `TS_REVIEWER_CONFIG`; the argument takes precedence. Use a flat JSON object with the existing kebab-case option names, string values for text/durations, and strings or numbers for integer options, for example `{ "max-concurrent": 2, "sol-weight": 60, "glm-weight": 40, "sol-slots": 2, "glm-slots": 1, "model-slot-wait": "00:02:00" }`. Missing, malformed, or invalid explicitly selected files fail startup.
@@ -33,7 +47,15 @@ Every push to a branch queues exact-commit indexing in a bounded, deduplicated q
 
 Never put tokens in the image, workflow YAML, or command-line arguments. The Forgejo token needs pull-request read, review/comment/status write, and issue write access across the TerraScale organization. The proxy token should be reachable only from the homelab network.
 
-The alpha reviewer container stays stopped for TS-585. Ship code only; COS deploys when the user explicitly says `restore reviewer`. On restore, remove any old `TS_REVIEWER_MAX_CONCURRENT` override above two.
+The homelab runs an Incus OCI `ts-reviewer` container on alpha, with OpenBao
+credentials mounted from `/var/srv/appdata/ts-reviewer/ts-reviewer.env` and the
+context directory mounted at `/var/lib/ts-reviewer`. `homelab-deployer` stages
+commit-tagged .NET container images through Harbor and rolls this instance,
+checking `/healthz` and rolling back on failure. For an explicitly authorized
+branch deployment, publish its tested commit image and run
+`sudo homelab-deployer roll ts-reviewer <sha>` on alpha (holds that image until
+`release ts-reviewer`). Keep the two-worker limit and existing model chain.
+See the homelab `services/ts-reviewer.md` and `services/deployer.md` runbooks.
 
 ## Container release
 

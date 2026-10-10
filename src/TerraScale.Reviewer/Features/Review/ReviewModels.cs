@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using TerraScale.Reviewer.Features.Forgejo;
 
 namespace TerraScale.Reviewer.Features.Review;
 
@@ -20,6 +21,8 @@ public sealed record ReviewResult
     public IReadOnlyList<Finding> Findings { get; init; } = [];
 
     public string? Model { get; init; }
+
+    public IReadOnlyList<ChangedFile> Files { get; init; } = [];
 
     public ReviewResult() { }
     public ReviewResult(string summary, IReadOnlyList<Finding> findings) => (Summary, Findings) = (summary, findings);
