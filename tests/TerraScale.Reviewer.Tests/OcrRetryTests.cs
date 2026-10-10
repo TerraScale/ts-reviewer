@@ -1,5 +1,14 @@
 using System.Diagnostics;
+using System.Formats.Tar;
+using System.IO.Compression;
+using System.Net;
+using System.Security.Cryptography;
 using System.Text.Json;
+using System.Text.Json.Nodes;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using TerraScale.Reviewer.Features.Configuration;
 using TerraScale.Reviewer.Features.Forgejo;
@@ -13,6 +22,91 @@ using TUnit.Core;
 /// </summary>
 public sealed class OcrRetryTests
 {
+    [Test]
+    public async Task PinnedOcrCompletesReviewThroughLocalProvider()
+    {
+        using var deadline = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+        var binary = await PinnedOcrAsync(deadline.Token);
+        await using var fixture = await Fixture.CreateAsync(servePartialClones: true);
+        var builder = WebApplication.CreateSlimBuilder();
+        builder.Configuration.Sources.Clear();
+        builder.Logging.ClearProviders();
+        builder.WebHost.ConfigureKestrel(server => server.Listen(IPAddress.Loopback, 0));
+        await using var upstream = builder.Build();
+        var calls = 0;
+        var decodedRead = false;
+        var correctRequests = true;
+        upstream.MapPost("/v1/messages", async (HttpRequest request) =>
+        {
+            using var document = await JsonDocument.ParseAsync(request.Body);
+            var body = document.RootElement;
+            correctRequests &= request.Headers.Authorization == "Bearer proxy"
+                && body.GetProperty("model").GetString() == ReviewProvider.PrimaryModel
+                && (!body.TryGetProperty("stream", out var stream) || !stream.GetBoolean());
+            foreach (var message in body.GetProperty("messages").EnumerateArray())
+                if (message.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.Array)
+                    foreach (var block in content.EnumerateArray())
+                        if (block.TryGetProperty("type", out var type) && type.GetString() == "tool_result"
+                            && block.GetProperty("tool_use_id").GetString() == "read_1")
+                            decodedRead |= block.GetRawText().Contains("LINE_RANGE: 1-1", StringComparison.Ordinal)
+                                && block.GetRawText().Contains("class A", StringComparison.Ordinal)
+                                && (!block.TryGetProperty("is_error", out var error) || !error.GetBoolean());
+            var first = ++calls == 1;
+            return Results.Json(new
+            {
+                id = "msg_" + calls,
+                type = "message",
+                role = "assistant",
+                model = ReviewProvider.PrimaryModel,
+                stop_reason = "tool_use",
+                usage = new { input_tokens = 10, output_tokens = 3 },
+                content = new[] { new {
+                    type = "tool_use", id = first ? "read_1" : "done_" + calls,
+                    name = first ? "file_read" : "task_done",
+                    input = JsonNode.Parse(first
+                        ? """{"file_path":"a.cs","start_line":1.0,"end_line":1.0}"""
+                        : """{"state":"DONE"}""")
+                } }
+            });
+        });
+        await upstream.StartAsync(deadline.Token);
+        var result = await fixture.Engine(binary, upstream.Urls.Single()).RunAsync(fixture.PullRequest, deadline.Token);
+        await Assert.That(result.Findings.Count).IsEqualTo(0);
+        await Assert.That(result.Model).IsEqualTo(ReviewProvider.PrimaryModel);
+        await Assert.That(calls).IsGreaterThan(1);
+        await Assert.That(correctRequests).IsTrue();
+        await Assert.That(decodedRead).IsTrue();
+    }
+
+    private static async Task<string> PinnedOcrAsync(CancellationToken ct)
+    {
+        var root = Path.GetFullPath("../../../../../", AppContext.BaseDirectory);
+        var containerfile = await File.ReadAllLinesAsync(Path.Combine(root, "Containerfile"), ct);
+        var version = containerfile.Single(line => line.StartsWith("ARG OCR_VERSION=", StringComparison.Ordinal)).Split('=', 2)[1];
+        var digest = containerfile.Single(line => line.StartsWith("ARG OCR_SHA256=", StringComparison.Ordinal)).Split('=', 2)[1];
+        var assets = Path.Combine(root, "artifacts", "ci", "ocr");
+        Directory.CreateDirectory(assets);
+        var archivePath = Path.Combine(assets, "ocr-" + version + ".tgz");
+        if (!File.Exists(archivePath))
+        {
+            using var http = new HttpClient();
+            await File.WriteAllBytesAsync(archivePath, await http.GetByteArrayAsync($"https://registry.npmjs.org/@alibaba-group/ocr-linux-x64/-/ocr-linux-x64-{version}.tgz", ct), ct);
+        }
+        var archive = await File.ReadAllBytesAsync(archivePath, ct);
+        await Assert.That(Convert.ToHexStringLower(SHA256.HashData(archive))).IsEqualTo(digest);
+        using var compressed = new GZipStream(new MemoryStream(archive), CompressionMode.Decompress);
+        using var tar = new TarReader(compressed);
+        while (tar.GetNextEntry() is { } entry)
+        {
+            if (entry.Name != "package/bin/opencodereview") continue;
+            var binary = Path.Combine(assets, "ocr");
+            await using (var output = File.Create(binary)) await entry.DataStream!.CopyToAsync(output, ct);
+            if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(binary, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            return binary;
+        }
+        throw new InvalidOperationException("Pinned OCR archive contains no production binary");
+    }
+
     [Test]
     [Arguments(false, false)]
     [Arguments(true, false)]
@@ -144,10 +238,10 @@ public sealed class OcrRetryTests
             if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(_stub, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
 
-        public ReviewEngine Engine() => new(new ReviewerOptions("http://+:8080", _forgejoUrl, "forgejo",
-            "https://proxy.test/v1", "proxy", "TerraScale", "bot", TimeSpan.FromMinutes(1),
+        public ReviewEngine Engine(string? ocrPath = null, string? proxyUrl = null) => new(new ReviewerOptions("http://+:8080", _forgejoUrl, "forgejo",
+            proxyUrl ?? "https://proxy.test/v1", "proxy", "TerraScale", "bot", TimeSpan.FromMinutes(1),
             "webhook-test-secret", "context-test-token", Path.Combine(_root, "context.db"), 100),
-            NullLogger<ReviewEngine>.Instance, _stub);
+            NullLogger<ReviewEngine>.Instance, ocrPath ?? _stub);
 
         public string Runs => _runs;
 
