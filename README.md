@@ -69,7 +69,7 @@ The service targets .NET 11 and is built from `src/TerraScale.Reviewer/TerraScal
 The context API accepts `POST /context/search` with `{ "repository": "TerraScale/ts-reviewer", "commit": "<sha>", "query": "Forgejo webhook authentication", "top_k": 8 }` and returns source snippets with repository, path, line range, symbol, and cosine-score metadata. Search applies the repository/commit boundary before a bounded exact cosine ranking, preserving tenant/commit isolation while avoiding vector-index writes during request-time reads. Reviews run through ocr and do not read this index; the context API serves other clients. Operators can inspect bounded dead-letter metadata with `GET /admin/context/dead-letter` and replay one job with `POST /admin/context/dead-letter/replay` using the separate operator bearer token; responses never expose lease tokens or indexed source content.
 CI (`.forgejo/workflows/ci.yml`) tags the image by immutable commit SHA. Pull
 requests only build and inspect it; pushes to `main` push the image tested in
-the same job to `git.terrascale.tech/terrascale/ts-reviewer:<sha>` with the
+the same job to `github.com/TerraScale/ts-reviewer:<sha>` with the
 `TERRASCALE_BOT_TOKEN` organization secret. The homelab deployment supplies the
 public webhook URL and secrets.
 
