@@ -51,6 +51,13 @@ jobs:
           github-server-url: https://git.terrascale.tech
           persist-credentials: false
 
+      - name: ts-libs packages are pinned to calendar versions
+        run: |
+          set -euo pipefail
+          # ts-libs publishes only YYYY.MMDD.HHmm[.ss]; any other pin is an old package.
+          bad=$(grep -rhoE 'Include="TerraScale\.(Logging|Endpoints)" Version="[^"]*"' --include=Directory.Packages.props --include='*.csproj' . | grep -vE 'Version="[0-9]{4}\.[0-9]{3,4}\.[0-9]{1,4}(\.[0-9]{1,2})?"' || true)
+          if [[ -n $bad ]]; then echo "Non-calendar ts-libs pins: $bad" >&2; exit 1; fi
+
       - name: Restore reviewer tests
         run: >-
           dotnet restore tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj

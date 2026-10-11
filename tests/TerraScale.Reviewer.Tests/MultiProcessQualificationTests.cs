@@ -163,7 +163,7 @@ public sealed partial class MultiProcessQualificationTests
             var workerError = await workerStderr.WaitAsync(TimeSpan.FromSeconds(10));
             await File.WriteAllTextAsync(workerLog,
                 $"pid={worker.Id} exit=sigkill\n--- stdout ---\n{workerOutput}\n--- stderr ---\n{workerError}\n");
-            await Assert.That(workerOutput).Contains($"indexed {Repository}@{Commit}");
+            await Assert.That(workerOutput).Contains($"\"Repository\":\"{Repository}\",\"Commit\":\"{Commit}\"");
             await Assert.That(forgejo.FileRequests).IsEqualTo(1);
 
             var queueState = new
