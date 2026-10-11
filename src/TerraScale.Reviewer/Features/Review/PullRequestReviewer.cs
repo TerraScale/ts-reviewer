@@ -16,29 +16,44 @@ public sealed class PullRequestReviewer(GitHubClient github, ReviewEngine engine
     /// <summary>
     /// Runs one review. <paramref name="cancellation"/> fires when the queue
     /// drops the request or shuts down, which publishes nothing here: the queue
-    /// marks a dropped head skipped once the review stops, and a shutdown leaves
+    /// marks a dropped head cancelled once the review stops, and a shutdown leaves
     /// it pending for startup recovery. Individual operations have deadlines;
     /// review size must not truncate model retry budgets.
     /// </summary>
-    public async Task RunAsync(ReviewRequest request, CancellationToken cancellation)
+    public Task RunAsync(ReviewRequest request, CancellationToken cancellation) => RunAsync(request, cancellation, null);
+
+    internal async Task RunAsync(ReviewRequest request, CancellationToken cancellation, Func<string, string, ReviewRequest?>? resolveCurrent)
     {
         var ct = cancellation;
         var (owner, name, number) = (request.Owner, request.Name, request.Number);
         var sha = request.HeadSha;
+        PullRequest? validated = null;
+        var reviewStarted = false;
         try
         {
-            logger.LogInformation("review started for {Repository}#{Number} with model {Model}", owner + "/" + name, number, ReviewProvider.PrimaryModel);
+            if (!await github.IsAllowedAsync(owner, name, ct)) return;
             var pr = await github.PullAsync(owner, name, number, ct) ?? throw new InvalidOperationException("pull request not found");
             if (!ValidTarget(pr, owner, name, number))
                 throw new InvalidOperationException("pull request metadata is outside the requested repository boundary");
+            validated = pr;
             if (pr.State != "open") { await SkipAsync(request, ReviewQueue.Closed); return; }
             if (sha is not null && !string.Equals(sha, pr.Head.Sha, StringComparison.OrdinalIgnoreCase))
             {
                 await SkipAsync(request, ReviewQueue.NewerHead);
-                return;
+                if (resolveCurrent is null) return;
+            }
+            if (resolveCurrent is not null)
+            {
+                var resolved = resolveCurrent(pr.Head.Sha, pr.Base.Sha);
+                if (resolved is null) return;
+                request = resolved;
             }
             sha = pr.Head.Sha;
-            await PublishStatusAsync(owner, name, sha, "pending", "Review in progress");
+            // Only this app's outcome for this exact PR and base can suppress a paid review.
+            if (!request.Rerun && IsCompleted(await LatestOwnedStatusAsync(pr, owner, name, ct), pr)) return;
+            reviewStarted = true;
+            logger.LogInformation("review started for {Repository}#{Number} with model {Model}", owner + "/" + name, number, ReviewProvider.PrimaryModel);
+            await PublishStatusAsync(owner, name, sha, "pending", StatusDescription(pr.Number, pr.Base.Sha, "Review in progress"));
             await ReviewAsync(pr, owner, name, number, ct);
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
@@ -48,13 +63,41 @@ public sealed class PullRequestReviewer(GitHubClient github, ReviewEngine engine
         catch (Exception ex)
         {
             logger.LogError(ex, "review failed for {Repository}#{Number}", owner + "/" + name, number);
-            if (sha is not null) await PublishStatusAsync(owner, name, sha, "error", "review failed: " + ex.Message);
+            // Recovery reconciles unavailable metadata; never overwrite an outcome before paid work begins.
+            if (sha is not null && reviewStarted && validated is not null) await PublishStatusAsync(owner, name, sha, "error",
+                StatusDescription(number, validated.Base.Sha, "review failed: " + ex.Message));
         }
     }
 
+    internal async Task<ContextStatus?> LatestOwnedStatusAsync(PullRequest pr, string owner, string name, CancellationToken ct) =>
+        (await github.StatusesAsync(owner, name, pr.Head.Sha, ct)).FirstOrDefault(x => x.Context == StatusContext
+            && string.Equals(x.Creator?.Login, options.BotLogin, StringComparison.OrdinalIgnoreCase)
+            && x.Description?.StartsWith(StatusDescription(pr.Number, pr.Base.Sha, string.Empty), StringComparison.Ordinal) == true);
+
+    internal static bool IsCompleted(ContextStatus? status, PullRequest pr) => status?.State is "success" or "failure"
+        || status?.State == "error" && status.Description?.StartsWith(StatusDescription(pr.Number, pr.Base.Sha, "Review cancelled:"), StringComparison.Ordinal) != true;
+
+    internal static string StatusDescription(int number, string? baseSha, string detail) =>
+        baseSha is null ? detail : $"PR #{number} base {baseSha.ToLowerInvariant()}: {detail}";
+
     /// <summary>Resolves the pending status of a head whose review the queue dropped.</summary>
-    public Task SkipAsync(ReviewRequest request, string reason) =>
-        request.HeadSha is null ? Task.CompletedTask : PublishStatusAsync(request.Owner, request.Name, request.HeadSha, "error", "Review cancelled: " + reason);
+    public async Task SkipAsync(ReviewRequest request, string reason)
+    {
+        if (request.HeadSha is null) return;
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        try
+        {
+            var prefix = request.BaseSha is null ? $"PR #{request.Number} base " : StatusDescription(request.Number, request.BaseSha, string.Empty);
+            var latest = (await github.StatusesAsync(request.Owner, request.Name, request.HeadSha, timeout.Token))
+                .FirstOrDefault(status => status.Context == StatusContext
+                    && string.Equals(status.Creator?.Login, options.BotLogin, StringComparison.OrdinalIgnoreCase)
+                    && status.Description?.StartsWith(prefix, StringComparison.Ordinal) == true);
+            if (latest?.State is "success" or "failure"
+                || latest?.State == "error" && !latest.Description!.Contains(": Review cancelled:", StringComparison.Ordinal)) return;
+            await PublishStatusAsync(request.Owner, request.Name, request.HeadSha, "error", StatusDescription(request.Number, request.BaseSha, "Review cancelled: " + reason));
+        }
+        catch (Exception ex) { logger.LogWarning(ex, "could not resolve cancelled status for {Repository}#{Number}", request.Owner + "/" + request.Name, request.Number); }
+    }
 
     /// <summary>Best-effort commit status publication with its own short deadline.</summary>
     public async Task PublishStatusAsync(string owner, string name, string sha, string state, string description)
@@ -88,13 +131,14 @@ public sealed class PullRequestReviewer(GitHubClient github, ReviewEngine engine
         ReviewResult result;
         try { result = await engine.RunAsync(pr, ct); }
         catch (Exception ex) when (ex is not OperationCanceledException)
-        { await PublishStatusAsync(owner, name, pr.Head.Sha, "error", "review incomplete: " + ex.Message); return; }
+        { await PublishStatusAsync(owner, name, pr.Head.Sha, "error", StatusDescription(number, pr.Base.Sha, "review incomplete: " + ex.Message)); return; }
         var latest = await github.PullAsync(owner, name, number, ct);
         if (latest is null || latest.State != "open" || !ValidTarget(latest, owner, name, number)
-            || !string.Equals(latest.Head.Sha, pr.Head.Sha, StringComparison.OrdinalIgnoreCase))
+            || !string.Equals(latest.Head.Sha, pr.Head.Sha, StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(latest.Base.Sha, pr.Base.Sha, StringComparison.OrdinalIgnoreCase))
         {
             logger.LogInformation("review discarded as stale for {Repository}#{Number}", owner + "/" + name, number);
-            await PublishStatusAsync(owner, name, pr.Head.Sha, "error", "Review cancelled: " + ReviewQueue.NewerHead);
+            await PublishStatusAsync(owner, name, pr.Head.Sha, "error", StatusDescription(number, pr.Base.Sha, "Review cancelled: " + ReviewQueue.NewerHead));
             return;
         }
         var hasFindings = result.Findings.Count > 0;
@@ -116,11 +160,20 @@ public sealed class PullRequestReviewer(GitHubClient github, ReviewEngine engine
         if (!await IsCurrentAsync(pr, owner, name, number, ct)) return;
         await github.ReviewAsync(owner, name, number, review, ct);
         if (!await IsCurrentAsync(pr, owner, name, number, ct)) return;
-        await github.StatusAsync(owner, name, pr.Head.Sha, new CommitStatus(hasFindings ? "failure" : "success", null, hasFindings ? "Findings require changes" : "No findings", StatusContext), ct);
+        if (!hasFindings)
+            foreach (var previous in await github.ReviewsAsync(owner, name, number, ct))
+            {
+                if (previous.State != "CHANGES_REQUESTED" || !string.Equals(previous.User?.Login, options.BotLogin, StringComparison.OrdinalIgnoreCase)) continue;
+                if (!await IsCurrentAsync(pr, owner, name, number, ct)) return;
+                await github.DismissReviewAsync(owner, name, number, previous.Id,
+                    $"Superseded by a complete clean source review of commit {pr.Head.Sha}; no approval or test execution is implied.", ct);
+            }
+        if (!await IsCurrentAsync(pr, owner, name, number, ct)) return;
+        await github.StatusAsync(owner, name, pr.Head.Sha, new CommitStatus(hasFindings ? "failure" : "success", null, StatusDescription(number, pr.Base.Sha, hasFindings ? "Findings require changes" : "No findings"), StatusContext), ct);
         logger.LogInformation("review published for {Repository}#{Number} at {Sha}: {Findings} finding(s)", owner + "/" + name, number, pr.Head.Sha, result.Findings.Count);
     }
 
-    private static bool ValidTarget(PullRequest pr, string owner, string name, int number) =>
+    internal static bool ValidTarget(PullRequest pr, string owner, string name, int number) =>
         pr.Number == number && pr.Base?.Repo?.Owner is not null && pr.Head is not null
         && string.Equals(pr.Base.Repo.Owner.Login, owner, StringComparison.OrdinalIgnoreCase)
         && string.Equals(pr.Base.Repo.Name, name, StringComparison.OrdinalIgnoreCase)
@@ -132,8 +185,9 @@ public sealed class PullRequestReviewer(GitHubClient github, ReviewEngine engine
         ct.ThrowIfCancellationRequested();
         var latest = await github.PullAsync(owner, name, number, ct);
         if (latest is not null && latest.State == "open" && ValidTarget(latest, owner, name, number)
-            && string.Equals(latest.Head.Sha, pr.Head.Sha, StringComparison.OrdinalIgnoreCase)) return true;
-        await SkipAsync(new ReviewRequest(owner, name, number, pr.Head.Sha), ReviewQueue.NewerHead);
+            && string.Equals(latest.Head.Sha, pr.Head.Sha, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(latest.Base.Sha, pr.Base.Sha, StringComparison.OrdinalIgnoreCase)) return true;
+        await SkipAsync(new ReviewRequest(owner, name, number, pr.Head.Sha, BaseSha: pr.Base.Sha), ReviewQueue.NewerHead);
         return false;
     }
 }

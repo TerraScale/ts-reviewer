@@ -1,0 +1,44 @@
+{
+  "comment": "Review-only replacement targets for the installed HomeLab manifest. Preserve the original Alpha dotenv generation for rollback before applying. Provision first-party credentials automatically; vendor credentials enter OpenBao directly. Do not run materialization until spending/auth and production handoff are approved.",
+  "targets": [
+    {
+      "id": "ts-reviewer-env",
+      "secretPath": "/ci/ts-reviewer",
+      "destination": "/var/srv/appdata/ts-reviewer/ts-reviewer.env",
+      "format": "dotenv",
+      "mode": "0644",
+      "keys": [
+        "TS_REVIEWER_ANTHROPIC_API_KEY",
+        "TS_REVIEWER_GITHUB_APP_ID",
+        "TS_REVIEWER_GITHUB_INSTALLATION_ID",
+        "TS_REVIEWER_GITHUB_PRIVATE_KEY_PATH",
+        "TS_REVIEWER_BOT_LOGIN",
+        "TS_REVIEWER_WEBHOOK_SECRET",
+        "TS_REVIEWER_CONTEXT_API_TOKEN",
+        "TS_REVIEWER_OPERATOR_TOKEN",
+        "TS_REVIEWER_CONTEXT_DATABASE"
+      ],
+      "requiredKeys": [
+        "TS_REVIEWER_ANTHROPIC_API_KEY",
+        "TS_REVIEWER_GITHUB_APP_ID",
+        "TS_REVIEWER_GITHUB_INSTALLATION_ID",
+        "TS_REVIEWER_GITHUB_PRIVATE_KEY_PATH",
+        "TS_REVIEWER_BOT_LOGIN",
+        "TS_REVIEWER_WEBHOOK_SECRET",
+        "TS_REVIEWER_CONTEXT_API_TOKEN",
+        "TS_REVIEWER_OPERATOR_TOKEN",
+        "TS_REVIEWER_CONTEXT_DATABASE"
+      ]
+    },
+    {
+      "id": "ts-reviewer-github-app-pem",
+      "secretPath": "/ci/ts-reviewer",
+      "destination": "/var/srv/appdata/ts-reviewer/github-app.pem",
+      "format": "raw",
+      "mode": "0600",
+      "owner": "1654",
+      "group": "1654",
+      "rawKey": "TS_REVIEWER_GITHUB_PRIVATE_KEY_PEM"
+    }
+  ]
+}

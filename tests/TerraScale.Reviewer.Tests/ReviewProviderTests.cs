@@ -587,21 +587,25 @@ public sealed class ReviewProviderTests
     public async Task DisconnectDuringResponseDeliveryCannotReopenTheRetryBudget(bool reviewCancellation)
     {
         var transport = new Transport((attempt, model, _) => Task.FromResult(attempt < 30
-            ? new HttpResponseMessage(HttpStatusCode.TooManyRequests)
-            : Success(model, [new { type = "text", text = new string('x', 32 * 1024 * 1024) }])));
+            ? new HttpResponseMessage(HttpStatusCode.TooManyRequests) : Success(model)));
         await using var provider = Create(transport);
         using var review = new CancellationTokenSource();
         await provider.StartAsync(review.Token);
         using var client = new HttpClient();
         client.DefaultRequestHeaders.Add("x-api-key", provider.Token);
-        using var request = new HttpRequestMessage(HttpMethod.Post, provider.Url + "/v1/messages") { Content = JsonContent.Create(Request()) };
-        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead).WaitAsync(TimeSpan.FromSeconds(5));
-        await Assert.That(response.StatusCode).IsEqualTo(HttpStatusCode.OK);
-        await Assert.That(response.Content.Headers.ContentLength > 32 * 1024 * 1024).IsTrue();
+        var failedDelivery = false;
+        try
+        {
+            await provider.SendAsync(Request(), CancellationToken.None, (_, _) =>
+            {
+                // Inject the transport failure directly; unread-body disposal races socket buffering.
+                if (reviewCancellation) review.Cancel();
+                throw new IOException("fixture response delivery failed");
+            });
+        }
+        catch (Exception exception) when (exception is IOException or InvalidOperationException) { failedDelivery = true; }
+        await Assert.That(failedDelivery).IsTrue();
         await Assert.That(transport.Models.Count).IsEqualTo(30);
-        if (reviewCancellation) review.Cancel();
-        // Disposing an unread body closes the local connection while the large response is still being written.
-        response.Dispose();
         using var retry = await client.PostAsJsonAsync(provider.Url + "/v1/messages", Request()).WaitAsync(TimeSpan.FromSeconds(5));
         await Assert.That(retry.IsSuccessStatusCode).IsFalse();
         await Assert.That(transport.Models.Count).IsEqualTo(30);

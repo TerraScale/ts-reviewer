@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Formats.Tar;
+using System.IO.Compression;
 using System.Threading.Channels;
 using TerraScale.Reviewer.Features.Configuration;
 using TerraScale.Reviewer.Features.GitHub;
@@ -15,7 +17,6 @@ public sealed class ContextIndexer : BackgroundService
     private readonly ILogger<ContextIndexer> _logger;
     private readonly string _workerId = Environment.MachineName + ":" + Environment.ProcessId + ":" + Guid.NewGuid().ToString("N");
     private const int QueueCapacity = 1024;
-    private const int FetchParallelism = 2; // Bound simultaneous GitHub file downloads independently of review workers.
     private readonly Channel<IndexRequest> _queue;
     private readonly ConcurrentDictionary<string, TaskCompletionSource<bool>> _pending = new(StringComparer.OrdinalIgnoreCase);
 
@@ -161,14 +162,36 @@ public sealed class ContextIndexer : BackgroundService
     private async Task IndexAsync(IndexRequest request, CancellationToken ct)
     {
         var repository = request.Owner + "/" + request.Name;
-        var tree = await _github.TreeAsync(request.Owner, request.Name, request.Commit, ct);
-        var files = tree.Where(x => x.Type == "blob" && x.Size is > 0 and <= 1_000_000 && IsSourceFile(x.Path)).Take(_options.ContextMaxFiles).ToList();
-        var chunks = new ConcurrentBag<CodeChunk>();
-        await Parallel.ForEachAsync(files, new ParallelOptions { MaxDegreeOfParallelism = FetchParallelism, CancellationToken = ct }, async (file, token) =>
+        // One exact-commit archive avoids consuming the installation REST budget per source file.
+        using var response = await _github.ArchiveAsync(request.Owner, request.Name, request.Commit, ct);
+        await using var compressed = await response.Content.ReadAsStreamAsync(ct);
+        await using var gzip = new GZipStream(compressed, CompressionMode.Decompress);
+        await using var bounded = new BoundedArchiveStream(gzip);
+        await using var tar = new TarReader(bounded);
+        var chunks = new List<CodeChunk>();
+        var files = 0;
+        string? prefix = null;
+        var paths = new HashSet<string>(StringComparer.Ordinal);
+        while (await tar.GetNextEntryAsync(cancellationToken: ct) is { } entry)
         {
-            var content = await _github.FileAsync(request.Owner, request.Name, request.Commit, file.Path, token);
-            foreach (var chunk in CodeChunker.Split(file.Path, content)) chunks.Add(chunk);
-        });
+            if (entry.EntryType == TarEntryType.GlobalExtendedAttributes) continue;
+            var split = entry.Name.IndexOf('/');
+            if (split <= 0) throw new InvalidOperationException("repository archive has an invalid root");
+            prefix ??= entry.Name[..split];
+            if (entry.Name[..split] != prefix) throw new InvalidOperationException("repository archive has multiple roots");
+            var path = entry.Name[(split + 1)..];
+            if (path.Split('/').Any(segment => segment is "." or "..") || path.Contains('\\'))
+                throw new InvalidOperationException("repository archive has an unsafe path");
+            // Never extract paths, follow symlinks, or execute archive content.
+            if (entry.EntryType is not (TarEntryType.RegularFile or TarEntryType.V7RegularFile)
+                || entry.Length is <= 0 or > 1_000_000 || !IsSourceFile(path)) continue;
+            if (!paths.Add(path)) throw new InvalidOperationException("repository archive has duplicate files");
+            if (++files > _options.ContextMaxFiles) throw new InvalidOperationException("repository exceeds the fixed context file limit");
+            using var reader = new StreamReader(entry.DataStream!, leaveOpen: true);
+            var content = await reader.ReadToEndAsync(ct);
+            chunks.AddRange(CodeChunker.Split(path, content));
+        }
+        if (prefix is null) throw new InvalidOperationException("repository archive was empty");
         var orderedChunks = chunks.OrderBy(x => x.Path, StringComparer.Ordinal).ThenBy(x => x.StartLine).ToList();
         if (orderedChunks.Count > 0)
         {
@@ -177,7 +200,7 @@ public sealed class ContextIndexer : BackgroundService
             _store.ReplaceCommit(repository, request.Commit, orderedChunks.Zip(vectors, (chunk, vector) => (chunk, vector)).ToList());
         }
         else _store.ReplaceCommit(repository, request.Commit, []);
-        _logger.LogInformation("indexed {Repository}@{Commit}: {Files} files, {Chunks} chunks", repository, request.Commit, files.Count, orderedChunks.Count);
+        _logger.LogInformation("indexed {Repository}@{Commit}: {Files} files, {Chunks} chunks", repository, request.Commit, files, orderedChunks.Count);
     }
 
     private (TaskCompletionSource<bool> Completion, bool Created) GetOrCreatePending(string key)

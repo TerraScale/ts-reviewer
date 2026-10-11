@@ -100,7 +100,7 @@ public sealed class ReviewerTests
 
             foreach (var key in new[] { "model", "fallback-model", "escalation-model", "max-concurrent", "ocr-concurrency",
                 "ocr-max-attempts", "ocr-retry-base-delay", "sol-weight", "glm-weight", "sol-slots", "glm-slots",
-                "model-slot-wait", "model-backoff-base-delay", "model-backoff-max-delay", "ocr-llm-timeout", "ocr-item-timeout", "timeout" })
+                "model-slot-wait", "model-backoff-base-delay", "model-backoff-max-delay", "ocr-llm-timeout", "ocr-item-timeout", "timeout", "context-max-files", "context-max-attempts", "context-retry-base-delay" })
             {
                 var rejected = false;
                 try { ReviewerOptions.Load([.. Credentials, "--" + key + "=1"]); }
@@ -121,19 +121,19 @@ public sealed class ReviewerTests
     {
         var path = Path.GetTempFileName();
         var overridePath = Path.GetTempFileName();
-        string[] names = ["TS_REVIEWER_CONFIG", "TS_REVIEWER_CONTEXT_MAX_FILES"];
+        string[] names = ["TS_REVIEWER_CONFIG", "TS_REVIEWER_CONTEXT_DATABASE"];
         var previous = names.ToDictionary(x => x, Environment.GetEnvironmentVariable);
         try
         {
             foreach (var name in names) Environment.SetEnvironmentVariable(name, null);
-            await File.WriteAllTextAsync(path, "{ \"context-max-files\": 70 }");
-            await File.WriteAllTextAsync(overridePath, "{ \"context-max-files\": \"80\" }");
+            await File.WriteAllTextAsync(path, "{ \"context-database\": \"first.db\" }");
+            await File.WriteAllTextAsync(overridePath, "{ \"context-database\": \"override.db\" }");
             Environment.SetEnvironmentVariable("TS_REVIEWER_CONFIG", path);
-            await Assert.That(ReviewerOptions.Load(Credentials).ContextMaxFiles).IsEqualTo(70);
-            await Assert.That(ReviewerOptions.Load([.. Credentials, "--" + configKey + "=" + overridePath]).ContextMaxFiles).IsEqualTo(80);
-            Environment.SetEnvironmentVariable("TS_REVIEWER_CONTEXT_MAX_FILES", "55");
-            await Assert.That(ReviewerOptions.Load(Credentials).ContextMaxFiles).IsEqualTo(55);
-            await Assert.That(ReviewerOptions.Load([.. Credentials, "--context-max-files=65"]).ContextMaxFiles).IsEqualTo(65);
+            await Assert.That(ReviewerOptions.Load(Credentials).ContextDatabasePath).IsEqualTo("first.db");
+            await Assert.That(ReviewerOptions.Load([.. Credentials, "--" + configKey + "=" + overridePath]).ContextDatabasePath).IsEqualTo("override.db");
+            Environment.SetEnvironmentVariable("TS_REVIEWER_CONTEXT_DATABASE", "environment.db");
+            await Assert.That(ReviewerOptions.Load(Credentials).ContextDatabasePath).IsEqualTo("environment.db");
+            await Assert.That(ReviewerOptions.Load([.. Credentials, "--context-database=argument.db"]).ContextDatabasePath).IsEqualTo("argument.db");
             await Assert.That(ReviewerOptions.Load(Credentials).GitHubUrl).IsEqualTo("https://api.github.com");
         }
         finally
@@ -393,6 +393,7 @@ public sealed class ReviewerTests
                     await Assert.That(comment.GetProperty("line").GetInt32()).IsEqualTo(findingLine);
                 }
             }
+            await Assert.That(transport.DismissedReviews).IsEquivalentTo(expectedFindings == 0 && !incomplete && !rejectReview ? new long[] { 88 } : Array.Empty<long>());
             await queue.StopAsync(CancellationToken.None);
             if (largeDiff)
             {
@@ -736,7 +737,7 @@ public sealed class ReviewerTests
     [Test]
     public async Task SynchronizedWebhookSchedulesReviewForUpdatedPullRequestHead()
     {
-        const string updatedHead = "updated-head-sha";
+        var updatedHead = new string('c', 40);
         var database = Path.Combine(Path.GetTempPath(), "ts-reviewer-" + Guid.NewGuid().ToString("N") + ".db");
         var options = Options(database);
         var handler = new SynchronizedWebhookFakeHandler();
@@ -795,6 +796,7 @@ public sealed class ReviewerTests
 
     private sealed class ReviewPublicationHandler(PullRequest pullRequest, bool rejectReview = false) : HttpMessageHandler
     {
+        public List<long> DismissedReviews { get; } = [];
         public TaskCompletionSource<JsonElement> Review { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource<JsonElement> PendingStatus { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource<JsonElement> Status { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -808,10 +810,22 @@ public sealed class ReviewerTests
                     return new(HttpStatusCode.OK) { Content = JsonContent.Create(new { permission = "write" }) };
                 if (path.EndsWith("/pulls/9", StringComparison.Ordinal))
                     return new(HttpStatusCode.OK) { Content = JsonContent.Create(pullRequest) };
-                if (path.EndsWith("/comments", StringComparison.Ordinal))
+                if (path.EndsWith("/reviews", StringComparison.Ordinal))
+                    return new(HttpStatusCode.OK) { Content = JsonContent.Create(new[]
+                    {
+                        new SubmittedReview(88, new Owner("bot"), "CHANGES_REQUESTED", new string('a', 40), "earlier findings"),
+                        new SubmittedReview(89, new Owner("human"), "CHANGES_REQUESTED", new string('a', 40), "human findings"),
+                        new SubmittedReview(90, new Owner("bot"), "COMMENT", pullRequest.Head.Sha, "clean")
+                    }) };
+                if (path.EndsWith("/comments", StringComparison.Ordinal) || path.EndsWith("/statuses", StringComparison.Ordinal))
                     return new(HttpStatusCode.OK) { Content = new StringContent("[]", Encoding.UTF8, "application/json") };
                 if (path.EndsWith(".diff", StringComparison.Ordinal) || path.EndsWith("/files", StringComparison.Ordinal))
                     throw new InvalidOperationException("review must use its local checkout, not the patch API");
+            }
+            else if (request.Method == HttpMethod.Put && path.EndsWith("/dismissals", StringComparison.Ordinal))
+            {
+                DismissedReviews.Add(long.Parse(path.Split('/')[^2]));
+                return new(HttpStatusCode.OK) { Content = JsonContent.Create(new { }) };
             }
             else if (request.Method == HttpMethod.Post)
             {
@@ -838,13 +852,10 @@ public sealed class ReviewerTests
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
-            if (request.Method == HttpMethod.Get && request.RequestUri?.AbsolutePath.Contains("/git/trees/", StringComparison.Ordinal) == true)
-                return Task.FromResult(Json(new { tree = new[] { new { path = "src/Widget.cs", type = "blob", size = 58, sha = "file-sha" } } }));
-            if (request.Method == HttpMethod.Get && request.RequestUri?.AbsolutePath.Contains("/contents/", StringComparison.Ordinal) == true)
+            if (request.Method == HttpMethod.Get && request.RequestUri?.AbsolutePath.Contains("/tarball/", StringComparison.Ordinal) == true)
             {
                 FileRequests++;
-                var content = Convert.ToBase64String(Encoding.UTF8.GetBytes("public class Widget { public Widget CreateWidget() => new(); }"));
-                return Task.FromResult(Json(new { content, encoding = "base64", type = "file" }));
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(ArchiveFixtures.Widget) });
             }
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
         }
@@ -859,8 +870,8 @@ public sealed class ReviewerTests
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
-            if (request.Method == HttpMethod.Get && request.RequestUri?.AbsolutePath.EndsWith("/status", StringComparison.Ordinal) == true)
-                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = JsonContent.Create(new { statuses = Array.Empty<object>() }) });
+            if (request.Method == HttpMethod.Get && request.RequestUri?.AbsolutePath.EndsWith("/statuses", StringComparison.Ordinal) == true)
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = JsonContent.Create(Array.Empty<object>()) });
             if (request.Method == HttpMethod.Get && request.RequestUri?.AbsolutePath.EndsWith("/permission", StringComparison.Ordinal) == true)
                 return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = JsonContent.Create(new { permission = "write" }) });
             if (request.Method == HttpMethod.Get && request.RequestUri?.AbsolutePath.EndsWith("/pulls/14", StringComparison.Ordinal) == true)
@@ -931,14 +942,14 @@ public sealed class ReviewerTests
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             var path = request.RequestUri!.AbsolutePath;
-            if (request.Method == HttpMethod.Get && path.EndsWith("/status", StringComparison.Ordinal))
-                return new(HttpStatusCode.OK) { Content = JsonContent.Create(new { statuses = Array.Empty<object>() }) };
+            if (request.Method == HttpMethod.Get && path.EndsWith("/statuses", StringComparison.Ordinal))
+                return new(HttpStatusCode.OK) { Content = JsonContent.Create(Array.Empty<object>()) };
             if (request.Method == HttpMethod.Get && path.EndsWith("/pulls/14", StringComparison.Ordinal))
             {
                 ReviewPullRequested.TrySetResult(true);
                 var repo = new Repository(new Owner("TerraScale"), "widgets");
                 return new(HttpStatusCode.OK) { Content = JsonContent.Create(new PullRequest(14, "change", "",
-                    new Branch(new string('b', 40), "main", repo), new Branch("updated-head-sha", "feature", repo))) };
+                    new Branch(new string('b', 40), "main", repo), new Branch(new string('c', 40), "feature", repo))) };
             }
 
             if (request.Method == HttpMethod.Post && path.Contains("/statuses/", StringComparison.Ordinal))

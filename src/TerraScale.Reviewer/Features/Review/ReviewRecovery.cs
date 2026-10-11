@@ -20,13 +20,18 @@ public sealed class ReviewRecovery(GitHubClient github, ReviewQueue queue, PullR
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        try
+        while (!stoppingToken.IsCancellationRequested)
         {
-            var recovered = await RecoverAsync(stoppingToken);
-            logger.LogInformation("startup recovery queued {Count} pending or unreviewed pull request(s)", recovered);
+            try
+            {
+                var recovered = await RecoverAsync(stoppingToken);
+                logger.LogInformation("review recovery queued {Count} pending or unreviewed pull request(s)", recovered);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { return; }
+            catch (Exception ex) { logger.LogWarning(ex, "review recovery failed; retrying in one minute"); }
+            try { await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken); }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { return; }
         }
-        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
-        catch (Exception ex) { logger.LogWarning(ex, "startup recovery of pending reviews failed; re-trigger them with a recheck comment"); }
     }
 
     internal async Task<int> RecoverAsync(CancellationToken ct)
@@ -51,12 +56,10 @@ public sealed class ReviewRecovery(GitHubClient github, ReviewQueue queue, PullR
             var pulls = await github.OpenPullsAsync(owner, name, page, PageSize, ct);
             foreach (var pull in pulls)
             {
-                var status = await github.CombinedStatusAsync(owner, name, pull.Head.Sha, ct);
-                var current = status?.Statuses?.FirstOrDefault(x => x.Context == PullRequestReviewer.StatusContext);
-                if (current is not null && current.State != "pending") continue;
+                var current = await reviewer.LatestOwnedStatusAsync(pull, owner, name, ct);
+                if (PullRequestReviewer.IsCompleted(current, pull)) continue;
                 logger.LogInformation("recovering review for {Repository}#{Number} at {Head}: {Reason}", owner + "/" + name, pull.Number, pull.Head.Sha, current is null ? "head never reviewed" : "review was pending");
-                queue.Enqueue(new ReviewRequest(owner, name, pull.Number, pull.Head.Sha),
-                    _ => reviewer.PublishStatusAsync(owner, name, pull.Head.Sha, "pending", "Review queued"));
+                queue.Enqueue(new ReviewRequest(owner, name, pull.Number, pull.Head.Sha, BaseSha: pull.Base.Sha));
                 recovered++;
             }
             if (pulls.Count < PageSize) return recovered;

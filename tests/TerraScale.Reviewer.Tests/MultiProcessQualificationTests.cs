@@ -428,23 +428,17 @@ public sealed partial class MultiProcessQualificationTests
                 var path = context.Request.Url!.AbsolutePath;
                 try
                 {
-                    if (path.Contains("/git/trees/", StringComparison.Ordinal))
-                    {
-                        await WriteJsonAsync(context.Response, new
-                        {
-                            tree = new object[] { new { path = "src/Widget.cs", type = "blob", size = 58, sha = "file-sha" } },
-                        });
-                    }
-                    else if (path.Contains("/contents/", StringComparison.Ordinal))
+                    if (path.Contains("/tarball/", StringComparison.Ordinal))
                     {
                         Interlocked.Increment(ref _fileRequests);
-                        // Hold the first file response so the reclaim lease is observably
-                        // held while the test reads the shared queue state.
+                        // Hold the archive response while the test observes the reclaimed lease.
                         if (Interlocked.Decrement(ref _stallsLeft) >= 0)
                             await Task.Delay(TimeSpan.FromMilliseconds(1_500), cancellationToken);
-                        var content = Convert.ToBase64String(
-                            Encoding.UTF8.GetBytes("public class Widget { public Widget CreateWidget() => new(); }"));
-                        await WriteJsonAsync(context.Response, new { content, encoding = "base64", type = "file" });
+                        var archive = ArchiveFixtures.Widget;
+                        context.Response.StatusCode = (int)HttpStatusCode.OK;
+                        context.Response.ContentType = "application/gzip";
+                        context.Response.ContentLength64 = archive.Length;
+                        await context.Response.OutputStream.WriteAsync(archive, cancellationToken);
                     }
                     else context.Response.StatusCode = (int)HttpStatusCode.NotFound;
                 }
@@ -452,15 +446,6 @@ public sealed partial class MultiProcessQualificationTests
                 catch (Exception) { context.Response.StatusCode = (int)HttpStatusCode.InternalServerError; }
                 finally { context.Response.Close(); }
             }
-        }
-
-        private static async Task WriteJsonAsync(HttpListenerResponse response, object value)
-        {
-            response.StatusCode = (int)HttpStatusCode.OK;
-            response.ContentType = "application/json";
-            var bytes = Json.SerializeToUtf8Bytes(value);
-            response.ContentLength64 = bytes.Length;
-            await response.OutputStream.WriteAsync(bytes);
         }
 
         public async ValueTask DisposeAsync()

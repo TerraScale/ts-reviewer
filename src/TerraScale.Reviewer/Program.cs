@@ -35,6 +35,7 @@ builder.Logging.AddSimpleConsole(console =>
 builder.Logging.AddFilter("Microsoft", LogLevel.Warning);
 builder.Services.AddSingleton(options);
 builder.Services.AddHttpClient<GitHubClient>()
+    .RemoveAllLoggers() // Archive redirects can contain temporary credentials in their query.
     .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler { AllowAutoRedirect = false });
 builder.Services.AddSingleton<ReviewEngine>();
 builder.Services.AddSingleton<PullRequestReviewer>();

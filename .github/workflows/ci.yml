@@ -1,6 +1,12 @@
 name: ts-reviewer CI
 
 on:
+  workflow_dispatch:
+    inputs:
+      expected_commit:
+        description: Exact trusted main commit requested by the maintainer command
+        required: true
+        type: string
   pull_request:
   push:
     branches: [main]
@@ -16,9 +22,14 @@ jobs:
     name: Check and build ts-reviewer
     runs-on: blacksmith-4vcpu-ubuntu-2404
     concurrency:
-      group: ts-reviewer-checks-${{ github.ref }}
+      group: ts-reviewer-checks-${{ github.event_name }}-${{ github.ref }}
       cancel-in-progress: true
     steps:
+      - name: Verify the requested trusted commit before running CI
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+        run: test "$GITHUB_SHA" = "$EXPECTED_COMMIT"
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
@@ -87,9 +98,11 @@ jobs:
         env:
           TOOLING_DIGEST: ${{ steps.tooling.outputs.digest }}
         run: |
+          # PublishRepositoryUrl is required by the SDK to emit the exact OCI commit label.
           dotnet msbuild src/TerraScale.Reviewer/TerraScale.Reviewer.csproj /t:PublishContainer \
             -p:Configuration=Release -p:RuntimeIdentifier=linux-x64 -p:SelfContained=true \
             -p:PublishDir="$GITHUB_WORKSPACE/artifacts/ci/reviewer/" \
+            -p:PublishRepositoryUrl=true -p:RepositoryUrl=https://github.com/TerraScale/ts-reviewer \
             -p:ContainerBaseImage="ghcr.io/terrascale/ts-reviewer@$TOOLING_DIGEST" \
             -p:ContainerRegistry=ghcr.io -p:ContainerRepository=terrascale/ts-reviewer \
             -p:ContainerImageTag="$GITHUB_SHA" -p:SourceRevisionId="$GITHUB_SHA"

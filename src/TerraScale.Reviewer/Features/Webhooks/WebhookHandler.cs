@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using TerraScale.Reviewer.Features.Configuration;
+using TerraScale.Reviewer.Features.Commands;
 using TerraScale.Reviewer.Features.Context;
 using TerraScale.Reviewer.Features.GitHub;
 using TerraScale.Reviewer.Features.Review;
@@ -50,7 +51,6 @@ public sealed class WebhookHandler(GitHubClient github, ReviewQueue queue, PullR
         string? lease = null;
         try
         {
-            if (!await github.IsAllowedAsync(owner, name, cancellationToken)) return Results.NoContent();
             lease = context.DeliveryStore.TryBeginWebhookDelivery(deliveryKey);
             if (lease is null) return Results.NoContent();
             var result = await DispatchAsync(eventName, webhook, owner, name, cancellationToken);
@@ -76,6 +76,7 @@ public sealed class WebhookHandler(GitHubClient github, ReviewQueue queue, PullR
     {
         if (eventName == "push")
         {
+            if (!await github.IsAllowedAsync(owner, name, ct)) return Results.NoContent();
             if (webhook.Ref?.StartsWith("refs/heads/", StringComparison.Ordinal) != true
                 || webhook.After is not { Length: 40 } sha || !sha.All(Uri.IsHexDigit) || sha.All(x => x == '0')) return Results.NoContent();
             if (!context.Enqueue(owner, name, sha)) throw new InvalidOperationException("context indexing admission failed");
@@ -87,36 +88,41 @@ public sealed class WebhookHandler(GitHubClient github, ReviewQueue queue, PullR
             if (number < 1 || webhook.PullRequest is null) return Results.NoContent();
             if (webhook.Action is "opened" or "synchronize" or "reopened")
             {
-                var current = await github.PullAsync(owner, name, number, ct);
-                if (current?.State != "open" || !string.Equals(current.Head.Sha, webhook.PullRequest.Head?.Sha, StringComparison.OrdinalIgnoreCase))
-                    return Results.NoContent();
-                var status = (await github.CombinedStatusAsync(owner, name, current.Head.Sha, ct))?.Statuses?
-                    .FirstOrDefault(x => x.Context == PullRequestReviewer.StatusContext);
-                // Completed outcomes deduplicate across deliveries/restarts; cancellation must permit A -> B -> A.
-                if (status?.State is "success" or "failure" || status?.State == "error"
-                    && status.Description?.StartsWith("Review cancelled:", StringComparison.Ordinal) != true)
-                    return Results.NoContent();
-                QueueReview(new ReviewRequest(owner, name, number, webhook.PullRequest.Head?.Sha));
+                QueueReview(new ReviewRequest(owner, name, number, webhook.PullRequest.Head?.Sha, BaseSha: webhook.PullRequest.Base?.Sha));
                 _ = AcknowledgeAsync(owner, name, number, null);
                 return Results.Accepted();
             }
             if (webhook.Action == "closed")
             {
-                if ((await github.PullAsync(owner, name, number, ct))?.State != "closed") return Results.NoContent();
-                queue.Cancel(owner, name, number);
+                _ = queue.CancelWhenClosedAsync(owner, name, number, async () =>
+                {
+                    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                    return (await github.PullAsync(owner, name, number, timeout.Token))?.State == "closed";
+                });
                 return Results.Accepted();
             }
             return Results.NoContent();
         }
         if (webhook.Action != "created" || webhook.Issue?.PullRequest is null || webhook.Issue.Number < 1
-            || FromBot(webhook) || webhook.Comment?.User?.Login is not { } login
-            || ParseCommand(webhook.Comment.Body, options.BotLogin) is not { } command) return Results.NoContent();
+            || FromBot(webhook) || webhook.Comment?.User?.Login is not { } login) return Results.NoContent();
+        var command = ParseCommand(webhook.Comment.Body, options.BotLogin);
+        var action = GitHubCommands.Parse(webhook.Comment.Body, options.BotLogin);
+        if (command is null && action is null) return Results.NoContent();
         if (!await github.CanReviewAsync(owner, name, login, ct)) return Results.NoContent();
+        if (action is { } parsed)
+        {
+            if (webhook.Comment.CreatedAt is not { } created || created <= DateTimeOffset.UnixEpoch || created > DateTimeOffset.UtcNow.AddMinutes(5)) return Results.BadRequest("invalid command timestamp");
+            // Finish an admitted maintainer action even if GitHub stops waiting for this webhook.
+            using var commandTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            await new GitHubCommands(github, options, context.DeliveryStore).ExecuteAsync(owner, name, webhook.Issue.Number, webhook.Comment.Id, created, parsed, commandTimeout.Token);
+            _ = AcknowledgeAsync(owner, name, webhook.Issue.Number, webhook.Comment.Id);
+            return Results.Accepted();
+        }
         switch (command)
         {
             case "review" or "recheck":
                 // Admit before resolving the head so commands retain FIFO order.
-                QueueReview(new ReviewRequest(owner, name, webhook.Issue.Number, null));
+                QueueReview(new ReviewRequest(owner, name, webhook.Issue.Number, null, Rerun: true));
                 break;
             case "explain":
                 await github.CommentAsync(owner, name, webhook.Issue.Number,
@@ -169,6 +175,7 @@ public sealed class WebhookHandler(GitHubClient github, ReviewQueue queue, PullR
     private void QueueReview(ReviewRequest request)
     {
         request = request with { HeadSha = string.IsNullOrWhiteSpace(request.HeadSha) ? null : request.HeadSha };
+        if (!request.Rerun) { queue.Enqueue(request); return; }
         queue.Enqueue(request, async admitted =>
         {
             if (admitted.HeadSha is null)
@@ -177,20 +184,23 @@ public sealed class WebhookHandler(GitHubClient github, ReviewQueue queue, PullR
                 var pull = await github.PullAsync(admitted.Owner, admitted.Name, admitted.Number, timeout.Token);
                 if (pull?.State != "open" || string.IsNullOrWhiteSpace(pull.Head.Sha))
                 { queue.Cancel(admitted.Owner, admitted.Name, admitted.Number); return; }
-                var resolved = queue.ResolveHead(admitted, pull.Head.Sha);
+                var resolved = queue.ResolveHead(admitted, pull.Head.Sha, pull.Base.Sha);
                 if (resolved is null) return;
                 admitted = resolved;
             }
-            await reviewer.PublishStatusAsync(admitted.Owner, admitted.Name, admitted.HeadSha!, "pending", "Review queued");
+            await reviewer.PublishStatusAsync(admitted.Owner, admitted.Name, admitted.HeadSha!, "pending",
+                PullRequestReviewer.StatusDescription(admitted.Number, admitted.BaseSha, "Review queued"));
         });
     }
 
     private sealed record WebhookEvent([property: JsonPropertyName("action")] string? Action, [property: JsonPropertyName("number")] int Number, [property: JsonPropertyName("ref")] string? Ref, [property: JsonPropertyName("after")] string? After, [property: JsonPropertyName("repository")] WebhookRepository? Repository, [property: JsonPropertyName("pull_request")] WebhookPullRequest? PullRequest, [property: JsonPropertyName("issue")] WebhookIssue? Issue, [property: JsonPropertyName("comment")] WebhookComment? Comment, [property: JsonPropertyName("sender")] Owner? Sender, [property: JsonPropertyName("installation")] WebhookInstallation? Installation);
     private sealed record WebhookInstallation([property: JsonPropertyName("id")] long Id);
     private sealed record WebhookRepository([property: JsonPropertyName("name")] string Name, [property: JsonPropertyName("owner")] Owner Owner);
-    private sealed record WebhookPullRequest([property: JsonPropertyName("number")] int Number, [property: JsonPropertyName("head")] WebhookBranch? Head);
+    private sealed record WebhookPullRequest([property: JsonPropertyName("number")] int Number, [property: JsonPropertyName("head")] WebhookBranch? Head,
+        [property: JsonPropertyName("base")] WebhookBranch? Base);
     private sealed record WebhookIssue([property: JsonPropertyName("number")] int Number, [property: JsonPropertyName("pull_request")] WebhookIssuePullRequest? PullRequest);
     private sealed record WebhookIssuePullRequest;
     private sealed record WebhookBranch([property: JsonPropertyName("sha")] string? Sha);
-    private sealed record WebhookComment([property: JsonPropertyName("id")] long Id, [property: JsonPropertyName("body")] string Body, [property: JsonPropertyName("user")] Owner? User);
+    private sealed record WebhookComment([property: JsonPropertyName("id")] long Id, [property: JsonPropertyName("body")] string Body, [property: JsonPropertyName("user")] Owner? User,
+        [property: JsonPropertyName("created_at")] DateTimeOffset? CreatedAt = null);
 }

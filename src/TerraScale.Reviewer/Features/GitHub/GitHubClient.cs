@@ -26,6 +26,7 @@ public sealed class GitHubClient
     {
         (_http, _options, _tokenFactory) = (http, options, tokenFactory);
         _http.BaseAddress = new Uri(options.GitHubUrl.TrimEnd('/') + "/");
+        _http.DefaultRequestHeaders.Authorization = null;
         _http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
         _http.DefaultRequestHeaders.UserAgent.ParseAdd("TerraScale-ts-reviewer/1.0");
         _http.DefaultRequestHeaders.Add("X-GitHub-Api-Version", "2022-11-28");
@@ -45,8 +46,16 @@ public sealed class GitHubClient
         return await InstallationTokenAsync(name, ct);
     }
 
-    public Task<PullRequest?> PullAsync(string owner, string name, int number, CancellationToken ct) =>
-        GetAsync<PullRequest>(owner, name, $"{Repo(owner, name)}/pulls/{number}", ct);
+    public async Task<PullRequest?> PullAsync(string owner, string name, int number, CancellationToken ct)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try { return await GetAsync<PullRequest>(owner, name, $"{Repo(owner, name)}/pulls/{number}", ct); }
+            catch (HttpRequestException ex) when (attempt < 3
+                && (ex.StatusCode is null or HttpStatusCode.TooManyRequests || (int)ex.StatusCode >= 500))
+            { await Task.Delay(TimeSpan.FromSeconds(attempt), ct); }
+        }
+    }
     public async Task<IReadOnlyList<IssueComment>> CommentsAsync(string owner, string name, int number, CancellationToken ct)
     {
         var comments = new List<IssueComment>();
@@ -67,6 +76,57 @@ public sealed class GitHubClient
         SendAsync(owner, name, HttpMethod.Patch, $"{Repo(owner, name)}/issues/comments/{id}", new { body }, ct);
     public Task ReviewAsync(string owner, string name, int number, PullReview review, CancellationToken ct) =>
         SendAsync(owner, name, HttpMethod.Post, $"{Repo(owner, name)}/pulls/{number}/reviews", review, ct);
+    public async Task<IReadOnlyList<SubmittedReview>> ReviewsAsync(string owner, string name, int number, CancellationToken ct)
+    {
+        var reviews = new List<SubmittedReview>();
+        for (var page = 1; ; page++)
+        {
+            var batch = await GetAsync<List<SubmittedReview>>(owner, name, $"{Repo(owner, name)}/pulls/{number}/reviews?per_page=100&page={page}", ct) ?? [];
+            reviews.AddRange(batch);
+            if (batch.Count < 100) return reviews;
+        }
+    }
+    public Task DismissReviewAsync(string owner, string name, int number, long id, string message, CancellationToken ct) =>
+        SendAsync(owner, name, HttpMethod.Put, $"{Repo(owner, name)}/pulls/{number}/reviews/{id}/dismissals", new { message }, ct);
+    public Task<Repository?> RepoAsync(string owner, string name, CancellationToken ct) => GetAsync<Repository>(owner, name, Repo(owner, name), ct);
+    public async Task<string?> BranchAsync(string owner, string name, string branch, CancellationToken ct) =>
+        (await GetAsync<RepositoryBranch>(owner, name, $"{Repo(owner, name)}/branches/{Uri.EscapeDataString(branch)}", ct))?.Commit.Sha;
+    public Task<RepositoryIssue?> IssueAsync(string owner, string name, int number, CancellationToken ct) =>
+        GetAsync<RepositoryIssue>(owner, name, $"{Repo(owner, name)}/issues/{number}", ct);
+    public async Task<IReadOnlyList<RepositoryIssue>> IssuesAsync(string owner, string name, CancellationToken ct, DateTimeOffset? since = null)
+    {
+        var issues = new List<RepositoryIssue>();
+        for (var page = 1; ; page++)
+        {
+            var batch = await GetAsync<List<RepositoryIssue>>(owner, name,
+                $"{Repo(owner, name)}/issues?creator={Uri.EscapeDataString(_options.BotLogin)}&state=all&per_page=100&page={page}"
+                    + (since is null ? string.Empty : "&since=" + Uri.EscapeDataString(since.Value.UtcDateTime.ToString("O"))), ct) ?? [];
+            issues.AddRange(batch);
+            if (batch.Count < 100) return issues;
+            if (page == 8) throw new InvalidOperationException("issue marker lookup exceeded its fixed page limit; creation was not attempted");
+        }
+    }
+    public async Task<RepositoryIssue> CreateIssueAsync(string owner, string name, string title, string body, CancellationToken ct)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, $"{Repo(owner, name)}/issues") { Content = JsonContent.Create(new { title, body }, options: JsonOptions) };
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", await GetInstallationTokenAsync(owner, name, ct));
+        using var response = await _http.SendAsync(request, ct);
+        EnsureSuccess(response);
+        return await response.Content.ReadFromJsonAsync<RepositoryIssue>(JsonOptions, ct)
+            ?? throw new InvalidOperationException("GitHub returned no created issue");
+    }
+    public async Task<RepositoryWorkflow?> WorkflowAsync(string owner, string name, string file, CancellationToken ct) =>
+        await GetWithTokenAsync<RepositoryWorkflow>($"{Repo(owner, name)}/actions/workflows/{Uri.EscapeDataString(file)}", await ActionsTokenAsync(owner, name, ct), ct);
+    public async Task DispatchWorkflowAsync(string owner, string name, string file, string branch, string expectedCommit, CancellationToken ct, Action? beforeSend = null)
+    {
+        if (expectedCommit.Length != 40 || !expectedCommit.All(Uri.IsHexDigit)) throw new ArgumentException("expected workflow commit must be a full SHA", nameof(expectedCommit));
+        using var request = new HttpRequestMessage(HttpMethod.Post, $"{Repo(owner, name)}/actions/workflows/{Uri.EscapeDataString(file)}/dispatches")
+        { Content = JsonContent.Create(new { @ref = branch, inputs = new { expected_commit = expectedCommit } }, options: JsonOptions) };
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", await ActionsTokenAsync(owner, name, ct));
+        beforeSend?.Invoke();
+        using var response = await _http.SendAsync(request, ct);
+        EnsureSuccess(response);
+    }
     public Task StatusAsync(string owner, string name, string sha, CommitStatus status, CancellationToken ct)
     {
         if (status.State is not ("pending" or "success" or "failure" or "error"))
@@ -99,11 +159,46 @@ public sealed class GitHubClient
         await GetAsync<List<PullRequest>>(owner, name, $"{Repo(owner, name)}/pulls?state=open&page={page}&per_page={limit}", ct) ?? [];
     public Task<CombinedStatus?> CombinedStatusAsync(string owner, string name, string sha, CancellationToken ct) =>
         GetAsync<CombinedStatus>(owner, name, $"{Repo(owner, name)}/commits/{Uri.EscapeDataString(sha)}/status", ct);
+    public async Task<IReadOnlyList<ContextStatus>> StatusesAsync(string owner, string name, string sha, CancellationToken ct)
+    {
+        var statuses = new List<ContextStatus>();
+        for (var page = 1; ; page++)
+        {
+            var batch = await GetAsync<List<ContextStatus>>(owner, name,
+                $"{Repo(owner, name)}/commits/{Uri.EscapeDataString(sha)}/statuses?per_page=100&page={page}", ct) ?? [];
+            statuses.AddRange(batch);
+            if (batch.Count < 100) return statuses;
+        }
+    }
     public async Task<IReadOnlyList<RepositoryTreeEntry>> TreeAsync(string owner, string name, string sha, CancellationToken ct)
     {
         var tree = await GetAsync<RepositoryTreeResponse>(owner, name, $"{Repo(owner, name)}/git/trees/{Uri.EscapeDataString(sha)}?recursive=1", ct);
         if (tree?.Truncated == true) throw new InvalidOperationException("GitHub returned a truncated tree; context indexing is incomplete");
         return tree?.Tree ?? [];
+    }
+    public async Task<HttpResponseMessage> ArchiveAsync(string owner, string name, string sha, CancellationToken ct)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, $"{Repo(owner, name)}/tarball/{Uri.EscapeDataString(sha)}");
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", await GetInstallationTokenAsync(owner, name, ct));
+        var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+        try
+        {
+            if (response.StatusCode is HttpStatusCode.MovedPermanently or HttpStatusCode.Found or HttpStatusCode.TemporaryRedirect or HttpStatusCode.PermanentRedirect)
+            {
+                var location = response.Headers.Location;
+                if (location is not { IsAbsoluteUri: true } || location.Scheme != Uri.UriSchemeHttps || location.Port != 443
+                    || !string.Equals(location.Host, "codeload.github.com", StringComparison.OrdinalIgnoreCase)
+                    || location.UserInfo.Length != 0 || location.Fragment.Length != 0
+                    || !location.AbsolutePath.StartsWith($"/{owner}/{name}/", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("GitHub archive redirect is outside the requested repository boundary");
+                response.Dispose();
+                using var download = new HttpRequestMessage(HttpMethod.Get, location);
+                response = await _http.SendAsync(download, HttpCompletionOption.ResponseHeadersRead, ct);
+            }
+            EnsureSuccess(response);
+            return response;
+        }
+        catch { response.Dispose(); throw; }
     }
     public async Task<string> FileAsync(string owner, string name, string sha, string path, CancellationToken ct)
     {
@@ -135,22 +230,28 @@ public sealed class GitHubClient
         EnsureSuccess(response);
     }
 
-    private async Task<string> InstallationTokenAsync(string name, CancellationToken ct)
+    private Task<string> ActionsTokenAsync(string owner, string name, CancellationToken ct)
+    {
+        if (!ValidRepository(owner, name)) throw new InvalidOperationException("repository is outside the GitHub installation boundary");
+        return InstallationTokenAsync(name, ct, actions: true);
+    }
+
+    private async Task<string> InstallationTokenAsync(string name, CancellationToken ct, bool actions = false)
     {
         if (_tokenFactory is not null) return await _tokenFactory(_options.Organization, name, ct);
-        if (_tokens.TryGetValue(name, out var token) && token.ExpiresAt > DateTimeOffset.UtcNow.AddMinutes(2)) return token.Token;
+        var key = actions ? "actions:" + name : name;
+        if (_tokens.TryGetValue(key, out var token) && token.ExpiresAt > DateTimeOffset.UtcNow.AddMinutes(2)) return token.Token;
         await _tokenGate.WaitAsync(ct);
         try
         {
-            if (_tokens.TryGetValue(name, out token) && token.ExpiresAt > DateTimeOffset.UtcNow.AddMinutes(2)) return token.Token;
+            if (_tokens.TryGetValue(key, out token) && token.ExpiresAt > DateTimeOffset.UtcNow.AddMinutes(2)) return token.Token;
             var jwt = await CreateAppJwtAsync(ct);
             var installation = await GetWithTokenAsync<AppInstallation>($"app/installations/{_options.GitHubInstallationId}", jwt, ct);
             if (installation?.Account?.Type != "Organization" || !string.Equals(installation.Account.Login, _options.Organization, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("GitHub App installation must belong to the TerraScale organization");
-            var permissions = new Dictionary<string, string>
-            {
-                ["contents"] = "read", ["metadata"] = "read", ["pull_requests"] = "write", ["issues"] = "write", ["statuses"] = "write"
-            };
+            var permissions = actions
+                ? new Dictionary<string, string> { ["actions"] = "write", ["metadata"] = "read" }
+                : new Dictionary<string, string> { ["contents"] = "read", ["metadata"] = "read", ["pull_requests"] = "write", ["issues"] = "write", ["statuses"] = "write" };
             using var request = new HttpRequestMessage(HttpMethod.Post, $"app/installations/{_options.GitHubInstallationId}/access_tokens")
             {
                 Content = JsonContent.Create(new { repositories = name.Length == 0 ? null : new[] { name }, permissions },
@@ -165,7 +266,7 @@ public sealed class GitHubClient
                 || (name.Length > 0 && token.Repositories?.Any(x => ValidRepository(x.Owner.Login, x.Name)
                     && string.Equals(x.Name, name, StringComparison.OrdinalIgnoreCase)) != true))
                 throw new InvalidOperationException("GitHub token does not include the requested installation repository");
-            _tokens[name] = token;
+            _tokens[key] = token;
             return token.Token;
         }
         finally { _tokenGate.Release(); }
@@ -198,6 +299,8 @@ public sealed class GitHubClient
     private static string Base64Url(byte[] bytes) => Convert.ToBase64String(bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
     private sealed record CollaboratorPermission([property: JsonPropertyName("permission")] string Permission);
     private sealed record AppInstallation([property: JsonPropertyName("account")] Owner Account);
+    private sealed record RepositoryBranch([property: JsonPropertyName("commit")] RepositoryCommit Commit);
+    private sealed record RepositoryCommit([property: JsonPropertyName("sha")] string Sha);
     private sealed record InstallationToken([property: JsonPropertyName("token")] string Token,
         [property: JsonPropertyName("expires_at")] DateTimeOffset ExpiresAt,
         [property: JsonPropertyName("repositories")] IReadOnlyList<Repository>? Repositories);

@@ -76,6 +76,8 @@ public sealed class GitHubMigrationTests
         await File.WriteAllTextAsync(keyPath, rsa.ExportRSAPrivateKeyPem());
         var signed = false;
         var scoped = false;
+        var actionsScoped = false;
+        var dispatchBound = false;
         var tokenRequests = 0;
         var transport = new Transport(async request =>
         {
@@ -93,10 +95,20 @@ public sealed class GitHubMigrationTests
             {
                 tokenRequests++;
                 using var body = JsonDocument.Parse(await request.Content!.ReadAsStringAsync());
-                scoped = body.RootElement.GetProperty("repositories")[0].GetString() == "widgets"
-                    && body.RootElement.GetProperty("permissions").GetProperty("contents").GetString() == "read";
+                var permissions = body.RootElement.GetProperty("permissions");
+                if (permissions.TryGetProperty("contents", out var contents))
+                    scoped = body.RootElement.GetProperty("repositories")[0].GetString() == "widgets"
+                        && contents.GetString() == "read" && !permissions.TryGetProperty("actions", out _);
+                else actionsScoped = permissions.GetProperty("actions").GetString() == "write"
+                    && permissions.GetProperty("metadata").GetString() == "read" && permissions.EnumerateObject().Count() == 2;
                 return Json(new { token = "fixture-installation-token", expires_at = DateTimeOffset.UtcNow.AddHours(1),
                     repositories = new[] { new { name = "widgets", owner = new { login = "TerraScale" } } } });
+            }
+            if (request.RequestUri.AbsolutePath.EndsWith("/dispatches", StringComparison.Ordinal))
+            {
+                using var body = JsonDocument.Parse(await request.Content!.ReadAsStringAsync());
+                dispatchBound = body.RootElement.GetProperty("ref").GetString() == "main"
+                    && body.RootElement.GetProperty("inputs").GetProperty("expected_commit").GetString() == new string('a', 40);
             }
             return Json(new { });
         });
@@ -105,9 +117,13 @@ public sealed class GitHubMigrationTests
             var github = new GitHubClient(new HttpClient(transport), Options() with { GitHubPrivateKeyPath = keyPath });
             await Assert.That(await github.IsAllowedAsync("TerraScale", "widgets", CancellationToken.None)).IsTrue();
             await github.CommentAsync("TerraScale", "widgets", 7, "evidence", CancellationToken.None);
+            await github.WorkflowAsync("TerraScale", "widgets", "ci.yml", CancellationToken.None);
+            await github.DispatchWorkflowAsync("TerraScale", "widgets", "ci.yml", "main", new string('a', 40), CancellationToken.None);
             await Assert.That(signed).IsTrue();
             await Assert.That(scoped).IsTrue();
-            await Assert.That(tokenRequests).IsEqualTo(1);
+            await Assert.That(actionsScoped).IsTrue();
+            await Assert.That(dispatchBound).IsTrue();
+            await Assert.That(tokenRequests).IsEqualTo(2);
         }
         finally { File.Delete(keyPath); }
     }
@@ -194,7 +210,7 @@ public sealed class GitHubMigrationTests
     {
         await using var fixture = new WebhookFixture();
         await Assert.That(await fixture.PostAsync("pull_request", PullEvent("opened"))).IsEqualTo(202);
-        await Assert.That(await fixture.PostAsync("pull_request", PullEvent("closed"))).IsEqualTo(204);
+        await Assert.That(await fixture.PostAsync("pull_request", PullEvent("closed"))).IsEqualTo(202);
         await Assert.That(fixture.Queue.Snapshot()).IsEqualTo((1, 0));
         fixture.PullState = "closed";
         await Assert.That(await fixture.PostAsync("pull_request", PullEvent("closed"))).IsEqualTo(202);
@@ -202,48 +218,88 @@ public sealed class GitHubMigrationTests
     }
 
     [Test]
-    public async Task DelayedSynchronizeDoesNotReplaceTheCurrentHead()
+    public async Task DelayedSynchronizeResolvesTheActualCurrentHeadWithoutAnotherPaidReview()
     {
-        await using var fixture = new WebhookFixture { PullHead = new string('b', 40) };
+        await using var fixture = new WebhookFixture(realReviewer: true) { PullHead = new string('b', 40), HeadStatus = "success" };
         await Assert.That(await fixture.PostAsync("pull_request", PullEvent("synchronize", fixture.PullHead))).IsEqualTo(202);
-        await Assert.That(await fixture.PostAsync("pull_request", PullEvent("synchronize", new string('a', 40)))).IsEqualTo(204);
+        await Assert.That(await fixture.PostAsync("pull_request", PullEvent("synchronize", new string('a', 40)))).IsEqualTo(202);
         await fixture.Queue.StartAsync(CancellationToken.None);
-        await Assert.That(await fixture.ReviewedHead.Task.WaitAsync(TimeSpan.FromSeconds(5))).IsEqualTo(fixture.PullHead);
-    }
-
-    [Test]
-    public async Task IgnoredOutdatedEventDoesNotConsumeAFutureCurrentHead()
-    {
-        await using var fixture = new WebhookFixture { PullHead = new string('b', 40) };
-        var payload = PullEvent("synchronize", new string('a', 40));
-        await Assert.That(await fixture.PostAsync("pull_request", payload)).IsEqualTo(204);
-        fixture.PullHead = new string('a', 40);
-        await Assert.That(await fixture.PostAsync("pull_request", payload)).IsEqualTo(202);
-        await Assert.That(fixture.Queue.Snapshot()).IsEqualTo((1, 0));
+        await WaitUntilAsync(() => fixture.Queue.Snapshot() == (0, 0));
+        await Assert.That(fixture.Transport.Requests.Any(x => x.Path.EndsWith("/commits/" + fixture.PullHead + "/statuses", StringComparison.Ordinal))).IsTrue();
+        await Assert.That(fixture.Transport.Requests.Any(x => x.Path.EndsWith("/reviews", StringComparison.Ordinal))).IsFalse();
     }
 
     [Test]
     [Arguments("success")]
     [Arguments("failure")]
     [Arguments("error")]
-    public async Task CompletedOutcomeDeduplicatesAutomaticHeadWithNewDeliveryId(string state)
+    public async Task CompletedOwnOutcomeIsCheckedBeforeAnyPendingOverwrite(string state)
     {
-        await using var fixture = new WebhookFixture();
+        await using var fixture = new WebhookFixture(realReviewer: true) { HeadStatus = state, StatusDescription = "Review finished" };
         await Assert.That(await fixture.PostAsync("pull_request", PullEvent("synchronize"))).IsEqualTo(202);
         await fixture.Queue.StartAsync(CancellationToken.None);
-        await fixture.ReviewedHead.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        fixture.HeadStatus = state;
-        fixture.StatusDescription = state == "error" ? "review incomplete: provider failed" : "Review finished";
-        await Assert.That(await fixture.PostAsync("pull_request", PullEvent("synchronize"))).IsEqualTo(204);
-        await Assert.That(fixture.Transport.Requests.Count(x => x.Path.EndsWith("/status", StringComparison.Ordinal))).IsEqualTo(2);
+        await WaitUntilAsync(() => fixture.Queue.Snapshot() == (0, 0));
+        await Assert.That(await fixture.PostAsync("pull_request", PullEvent("synchronize"))).IsEqualTo(202);
+        await WaitUntilAsync(() => fixture.Queue.Snapshot() == (0, 0));
+        await Assert.That(fixture.Transport.Requests.Count(x => x.Path.EndsWith("/statuses", StringComparison.Ordinal))).IsEqualTo(2);
+        await Assert.That(fixture.Transport.Requests.Any(x => x.Path.Contains("/statuses/", StringComparison.Ordinal) || x.Path.EndsWith("/reviews", StringComparison.Ordinal))).IsFalse();
     }
 
     [Test]
-    public async Task CancelledOutcomeCanBeReviewedWhenTheHeadBecomesCurrentAgain()
+    [Arguments("outsider", 7, 'b')]
+    [Arguments("reviewer[bot]", 8, 'b')]
+    [Arguments("reviewer[bot]", 7, 'c')]
+    public async Task SpoofedOrDifferentPullRequestOrBaseStatusCannotSuppressReview(string creator, int number, char baseCharacter)
+    {
+        await using var fixture = new WebhookFixture { HeadStatus = "success", StatusCreator = creator, StatusNumber = number, StatusBase = new string(baseCharacter, 40) };
+        var status = await fixture.Reviewer.LatestOwnedStatusAsync(fixture.Metadata, "TerraScale", "widgets", CancellationToken.None);
+        await Assert.That(status).IsNull();
+        await Assert.That(PullRequestReviewer.IsCompleted(status, fixture.Metadata)).IsFalse();
+    }
+
+    [Test]
+    public async Task CancelledOwnOutcomeCanBeReviewedWhenTheHeadBecomesCurrentAgain()
     {
         await using var fixture = new WebhookFixture { HeadStatus = "error", StatusDescription = "Review cancelled: a newer push replaced this head" };
-        await Assert.That(await fixture.PostAsync("pull_request", PullEvent("synchronize"))).IsEqualTo(202);
-        await Assert.That(fixture.Queue.Snapshot()).IsEqualTo((1, 0));
+        var status = await fixture.Reviewer.LatestOwnedStatusAsync(fixture.Metadata, "TerraScale", "widgets", CancellationToken.None);
+        await Assert.That(status).IsNotNull();
+        await Assert.That(PullRequestReviewer.IsCompleted(status, fixture.Metadata)).IsFalse();
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> done)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        while (!done()) await Task.Delay(10, timeout.Token);
+    }
+
+    [Test]
+    public async Task AutomaticAdmissionPreservesOrderWhileAuthenticationIsBlocked()
+    {
+        var release = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var fixture = new WebhookFixture(tokenFactory: (_, _, _) => release.Task);
+        try
+        {
+            var a = new string('a', 40);
+            var b = new string('b', 40);
+            await Assert.That(await fixture.PostAsync("pull_request", PullEvent("synchronize", a)).WaitAsync(TimeSpan.FromSeconds(1))).IsEqualTo(202);
+            await Assert.That(await fixture.PostAsync("pull_request", PullEvent("synchronize", b)).WaitAsync(TimeSpan.FromSeconds(1))).IsEqualTo(202);
+            await fixture.Queue.StartAsync(CancellationToken.None);
+            await Assert.That(await fixture.ReviewedHead.Task.WaitAsync(TimeSpan.FromSeconds(5))).IsEqualTo(b);
+        }
+        finally { release.TrySetResult("fixture-installation-token"); }
+    }
+
+    [Test]
+    public async Task MetadataTransientFailureRetriesWithoutLosingAcceptedHead()
+    {
+        var attempts = 0;
+        var repository = new Repository(new Owner("TerraScale"), "widgets");
+        var transport = new Transport(_ => Task.FromResult(++attempts == 1
+            ? new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
+            : Json(new PullRequest(7, "title", "", new Branch(new string('b', 40), "main", repository), new Branch(new string('a', 40), "head", repository)))));
+        var pull = await Client(transport).PullAsync("TerraScale", "widgets", 7, CancellationToken.None);
+        await Assert.That(pull?.Head.Sha).IsEqualTo(new string('a', 40));
+        await Assert.That(attempts).IsEqualTo(2);
     }
 
     [Test]
@@ -298,6 +354,79 @@ public sealed class GitHubMigrationTests
         await Assert.That(rejected).IsTrue();
     }
 
+    [Test]
+    public async Task CancellationCannotOverwriteACompletedOwnedOutcome()
+    {
+        await using var fixture = new WebhookFixture { HeadStatus = "success" };
+        await fixture.Reviewer.SkipAsync(new ReviewRequest("TerraScale", "widgets", 7, fixture.PullHead, BaseSha: fixture.Metadata.Base.Sha), ReviewQueue.NewerHead);
+        await Assert.That(fixture.Transport.Requests.Any(x => x.Path.Contains("/statuses/", StringComparison.Ordinal))).IsFalse();
+    }
+
+    [Test]
+    public async Task StatusPaginationFindsOwnedOutcomeBehindSpoofedContexts()
+    {
+        var baseSha = new string('b', 40);
+        var spoofed = new ContextStatus("ts-reviewer", "success", PullRequestReviewer.StatusDescription(7, baseSha, "spoof"), new Owner("outsider"));
+        var owned = spoofed with { Creator = new Owner("reviewer[bot]") };
+        var transport = new Transport(request => Task.FromResult(Json(request.RequestUri!.Query.EndsWith("&page=1", StringComparison.Ordinal)
+            ? Enumerable.Repeat(spoofed, 100).ToArray() : new[] { owned })));
+        var options = Options();
+        var reviewer = new PullRequestReviewer(Client(transport), new ReviewEngine(options, NullLogger<ReviewEngine>.Instance), options, NullLogger<PullRequestReviewer>.Instance);
+        var repo = new Repository(new Owner("TerraScale"), "widgets");
+        var pull = new PullRequest(7, "title", "", new Branch(baseSha, "main", repo), new Branch(new string('a', 40), "head", repo));
+        var status = await reviewer.LatestOwnedStatusAsync(pull, "TerraScale", "widgets", CancellationToken.None);
+        await Assert.That(status?.Creator?.Login).IsEqualTo("reviewer[bot]");
+        await Assert.That(transport.Requests.Count).IsEqualTo(2);
+    }
+
+    [Test]
+    public async Task ArchiveRedirectDoesNotForwardInstallationAuthorization()
+    {
+        var transport = new Transport(request => Task.FromResult(request.RequestUri!.Host == "github.test"
+            ? Redirect("https://codeload.github.com/TerraScale/widgets/tar.gz/" + new string('a', 40))
+            : new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("fixture archive") }));
+        using var response = await Client(transport).ArchiveAsync("TerraScale", "widgets", new string('a', 40), CancellationToken.None);
+        await Assert.That(response.IsSuccessStatusCode).IsTrue();
+        var requests = transport.Requests.ToArray();
+        await Assert.That(requests[0].Authenticated).IsTrue();
+        await Assert.That(requests[1].Authenticated).IsFalse();
+    }
+
+    [Test]
+    [Arguments("https://outside.test/TerraScale/widgets/tar.gz/sha")]
+    [Arguments("http://codeload.github.com/TerraScale/widgets/tar.gz/sha")]
+    [Arguments("https://codeload.github.com:444/TerraScale/widgets/tar.gz/sha")]
+    [Arguments("https://codeload.github.com/OtherOrg/widgets/tar.gz/sha")]
+    [Arguments("https://codeload.github.com/TerraScale/other/tar.gz/sha")]
+    [Arguments("https://user@codeload.github.com/TerraScale/widgets/tar.gz/sha")]
+    public async Task ArchiveRejectsRedirectOutsideTrustedRepositoryBoundary(string location)
+    {
+        var transport = new Transport(_ => Task.FromResult(Redirect(location)));
+        var rejected = false;
+        try { using var response = await Client(transport).ArchiveAsync("TerraScale", "widgets", new string('a', 40), CancellationToken.None); }
+        catch (InvalidOperationException) { rejected = true; }
+        await Assert.That(rejected).IsTrue();
+        await Assert.That(transport.Requests.Count).IsEqualTo(1);
+    }
+
+    [Test]
+    public async Task ArchiveFollowsOnlyOneRedirect()
+    {
+        var transport = new Transport(_ => Task.FromResult(Redirect("https://codeload.github.com/TerraScale/widgets/tar.gz/sha")));
+        var rejected = false;
+        try { using var response = await Client(transport).ArchiveAsync("TerraScale", "widgets", new string('a', 40), CancellationToken.None); }
+        catch (HttpRequestException ex) { rejected = ex.StatusCode == HttpStatusCode.Found; }
+        await Assert.That(rejected).IsTrue();
+        await Assert.That(transport.Requests.Count).IsEqualTo(2);
+    }
+
+    private static HttpResponseMessage Redirect(string location)
+    {
+        var response = new HttpResponseMessage(HttpStatusCode.Found);
+        response.Headers.Location = new Uri(location);
+        return response;
+    }
+
     private static object PullEvent(string action, string? head = null) => new { action, number = 7, repository = new { name = "widgets", owner = new { login = "TerraScale" } },
         pull_request = new { number = 7, head = new { sha = head ?? new string('a', 40) } } };
     private static object CommandEvent(string login = "author", string type = "User", long id = 1) => new { action = "created",
@@ -330,11 +459,18 @@ public sealed class GitHubMigrationTests
         public string PullHead { get; set; } = new string('a', 40);
         public string? HeadStatus { get; set; }
         public string? StatusDescription { get; set; }
+        public string StatusCreator { get; set; } = "reviewer[bot]";
+        public int StatusNumber { get; set; } = 7;
+        public string? StatusBase { get; set; }
+        public PullRequestReviewer Reviewer { get; }
+        public PullRequest Metadata => new(7, "title", "body", new Branch(new string('b', 40), "main", new Repository(new Owner("TerraScale"), "widgets")),
+            new Branch(PullHead, "feature", new Repository(new Owner("TerraScale"), "widgets")), PullState);
         public TaskCompletionSource<string> ReviewedHead { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public Transport Transport { get; }
         public ReviewQueue Queue { get; }
         public WebhookHandler Handler { get; }
-        public WebhookFixture(string? database = null, string permission = "write", Func<ReviewRequest, CancellationToken, Task>? runner = null)
+        public WebhookFixture(string? database = null, string permission = "write", Func<ReviewRequest, CancellationToken, Task>? runner = null,
+            bool realReviewer = false, Func<string, string, CancellationToken, Task<string>>? tokenFactory = null)
         {
             _database = database ?? Path.Combine(Path.GetTempPath(), "reviewer-webhook-" + Guid.NewGuid().ToString("N") + ".db");
             _delete = database is null;
@@ -343,21 +479,22 @@ public sealed class GitHubMigrationTests
             {
                 if (request.RequestUri!.AbsolutePath.Contains("/collaborators/", StringComparison.Ordinal))
                     return Task.FromResult(PermissionFails ? new HttpResponseMessage(HttpStatusCode.ServiceUnavailable) : Json(new { permission }));
-                if (request.RequestUri.AbsolutePath.EndsWith("/status", StringComparison.Ordinal))
-                    return Task.FromResult(Json(new CombinedStatus(HeadStatus is null ? [] :
-                        [new ContextStatus(PullRequestReviewer.StatusContext, HeadStatus, StatusDescription)])));
+                if (request.RequestUri.AbsolutePath.EndsWith("/statuses", StringComparison.Ordinal))
+                    return Task.FromResult(Json(HeadStatus is null ? Array.Empty<ContextStatus>() :
+                        new[] { new ContextStatus(PullRequestReviewer.StatusContext, HeadStatus,
+                            PullRequestReviewer.StatusDescription(StatusNumber, StatusBase ?? Metadata.Base.Sha, StatusDescription ?? "Review complete"), new Owner(StatusCreator)) }));
                 if (request.RequestUri.AbsolutePath.EndsWith("/pulls/7", StringComparison.Ordinal))
-                    return Task.FromResult(Json(new PullRequest(7, "title", "body", new Branch(new string('b', 40), "main", new Repository(new Owner("TerraScale"), "widgets")),
-                        new Branch(PullHead, "feature", new Repository(new Owner("TerraScale"), "widgets")), PullState)));
+                    return Task.FromResult(Json(Metadata));
                 return Task.FromResult(Json(new { }));
             });
-            var github = new GitHubClient(new HttpClient(Transport), options, (_, _, _) => Task.FromResult("fixture-installation-token"));
-            Queue = new ReviewQueue(runner ?? ((request, _) => { ReviewedHead.TrySetResult(request.HeadSha!); return Task.CompletedTask; }),
-                (_, _) => Task.CompletedTask, 1, NullLogger<ReviewQueue>.Instance);
+            var github = new GitHubClient(new HttpClient(Transport), options, tokenFactory ?? ((_, _, _) => Task.FromResult("fixture-installation-token")));
             _store = new ContextStore(options);
             var context = new ContextIndexer(github, _store, Embedder, options, NullLogger<ContextIndexer>.Instance);
-            var reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance), options, NullLogger<PullRequestReviewer>.Instance);
-            Handler = new WebhookHandler(github, Queue, reviewer, context, options, NullLogger<WebhookHandler>.Instance);
+            Reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance), options, NullLogger<PullRequestReviewer>.Instance);
+            Queue = realReviewer ? new ReviewQueue(Reviewer, NullLogger<ReviewQueue>.Instance)
+                : new ReviewQueue(runner ?? ((request, _) => { ReviewedHead.TrySetResult(request.HeadSha!); return Task.CompletedTask; }),
+                    (_, _) => Task.CompletedTask, 1, NullLogger<ReviewQueue>.Instance);
+            Handler = new WebhookHandler(github, Queue, Reviewer, context, options, NullLogger<WebhookHandler>.Instance);
         }
         public async Task<int?> PostAsync(string eventName, object payload, string? delivery = null)
         {

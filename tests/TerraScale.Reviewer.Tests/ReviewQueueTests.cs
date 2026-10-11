@@ -255,7 +255,7 @@ public sealed class ReviewQueueTests
         var reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance), options, NullLogger<PullRequestReviewer>.Instance);
         var oldHead = new string('a', 40);
         await reviewer.RunAsync(Request(7, oldHead), CancellationToken.None);
-        await Assert.That(transport.Requests.Count).IsEqualTo(2);
+        await Assert.That(transport.Requests.Count).IsEqualTo(3);
         await Assert.That(transport.Requests.Last()).IsEqualTo("/repos/TerraScale/widgets/statuses/" + oldHead);
         await Assert.That(transport.State).IsEqualTo("error");
     }
@@ -529,9 +529,8 @@ public sealed class ReviewQueueTests
 
         await Assert.That(await recovery.RecoverAsync(CancellationToken.None)).IsEqualTo(2);
         await Assert.That(queue.Snapshot()).IsEqualTo((2, 0));
-        // Recovery admission is immediate; its queued POST runs asynchronously.
-        await WaitUntilAsync(() => handler.QueuedHeads.Count == 2);
-        await Assert.That(string.Join(",", handler.QueuedHeads.Order())).IsEqualTo("pending-head,unreviewed-head");
+        // Admission must not overwrite a trusted terminal status before the worker deduplicates it.
+        await Assert.That(handler.QueuedHeads.Count).IsEqualTo(0);
         await queue.StartAsync(CancellationToken.None);
         try
         {
@@ -550,6 +549,27 @@ public sealed class ReviewQueueTests
         var queue = new ReviewQueue(runner.RunAsync, runner.SkipAsync, workers, NullLogger<ReviewQueue>.Instance);
         await queue.StartAsync(CancellationToken.None);
         return queue;
+    }
+
+    [Test]
+    public async Task DelayedClosureLookupCannotCancelANewerAdmission()
+    {
+        var runner = new ScriptedRunner();
+        var queue = await StartAsync(runner, 1);
+        var closed = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            queue.Enqueue(Request(7, "old"));
+            await runner.Started(7, "old").WaitAsync(Wait);
+            var verification = queue.CancelWhenClosedAsync("TerraScale", "widgets", 7, () => closed.Task);
+            queue.Enqueue(Request(7, "current"));
+            await runner.Started(7, "current").WaitAsync(Wait);
+            closed.TrySetResult(true);
+            await verification;
+            await Assert.That(queue.Snapshot()).IsEqualTo((0, 1));
+            runner.Release(7, "current");
+        }
+        finally { closed.TrySetResult(false); await queue.StopAsync(CancellationToken.None); }
     }
 
     private static async Task<IResult> PostAsync(WebhookHandler handler, object payload)
@@ -650,6 +670,8 @@ public sealed class ReviewQueueTests
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             Requests.Add(request.RequestUri!.AbsolutePath);
+            if (request.RequestUri.AbsolutePath.EndsWith("/statuses", StringComparison.Ordinal))
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = JsonContent.Create(Array.Empty<ContextStatus>()) };
             if (request.Method == HttpMethod.Get)
             {
                 var repository = new Repository(new Owner("TerraScale"), "widgets");
@@ -720,11 +742,11 @@ public sealed class ReviewQueueTests
                     },
                 },
                 "/repos/TerraScale/widgets/pulls" => new object[] { Pull(7, "pending-head"), Pull(8, "reviewed-head"), Pull(9, "unreviewed-head"), Pull(10, "errored-head"), Pull(11, "rejected-head") },
-                "/repos/TerraScale/widgets/commits/pending-head/status" => Status(("ci", "success"), ("ts-reviewer", "pending")),
-                "/repos/TerraScale/widgets/commits/reviewed-head/status" => Status(("ci", "pending"), ("ts-reviewer", "success")),
-                "/repos/TerraScale/widgets/commits/unreviewed-head/status" => Status(("ci", "pending")),
-                "/repos/TerraScale/widgets/commits/errored-head/status" => Status(("ts-reviewer", "error")),
-                "/repos/TerraScale/widgets/commits/rejected-head/status" => Status(("ts-reviewer", "failure")),
+                "/repos/TerraScale/widgets/commits/pending-head/statuses" => Status(7, ("ci", "success"), ("ts-reviewer", "pending")),
+                "/repos/TerraScale/widgets/commits/reviewed-head/statuses" => Status(8, ("ci", "pending"), ("ts-reviewer", "success")),
+                "/repos/TerraScale/widgets/commits/unreviewed-head/statuses" => Status(9, ("ci", "pending")),
+                "/repos/TerraScale/widgets/commits/errored-head/statuses" => Status(10, ("ts-reviewer", "error")),
+                "/repos/TerraScale/widgets/commits/rejected-head/statuses" => Status(11, ("ts-reviewer", "failure")),
                 _ => throw new InvalidOperationException("unexpected request " + request.RequestUri.PathAndQuery),
             };
             return new HttpResponseMessage(HttpStatusCode.OK) { Content = JsonContent.Create(body) };
@@ -736,7 +758,8 @@ public sealed class ReviewQueueTests
             return new { number, title = "t", body = "", @base = new { sha = "base", @ref = "main", repo }, head = new { sha = head, @ref = "feature", repo } };
         }
 
-        private static object Status(params (string Context, string State)[] statuses) =>
-            new { statuses = statuses.Select(x => new { context = x.Context, state = x.State, description = "" }) };
+        private static object Status(int number, params (string Context, string State)[] statuses) =>
+            statuses.Select(x => new { context = x.Context, state = x.State,
+                description = PullRequestReviewer.StatusDescription(number, "base", "Review complete"), creator = new { login = "bot" } }).ToArray();
     }
 }

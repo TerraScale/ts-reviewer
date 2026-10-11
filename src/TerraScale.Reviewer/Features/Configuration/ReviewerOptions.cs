@@ -23,9 +23,6 @@ public sealed record ReviewerOptions(
             ["webhook-secret"] = string.Empty,
             ["context-api-token"] = string.Empty,
             ["context-database"] = "data/reviewer-context.db",
-            ["context-max-files"] = "20000",
-            ["context-max-attempts"] = "5",
-            ["context-retry-base-delay"] = "00:00:01",
             ["operator-token"] = string.Empty
         };
         var overrides = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
@@ -83,21 +80,12 @@ public sealed record ReviewerOptions(
         var webhookSecret = Required(values, "webhook-secret", "TS_REVIEWER_WEBHOOK_SECRET");
         var contextApiToken = Required(values, "context-api-token", "TS_REVIEWER_CONTEXT_API_TOKEN");
         var operatorToken = Required(values, "operator-token", "TS_REVIEWER_OPERATOR_TOKEN");
-        var contextMaxFiles = ParseInt(values, "context-max-files");
-        if (contextMaxFiles is < 1 or > 100_000) throw new InvalidOperationException("context-max-files must be between 1 and 100000");
-        var contextMaxAttempts = ParseInt(values, "context-max-attempts");
-        if (contextMaxAttempts is < 1 or > 100) throw new InvalidOperationException("context-max-attempts must be between 1 and 100");
-        if (!TimeSpan.TryParse(values["context-retry-base-delay"], out var contextRetryBaseDelay)
-            || contextRetryBaseDelay <= TimeSpan.Zero || contextRetryBaseDelay > TimeSpan.FromMinutes(1))
-            throw new InvalidOperationException("context-retry-base-delay must be positive and at most one minute");
         return new ReviewerOptions(Trim(values["listen"]!), "https://api.github.com", appId,
             "https://api.anthropic.com", anthropicKey, "TerraScale", botLogin,
-            webhookSecret, contextApiToken, values["context-database"]!, contextMaxFiles,
-            contextMaxAttempts, contextRetryBaseDelay, operatorToken, installationId, privateKeyPath);
+            webhookSecret, contextApiToken, values["context-database"]!, 20_000,
+            5, TimeSpan.FromSeconds(1), operatorToken, installationId, privateKeyPath);
     }
     private static string Required(IReadOnlyDictionary<string, string?> values, string key, string environmentName) =>
         string.IsNullOrWhiteSpace(values[key]) ? throw new InvalidOperationException($"{environmentName} is required") : values[key]!;
-    private static int ParseInt(IReadOnlyDictionary<string, string?> values, string key) =>
-        int.TryParse(values[key], out var result) ? result : throw new InvalidOperationException($"{key} must be an integer");
     private static string Trim(string value) => value.TrimEnd('/');
 }
