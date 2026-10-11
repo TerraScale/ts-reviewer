@@ -7,7 +7,6 @@
     <PackageVersion Include="LiteDB" Version="6.0.0-prerelease.289" />
     <PackageVersion Include="Microsoft.ML.OnnxRuntime" Version="1.17.0" />
     <PackageVersion Include="SmartComponents.LocalEmbeddings" Version="0.1.0-preview10148" />
-    <PackageVersion Include="TerraScale.Logging" Version="2026.1011.1224" />
   </ItemGroup>
   <ItemGroup Label="Tests">
     <PackageVersion Include="TUnit" Version="1.72.10" />

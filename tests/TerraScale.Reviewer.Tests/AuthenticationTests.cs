@@ -10,8 +10,8 @@ using TUnit.Core;
 
 public sealed class AuthenticationTests
 {
-    private static ReviewerOptions Options => new("http://+:8080", "https://forgejo.test", "forgejo",
-        "https://proxy.test", "proxy", "TerraScale", "bot",
+    private static ReviewerOptions Options => new("http://+:8080", "https://github.test", "123",
+        "https://anthropic.test", "anthropic-test-key", "TerraScale", "bot",
         "webhook-test-secret", "context-test-token", "unused", 100);
 
     [Test]
@@ -24,7 +24,8 @@ public sealed class AuthenticationTests
         string? error = null;
         try
         {
-            ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy",
+            ReviewerOptions.Load(["--github-app-id=123", "--github-installation-id=456", "--github-private-key-path=unused",
+                "--anthropic-api-key=anthropic-test-key", "--bot-login=bot", "--operator-token=operator-test-token",
                 "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token", $"--{key}={value}"]);
         }
         catch (InvalidOperationException exception) { error = exception.Message; }
@@ -75,8 +76,8 @@ public sealed class AuthenticationTests
         context.Request.Method = "POST";
         var body = "invalid JSON"u8.ToArray();
         context.Request.Body = new MemoryStream(body);
-        context.Request.Headers["X-Forgejo-Signature"] = signature == "empty-key-signature"
-            ? Convert.ToHexString(HMACSHA256.HashData(Encoding.UTF8.GetBytes(secret), body))
+        context.Request.Headers["X-Hub-Signature-256"] = signature == "empty-key-signature"
+            ? "sha256=" + Convert.ToHexString(HMACSHA256.HashData(Encoding.UTF8.GetBytes(secret), body))
             : signature;
         var result = await handler.HandleAsync(context.Request, CancellationToken.None);
         await Assert.That(((IStatusCodeHttpResult)result).StatusCode).IsEqualTo(StatusCodes.Status401Unauthorized);

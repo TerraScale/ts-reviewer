@@ -52,6 +52,7 @@ internal sealed class ContextStore : IDisposable
     private readonly ILiteCollection<CommitDocument> _commits;
     private readonly ILiteCollection<BsonDocument> _meta;
     private readonly ILiteCollection<IndexJobDocument> _jobs;
+    private readonly ILiteCollection<BsonDocument> _deliveries;
     private int _vectorDimensions;
 
     public ContextStore(ReviewerOptions options)
@@ -74,6 +75,58 @@ internal sealed class ContextStore : IDisposable
         _vectorDimensions = _meta.FindById("embedding_dimensions")?["dimensions"].AsInt32 ?? 0;
         _jobs = _database.GetCollection<IndexJobDocument>("index_jobs");
         _jobs.EnsureIndex(x => x.Repository);
+        _deliveries = _database.GetCollection("webhook_deliveries");
+    }
+
+    public string? TryBeginWebhookDelivery(string id)
+    {
+        lock (_gate)
+        {
+            _database.BeginTrans();
+            try
+            {
+                var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                var delivery = _deliveries.FindById(id);
+                if (delivery is not null && (delivery["complete"].AsBoolean || delivery["until"].AsInt64 > now))
+                {
+                    _database.Rollback();
+                    return null;
+                }
+                var token = Guid.NewGuid().ToString("N");
+                _deliveries.Upsert(new BsonDocument { ["_id"] = id, ["token"] = token,
+                    ["complete"] = false, ["until"] = now + 300_000 });
+                _database.Commit();
+                return token;
+            }
+            catch { _database.Rollback(); throw; }
+        }
+    }
+
+    public void CompleteWebhookDelivery(string id, string token) => FinishWebhookDelivery(id, token, true);
+    public void ReleaseWebhookDelivery(string id, string token) => FinishWebhookDelivery(id, token, false);
+
+    private void FinishWebhookDelivery(string id, string token, bool complete)
+    {
+        lock (_gate)
+        {
+            _database.BeginTrans();
+            try
+            {
+                var delivery = _deliveries.FindById(id);
+                if (delivery is not null && delivery["token"].AsString == token)
+                {
+                    if (complete)
+                    {
+                        delivery["complete"] = true;
+                        delivery["token"] = "";
+                        _deliveries.Update(delivery);
+                    }
+                    else _deliveries.Delete(id);
+                }
+                _database.Commit();
+            }
+            catch { _database.Rollback(); throw; }
+        }
     }
 
     public bool IsIndexed(string repository, string commit)

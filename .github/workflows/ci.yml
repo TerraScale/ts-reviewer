@@ -1,0 +1,164 @@
+name: ts-reviewer CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CI: true # Standard .NET/Actions CI detection, required by the local-priority rule.
+
+jobs:
+  checks:
+    name: Check and build ts-reviewer
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    concurrency:
+      group: ts-reviewer-checks-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          global-json-file: global.json
+      - name: TUnit tests and migration/deployment fixtures
+        run: |
+          dotnet run --project tests/TerraScale.Reviewer.Tests -c Release
+          dotnet run scripts/check-nuget-vulnerabilities.tests.cs
+          dotnet run scripts/deploy-alpha.tests.cs
+      - name: Audit all dependencies
+        run: dotnet run scripts/check-nuget-vulnerabilities.cs src/TerraScale.Reviewer/TerraScale.Reviewer.csproj tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj
+      - name: Publish the checked application and Alpha utility
+        run: |
+          dotnet publish src/TerraScale.Reviewer -c Release -r linux-x64 --self-contained true -o artifacts/ci/reviewer -p:SourceRevisionId="$GITHUB_SHA"
+          dotnet publish scripts/deploy-alpha.cs -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o artifacts/ci/deploy
+      - name: Verify pinned OCR tooling without model calls
+        run: docker build --file Containerfile --tag ts-reviewer-tooling-check .
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: checked-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            artifacts/ci/reviewer/
+            artifacts/ci/deploy/
+
+  image:
+    name: Publish the exact checked image
+    needs: checks
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.archive.outputs.digest }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          global-json-file: global.json
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: checked-${{ github.sha }}
+          path: artifacts/ci
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Publish native tooling base
+        id: tooling
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Containerfile
+          platforms: linux/amd64
+          provenance: false # SDK base-image reader expects one image manifest, not an attestation index.
+          push: true
+          tags: ghcr.io/terrascale/ts-reviewer:tooling-${{ github.sha }}
+      - name: PublishContainer directly from the checked publish directory
+        env:
+          TOOLING_DIGEST: ${{ steps.tooling.outputs.digest }}
+        run: |
+          dotnet msbuild src/TerraScale.Reviewer/TerraScale.Reviewer.csproj /t:PublishContainer \
+            -p:Configuration=Release -p:RuntimeIdentifier=linux-x64 -p:SelfContained=true \
+            -p:PublishDir="$GITHUB_WORKSPACE/artifacts/ci/reviewer/" \
+            -p:ContainerBaseImage="ghcr.io/terrascale/ts-reviewer@$TOOLING_DIGEST" \
+            -p:ContainerRegistry=ghcr.io -p:ContainerRepository=terrascale/ts-reviewer \
+            -p:ContainerImageTag="$GITHUB_SHA" -p:SourceRevisionId="$GITHUB_SHA"
+      - name: Export immutable OCI artifact using the existing runner registry session
+        id: archive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends skopeo
+          mkdir -p artifacts/ci/alpha
+          digest=$(skopeo inspect --authfile "$HOME/.docker/config.json" --format '{{.Digest}}' "docker://ghcr.io/terrascale/ts-reviewer:$GITHUB_SHA")
+          skopeo copy --quiet --preserve-digests --src-authfile "$HOME/.docker/config.json" \
+            "docker://ghcr.io/terrascale/ts-reviewer@$digest" oci-archive:artifacts/ci/alpha/image.oci.tar
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: alpha-image-${{ github.sha }}
+          if-no-files-found: error
+          path: artifacts/ci/alpha/image.oci.tar
+
+  deployment-gate:
+    name: Verify Alpha environment setup
+    needs: image
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Require an existing main-only Alpha deployment environment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/environments/alpha" \
+            --jq '.deployment_branch_policy.custom_branch_policies == true' | awk '$1 == "true" { valid = 1 } END { exit !valid }'
+          gh api "repos/$GITHUB_REPOSITORY/environments/alpha/deployment-branch-policies" \
+            --jq '(.branch_policies | length) == 1 and .branch_policies[0].name == "main" and .branch_policies[0].type == "branch"' \
+            | awk '$1 == "true" { valid = 1 } END { exit !valid }'
+
+  deploy:
+    name: Deploy Alpha with health check and rollback
+    needs: [checks, image, deployment-gate]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    environment: alpha
+    concurrency:
+      group: ts-reviewer-alpha
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: checked-${{ github.sha }}
+          path: artifacts/ci
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: alpha-image-${{ github.sha }}
+          path: artifacts/ci/alpha
+      - name: Deploy only current main through the existing Alpha SSH capability
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          current=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          if [ "$current" != "$GITHUB_SHA" ]; then
+            printf 'A newer main commit supersedes this image; Alpha remains unchanged.\n'
+            exit 0
+          fi
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 alpha true
+          stage="/tmp/ts-reviewer-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes alpha "umask 077; mkdir '$stage'"
+          scp -o BatchMode=yes -o StrictHostKeyChecking=yes artifacts/ci/alpha/image.oci.tar alpha:"$stage/image.oci.tar"
+          scp -o BatchMode=yes -o StrictHostKeyChecking=yes -r artifacts/ci/reviewer alpha:"$stage/reviewer"
+          scp -o BatchMode=yes -o StrictHostKeyChecking=yes artifacts/ci/deploy/deploy-alpha alpha:"$stage/deploy-alpha"
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes alpha \
+            "chmod 700 '$stage/deploy-alpha' '$stage/reviewer/TerraScale.Reviewer'; sudo -n '$stage/deploy-alpha' '$GITHUB_SHA' '$IMAGE_DIGEST' '$stage'"

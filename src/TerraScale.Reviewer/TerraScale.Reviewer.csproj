@@ -8,7 +8,7 @@
     <AssemblyName>TerraScale.Reviewer</AssemblyName>
     <RootNamespace>TerraScale.Reviewer</RootNamespace>
     <EnableSdkContainerSupport>true</EnableSdkContainerSupport>
-    <ContainerBaseImage>mcr.microsoft.com/dotnet/aspnet:11.0-rc.1</ContainerBaseImage>
+    <ContainerBaseImage>mcr.microsoft.com/dotnet/aspnet:11.0.0-rc.1</ContainerBaseImage>
     <ContainerRepository>terrascale/ts-reviewer</ContainerRepository>
     <ContainerPort>8080</ContainerPort>
     <ContainerUser>1654</ContainerUser>
@@ -17,7 +17,6 @@
     <PackageReference Include="FastBertTokenizer" />
     <PackageReference Include="LiteDB" />
     <PackageReference Include="Microsoft.ML.OnnxRuntime" />
-    <PackageReference Include="TerraScale.Logging" />
     <!-- Supplies the bge-micro-v2 model and vocabulary at build time; ContextEmbedder runs them. -->
     <PackageReference Include="SmartComponents.LocalEmbeddings" />
   </ItemGroup>

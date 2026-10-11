@@ -1,5 +1,4 @@
 using System.Net;
-using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -11,8 +10,8 @@ namespace TerraScale.Reviewer.Features.Review;
 /// <summary>Owns the retry budget for each OCR model call, before OCR's SDK can retry it.</summary>
 internal sealed class ReviewProvider : IAsyncDisposable
 {
-    internal const string PrimaryModel = "glm-5.3";
-    internal const string FallbackModel = "glm-5.3-flash";
+    internal const string PrimaryModel = "claude-opus-5-5";
+    internal const int ModelOutputLimit = 128000;
     internal const int MaxAttempts = 30;
     internal static readonly TimeSpan AttemptTimeout = TimeSpan.FromMinutes(20);
     internal static readonly TimeSpan InactivityTimeout = TimeSpan.FromMinutes(20);
@@ -25,7 +24,6 @@ internal sealed class ReviewProvider : IAsyncDisposable
     private readonly Func<TimeSpan, CancellationToken, Task> _delay;
     private readonly TimeProvider _time;
     private readonly SemaphoreSlim _serial = new(1);
-    private readonly List<string> _models = [];
     private CancellationTokenSource? _lifetime;
     private CancellationTokenSource? _inactivity;
     private WebApplication? _app;
@@ -46,7 +44,7 @@ internal sealed class ReviewProvider : IAsyncDisposable
     internal string Url { get; private set; } = "";
     internal CancellationToken Lifetime => _lifetime!.Token;
     internal string? Failure { get; private set; }
-    internal string ModelsUsed => _models.Count == 0 ? PrimaryModel : string.Join(" → ", _models);
+    internal string ModelsUsed => PrimaryModel;
 
     internal async Task StartAsync(CancellationToken ct)
     {
@@ -101,7 +99,7 @@ internal sealed class ReviewProvider : IAsyncDisposable
             else
             {
                 context.Response.Clear();
-                await Results.Json(new { type = "error", error = new { type = "invalid_request_error", message = ex.Message } }, statusCode: 400).ExecuteAsync(context);
+                await Results.Json(new { type = "error", error = new { type = "invalid_request_error", message = ex is JsonException ? "invalid model request JSON" : ex.Message } }, statusCode: 400).ExecuteAsync(context);
             }
         }
     }
@@ -114,35 +112,36 @@ internal sealed class ReviewProvider : IAsyncDisposable
         try
         {
             if (Failure is not null) throw new InvalidOperationException(Failure);
+            NormalizeRequest(body);
             var step = ++_step;
             string reason = "no response";
             for (var attempt = 1; attempt <= MaxAttempts; attempt++)
             {
                 ct.ThrowIfCancellationRequested();
-                // Alternate in blocks of three consecutive failures; every new step starts with GLM 5.3.
-                var model = ((attempt - 1) / 3) % 2 == 0 ? PrimaryModel : FallbackModel;
-                body["model"] = model;
-                body["stream"] = false;
-                if (!_models.Contains(model)) _models.Add(model);
+                var model = PrimaryModel;
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 timeout.CancelAfter(AttemptTimeout);
                 string? completed = null;
                 try
                 {
-                    var endpoint = _options.ProxyUrl.TrimEnd('/');
+                    var endpoint = _options.AnthropicUrl.TrimEnd('/');
                     endpoint += endpoint.EndsWith("/v1", StringComparison.Ordinal) ? "/messages" : "/v1/messages";
                     using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
-                    request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _options.ProxyToken);
+                    request.Headers.Add("x-api-key", _options.AnthropicApiKey);
                     request.Headers.Add("anthropic-version", "2023-06-01");
                     request.Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
                     using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
                     var json = await response.Content.ReadAsStringAsync(timeout.Token);
                     if (response.IsSuccessStatusCode)
                     {
-                        ValidateResponse(json, model, body["tools"] as JsonArray);
-                        _logger.LogInformation("review {Review}; step {Step}; model {Model}; attempts {Attempts}; retries {Retries}; succeeded",
-                            _review, step, model, attempt, attempt - 1);
-                        completed = json;
+                        try
+                        {
+                            ValidateResponse(json, model, body["tools"] as JsonArray);
+                            _logger.LogInformation("review {Review}; step {Step}; model {Model}; attempts {Attempts}; retries {Retries}; succeeded",
+                                _review, step, model, attempt, attempt - 1);
+                            completed = json;
+                        }
+                        catch (InvalidOperationException ex) { reason = ex.Message; }
                     }
                     else
                     {
@@ -151,16 +150,17 @@ internal sealed class ReviewProvider : IAsyncDisposable
                     }
                 }
                 catch (OperationCanceledException) when (!ct.IsCancellationRequested) { reason = $"provider timed out after {AttemptTimeout}"; }
-                catch (Exception ex) when (ex is HttpRequestException or IOException or JsonException or InvalidOperationException) { reason = ex.Message; }
+                catch (JsonException) { reason = "provider returned malformed JSON"; }
+                catch (Exception ex) when (ex is HttpRequestException or IOException or InvalidOperationException) { reason = "provider transport failed"; }
                 if (completed is not null)
                 {
                     // Keep delivery under the call lock; a lost response must not reopen the spent budget.
                     try { if (deliver is not null) await deliver(completed, ct); }
-                    catch (Exception ex) when (_lifetime is { IsCancellationRequested: false })
+                    catch (Exception) when (_lifetime is { IsCancellationRequested: false })
                     {
-                        Failure = $"OCR response delivery failed; review stopped to preserve its retry budget: {ex.Message}";
+                        Failure = "OCR response delivery failed; review stopped to preserve its retry budget";
                         _logger.LogError("review {Review}; step {Step}; {Reason}", _review, step, Failure);
-                        throw new InvalidOperationException(Failure, ex);
+                        throw new InvalidOperationException(Failure);
                     }
                     return completed;
                 }
@@ -170,7 +170,7 @@ internal sealed class ReviewProvider : IAsyncDisposable
             }
             _logger.LogError("review {Review}; step {Step}; attempts {Attempts}; retries {Retries}; exhausted: {Reason}",
                 _review, step, MaxAttempts, MaxAttempts - 1, reason);
-            Failure = $"GLM review step {step} failed after {MaxAttempts} attempts: {reason}";
+            Failure = $"Claude review step {step} failed after {MaxAttempts} attempts: {reason}";
             throw new InvalidOperationException(Failure);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested && _lifetime is { IsCancellationRequested: false })
@@ -191,6 +191,27 @@ internal sealed class ReviewProvider : IAsyncDisposable
     {
         var ceiling = Math.Min(60, Math.Pow(2, Math.Clamp(failure - 1, 0, 6)));
         return TimeSpan.FromSeconds(ceiling * (0.5 + Math.Clamp(jitter, 0, 1) / 2));
+    }
+
+    private static void NormalizeRequest(JsonObject body)
+    {
+        body["model"] = PrimaryModel;
+        body["stream"] = false;
+        // Opus 5.5 always thinks adaptively and rejects forced tools and sampling overrides from OCR.
+        body.Remove("thinking");
+        body.Remove("temperature");
+        body.Remove("top_p");
+        body.Remove("top_k");
+        // OCR's grouping call uses its 200k prompt limit as output; Opus accepts at most 128k output.
+        if (body["max_tokens"]?.Deserialize<long>() > ModelOutputLimit) body["max_tokens"] = ModelOutputLimit;
+        if (body["tools"] is JsonArray { Count: > 0 } tools)
+        {
+            if (tools.Any(tool => tool?["name"]?.GetValue<string>() is not ("task_done" or "code_comment" or "code_search" or "file_read" or "file_read_diff" or "file_find")
+                || tool?["type"]?.GetValue<string>() is not (null or "custom")))
+                throw new InvalidOperationException("OCR declared a tool outside the trusted read-only review tool set");
+            body["tool_choice"] = new JsonObject { ["type"] = "auto" };
+        }
+        else body.Remove("tool_choice");
     }
 
     private static void ValidateResponse(string json, string model, JsonArray? tools)
@@ -237,11 +258,11 @@ internal sealed class ReviewProvider : IAsyncDisposable
                     break;
                 case "thinking":
                     if (!block.TryGetProperty("thinking", out var thinking) || thinking.ValueKind != JsonValueKind.String
-                        || !block.TryGetProperty("signature", out var signature) || signature.ValueKind != JsonValueKind.String)
+                        || !block.TryGetProperty("signature", out var signature) || signature.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(signature.GetString()))
                         throw new InvalidOperationException("provider returned a malformed thinking block");
                     break;
                 case "redacted_thinking":
-                    if (!block.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.String)
+                    if (!block.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(data.GetString()))
                         throw new InvalidOperationException("provider returned a malformed redacted thinking block");
                     break;
                 default: throw new InvalidOperationException("provider returned an unsupported content block");
@@ -290,10 +311,15 @@ internal sealed class ReviewProvider : IAsyncDisposable
         {
             using var document = JsonDocument.Parse(json);
             if (document.RootElement.ValueKind == JsonValueKind.Object && document.RootElement.TryGetProperty("error", out var error) && error.ValueKind == JsonValueKind.Object
-                && error.TryGetProperty("message", out var message) && message.ValueKind == JsonValueKind.String)
+                && error.TryGetProperty("type", out var type) && type.ValueKind == JsonValueKind.String)
             {
-                var reason = message.GetString()!;
-                return reason[..Math.Min(reason.Length, 300)];
+                // Upstream messages and transport exceptions can echo keys, URLs or prompt content.
+                return type.GetString() switch
+                {
+                    "invalid_request_error" or "authentication_error" or "permission_error" or "not_found_error"
+                        or "request_too_large" or "rate_limit_error" or "api_error" or "overloaded_error" => type.GetString()!,
+                    _ => "provider request failed",
+                };
             }
         }
         catch (JsonException) { }

@@ -1,5 +1,5 @@
 using System.Diagnostics;
-using TerraScale.Reviewer.Features.Forgejo;
+using TerraScale.Reviewer.Features.GitHub;
 using TerraScale.Reviewer.Features.Configuration;
 using TerraScale.Reviewer.Features.Context;
 using TerraScale.Reviewer.Features.Review;
@@ -19,7 +19,7 @@ public sealed class ReviewerTests
     private static readonly ContextEmbedder Embedder = new();
 
     private static ReviewerOptions Options(string database) =>
-        new("http://+:8080", "https://forgejo.test", "forgejo", "https://proxy.test/v1", "proxy", "TerraScale", "bot", "webhook-test-secret", "context-test-token", database, 100, 5, null, "operator-test-token");
+        new("http://+:8080", "https://github.test", "github", "https://proxy.test/v1", "proxy", "TerraScale", "bot", "webhook-test-secret", "context-test-token", database, 100, 5, null, "operator-test-token");
 
     private static float[] UnitVector(int index)
     {
@@ -63,7 +63,7 @@ public sealed class ReviewerTests
         await Assert.That(UnifiedDiff.ReviewPosition(files[0].Patch, 2)).IsGreaterThan(0);
     }
 
-    private static readonly string[] Credentials = ["--forgejo-token=forgejo", "--proxy-token=proxy", "--webhook-secret=secret", "--context-api-token=context", "--operator-token=operator"];
+    private static readonly string[] Credentials = ["--github-app-id=1", "--github-installation-id=2", "--github-private-key-path=unused.pem", "--anthropic-api-key=anthropic-test-key", "--bot-login=bot", "--webhook-secret=secret", "--context-api-token=context", "--operator-token=operator"];
 
     [Test]
     public async Task UnifiedDiffDoesNotReadChangedContentAsFileHeaders()
@@ -91,7 +91,7 @@ public sealed class ReviewerTests
     {
         // Retired environment overrides cannot select another model or raise the limits.
         string[] retired = ["TS_REVIEWER_MODEL", "TS_REVIEWER_MAX_CONCURRENT", "TS_REVIEWER_OCR_CONCURRENCY", "TS_REVIEWER_TIMEOUT"];
-        string[] names = [.. retired, "TS_REVIEWER_PROXY_URL", "TS_REVIEWER_CONFIG"];
+        string[] names = [.. retired, "TS_REVIEWER_ANTHROPIC_URL", "TS_REVIEWER_CONFIG"];
         var previous = names.ToDictionary(x => x, Environment.GetEnvironmentVariable);
         try
         {
@@ -108,7 +108,7 @@ public sealed class ReviewerTests
                 await Assert.That(rejected).IsTrue();
             }
             var options = ReviewerOptions.Load(Credentials);
-            await Assert.That(options.ProxyUrl).IsEqualTo("http://10.11.99.1:8318");
+            await Assert.That(options.AnthropicUrl).IsEqualTo("https://api.anthropic.com");
         }
         finally { foreach (var (name, value) in previous) Environment.SetEnvironmentVariable(name, value); }
     }
@@ -134,7 +134,7 @@ public sealed class ReviewerTests
             Environment.SetEnvironmentVariable("TS_REVIEWER_CONTEXT_MAX_FILES", "55");
             await Assert.That(ReviewerOptions.Load(Credentials).ContextMaxFiles).IsEqualTo(55);
             await Assert.That(ReviewerOptions.Load([.. Credentials, "--context-max-files=65"]).ContextMaxFiles).IsEqualTo(65);
-            await Assert.That(ReviewerOptions.Load([.. Credentials, "--forgejo-url=https://forgejo.test/"]).ForgejoUrl).IsEqualTo("https://forgejo.test");
+            await Assert.That(ReviewerOptions.Load(Credentials).GitHubUrl).IsEqualTo("https://api.github.com");
         }
         finally
         {
@@ -161,8 +161,7 @@ public sealed class ReviewerTests
             var rejected = false;
             try
             {
-                ReviewerOptions.Load(["--config=" + path, "--forgejo-token=forgejo", "--proxy-token=proxy",
-                    "--webhook-secret=secret", "--context-api-token=context", "--operator-token=operator"]);
+                ReviewerOptions.Load([.. Credentials, "--config=" + path]);
             }
             catch (InvalidOperationException) { rejected = true; }
             await Assert.That(rejected).IsTrue();
@@ -222,16 +221,16 @@ public sealed class ReviewerTests
         await Assert.That(formatted.Contains("<summary>Suggested fix</summary>")).IsTrue();
         await Assert.That(formatted.Contains("model")).IsFalse();
 
-        var withModel = PullRequestReviewer.Format(pullRequest, new ReviewResult("ignored", [finding]), "glm-5.3");
-        await Assert.That(withModel.Contains("model `glm-5.3`")).IsTrue();
+        var withModel = PullRequestReviewer.Format(pullRequest, new ReviewResult("ignored", [finding]), "claude-opus-5-5");
+        await Assert.That(withModel.Contains("model `claude-opus-5-5`")).IsTrue();
     }
 
     [Test]
     [Arguments("high", "REQUEST_CHANGES", "failure", false, false)]
     [Arguments("medium", "REQUEST_CHANGES", "failure", false, false)]
     [Arguments("low", "REQUEST_CHANGES", "failure", false, false)]
-    [Arguments(null, "APPROVED", "success", false, false)]
-    [Arguments(null, "APPROVED", "success", true, false)]
+    [Arguments(null, "COMMENT", "success", false, false)]
+    [Arguments(null, "COMMENT", "error", true, false)]
     [Arguments(null, "", "error", false, true)]
     [Arguments("high", "", "error", false, true)]
     [Arguments("high", "REQUEST_CHANGES", "failure", false, false, true)]
@@ -239,7 +238,8 @@ public sealed class ReviewerTests
     [Arguments("high", "REQUEST_CHANGES", "failure", false, false, false, "café.cs")]
     [Arguments("high", "REQUEST_CHANGES", "failure", false, false, false, "space name.cs")]
     [Arguments("high", "REQUEST_CHANGES", "failure", false, false, false, "tab\tquote\"back\\line\n.cs")]
-    public async Task ReviewEngineRunsOcrOverAClonedPullRequestRange(string? severity, string expectedEvent, string expectedStatus, bool rejectReview, bool incomplete = false, bool largeDiff = false, string? renamedPath = null)
+    [Arguments("high", "REQUEST_CHANGES", "failure", false, false, false, null, true)]
+    public async Task ReviewEngineRunsOcrOverAClonedPullRequestRange(string? severity, string expectedEvent, string expectedStatus, bool rejectReview, bool incomplete = false, bool largeDiff = false, string? renamedPath = null, bool fork = false)
     {
         if (!ToolAvailable("git") || !ToolAvailable("chmod")) throw new TUnit.Core.Exceptions.SkipTestException("requires a POSIX host with git and chmod");
 
@@ -250,7 +250,7 @@ public sealed class ReviewerTests
         var work = Path.Combine(root, "work");
         try
         {
-            // A local bare "Forgejo" laid out like the real one: <root>/<owner>/<repo>.git
+            // A local bare "GitHub" laid out like the real one: <root>/<owner>/<repo>.git
             var remote = Path.Combine(root, "TerraScale", "widgets.git");
             Directory.CreateDirectory(Path.GetDirectoryName(remote)!);
             await RunGitAsync(root, "init", "--quiet", "-b", "main", "--bare", remote);
@@ -302,10 +302,11 @@ public sealed class ReviewerTests
             var expectedFindings = severity is null ? 0 : 1;
             await RunChmodAsync(Path.Combine(stub, "ocr"));
 
-            var options = Options(database) with { ForgejoUrl = root };
+            var options = Options(database) with { GitHubUrl = root };
             var engine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, Path.Combine(stub, "ocr"));
             var repository = new Repository(new Owner("TerraScale"), "widgets");
-            var pullRequest = new PullRequest(9, "Test change", "", new Branch(baseSha, "main", repository), new Branch(headSha, "feature", repository));
+            var pullRequest = new PullRequest(9, "Test change", "", new Branch(baseSha, "main", repository),
+                new Branch(headSha, "feature", fork ? new Repository(new Owner("untrusted-outsider"), "fork") : repository));
             ReviewResult? result = null;
             if (incomplete)
             {
@@ -345,7 +346,7 @@ public sealed class ReviewerTests
             await Assert.That(recorded.Contains("--concurrency 1")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_URL=http://127.0.0.1:")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_TOKEN=")).IsTrue();
-            await Assert.That(recorded.Contains("--model glm-5.3 ")).IsTrue();
+            await Assert.That(recorded.Contains("--model claude-opus-5-5 ")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_MODEL")).IsFalse();
             await Assert.That(recorded.Contains("OCR_LLM_PROTOCOL=anthropic")).IsTrue();
             await Assert.That(recorded.Contains("--timeout 0 ")).IsTrue();
@@ -353,23 +354,21 @@ public sealed class ReviewerTests
             await Assert.That(recorded.Contains($"OCR_LLM_TIMEOUT={ReviewProvider.StepTimeout.TotalSeconds}")).IsTrue();
             await Assert.That(recorded.Contains("OCR_ENABLE_TELEMETRY=false")).IsTrue();
 
-            // Exercise the real webhook-to-HTTP publication path. Forgejo uses
-            // APPROVED, not GitHub's APPROVE; the latter creates a pending draft.
+            // Exercise GitHub COMMENT/REQUEST_CHANGES publication with an exact commit ID.
             var apiOptions = Options(database);
-            // A rejected approval (Forgejo refuses the PR author's own
-            // approval) must still publish the clean review's success status.
+            // A rejected review must fail without publishing a successful verdict.
             var transport = new ReviewPublicationHandler(pullRequest, rejectReview);
             using var http = new HttpClient(transport);
-            var forgejo = new ForgejoClient(http, apiOptions);
+            var github = new GitHubClient(http, apiOptions, (_, _, _) => Task.FromResult("installation-test-token"));
             using var store = new ContextStore(apiOptions);
-            var indexer = new ContextIndexer(forgejo, store, Embedder, apiOptions, NullLogger<ContextIndexer>.Instance);
-            var (webhook, queue) = await StartWebhookAsync(forgejo, engine, indexer, apiOptions);
+            var indexer = new ContextIndexer(github, store, Embedder, apiOptions, NullLogger<ContextIndexer>.Instance);
+            var (webhook, queue) = await StartWebhookAsync(github, engine, indexer, apiOptions);
             await PostWebhookAsync(webhook, new
             {
                 action = "created",
                 repository = new { name = "widgets", owner = new { login = "TerraScale" } },
                 issue = new { number = 9, pull_request = new { } },
-                comment = new { id = 77, body = "@bot recheck" },
+                comment = new { id = 77, body = "@bot recheck", user = new { login = "maintainer" } },
             });
             var pendingStatus = await transport.PendingStatus.Task.WaitAsync(TimeSpan.FromSeconds(30));
             var publishedStatus = await transport.Status.Task.WaitAsync(TimeSpan.FromSeconds(30));
@@ -391,20 +390,20 @@ public sealed class ReviewerTests
                 {
                     var comment = publishedReview.GetProperty("comments")[0];
                     await Assert.That(comment.GetProperty("path").GetString()).IsEqualTo(filePath);
-                    await Assert.That(comment.GetProperty("new_position").GetInt32()).IsEqualTo(findingLine);
+                    await Assert.That(comment.GetProperty("line").GetInt32()).IsEqualTo(findingLine);
                 }
             }
             await queue.StopAsync(CancellationToken.None);
             if (largeDiff)
             {
                 await Assert.That(result!.Files.Count).IsEqualTo(1);
-                await Assert.That(publishedReview.GetProperty("comments")[0].GetProperty("new_position").GetInt32()).IsGreaterThan(0);
+                await Assert.That(publishedReview.GetProperty("comments")[0].GetProperty("line").GetInt32()).IsGreaterThan(0);
                 // Exhausted OCR failures must resolve the pending head with a clear error.
                 await File.WriteAllTextAsync(Path.Combine(stub, "ocr"), "#!/bin/sh\necho 'Error: model context exhausted' >&2\nexit 1\n");
                 var failingEngine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, Path.Combine(stub, "ocr"));
                 var failedTransport = new ReviewPublicationHandler(pullRequest);
                 using var failedHttp = new HttpClient(failedTransport);
-                var reviewer = new PullRequestReviewer(new ForgejoClient(failedHttp, apiOptions), failingEngine, apiOptions, NullLogger<PullRequestReviewer>.Instance);
+                var reviewer = new PullRequestReviewer(new GitHubClient(failedHttp, apiOptions, (_, _, _) => Task.FromResult("installation-test-token")), failingEngine, apiOptions, NullLogger<PullRequestReviewer>.Instance);
                 await reviewer.RunAsync(new ReviewRequest("TerraScale", "widgets", 9, HeadSha: headSha), CancellationToken.None);
                 var error = await failedTransport.Status.Task.WaitAsync(TimeSpan.FromSeconds(30));
                 await Assert.That(error.GetProperty("state").GetString()).IsEqualTo("error");
@@ -451,7 +450,7 @@ public sealed class ReviewerTests
             await File.WriteAllTextAsync(Path.Combine(stub, "ocr"), "#!/bin/sh\nsleep 60\n");
             await RunChmodAsync(Path.Combine(stub, "ocr"));
 
-            var options = Options(Path.Combine(root, "context.db")) with { ForgejoUrl = root };
+            var options = Options(Path.Combine(root, "context.db")) with { GitHubUrl = root };
             var engine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, Path.Combine(stub, "ocr"));
             var repository = new Repository(new Owner("TerraScale"), "widgets");
             var pullRequest = new PullRequest(9, "Test change", "", new Branch(baseSha, "main", repository), new Branch(headSha, "feature", repository));
@@ -653,9 +652,9 @@ public sealed class ReviewerTests
         var database = Path.Combine(Path.GetTempPath(), "ts-reviewer-" + Guid.NewGuid().ToString("N") + ".db");
         var options = Options(database);
         var handler = new ContextFakeHandler();
-        var forgejo = new ForgejoClient(new HttpClient(handler), options);
+        var github = new GitHubClient(new HttpClient(handler), options, (_, _, _) => Task.FromResult("installation-test-token"));
         using var store = new ContextStore(options);
-        var indexer = new ContextIndexer(forgejo, store, Embedder, options, NullLogger<ContextIndexer>.Instance);
+        var indexer = new ContextIndexer(github, store, Embedder, options, NullLogger<ContextIndexer>.Instance);
         try
         {
             await indexer.StartAsync(CancellationToken.None);
@@ -681,14 +680,14 @@ public sealed class ReviewerTests
         {
             using (var firstStore = new ContextStore(options))
             {
-                var firstIndexer = new ContextIndexer(new ForgejoClient(new HttpClient(handler), options), firstStore,
+                var firstIndexer = new ContextIndexer(new GitHubClient(new HttpClient(handler), options, (_, _, _) => Task.FromResult("installation-test-token")), firstStore,
                     Embedder, options, NullLogger<ContextIndexer>.Instance);
                 await Assert.That(firstIndexer.Enqueue("TerraScale", "widgets", "restart-commit")).IsTrue();
                 // The worker never starts: the persisted job is the recovery source.
             }
 
             using var recoveredStore = new ContextStore(options);
-            var recovered = new ContextIndexer(new ForgejoClient(new HttpClient(handler), options), recoveredStore,
+            var recovered = new ContextIndexer(new GitHubClient(new HttpClient(handler), options, (_, _, _) => Task.FromResult("installation-test-token")), recoveredStore,
                 Embedder, options, NullLogger<ContextIndexer>.Instance);
             await recovered.StartAsync(CancellationToken.None);
             await recovered.EnsureIndexedAsync("TerraScale", "widgets", "restart-commit", CancellationToken.None);
@@ -704,11 +703,11 @@ public sealed class ReviewerTests
         var database = Path.Combine(Path.GetTempPath(), "ts-reviewer-" + Guid.NewGuid().ToString("N") + ".db");
         var options = Options(database);
         var handler = new AcknowledgeFakeHandler();
-        var forgejo = new ForgejoClient(new HttpClient(handler), options);
+        var github = new GitHubClient(new HttpClient(handler), options, (_, _, _) => Task.FromResult("installation-test-token"));
         using var store = new ContextStore(options);
-        var indexer = new ContextIndexer(forgejo, store, Embedder, options, NullLogger<ContextIndexer>.Instance);
+        var indexer = new ContextIndexer(github, store, Embedder, options, NullLogger<ContextIndexer>.Instance);
         var engine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance);
-        var (webhookHandler, queue) = await StartWebhookAsync(forgejo, engine, indexer, options);
+        var (webhookHandler, queue) = await StartWebhookAsync(github, engine, indexer, options);
         try
         {
             var result = await PostWebhookAsync(webhookHandler, new
@@ -716,7 +715,7 @@ public sealed class ReviewerTests
                 action = "opened",
                 number = 14,
                 repository = new { name = "widgets", owner = new { login = "TerraScale" } },
-                pull_request = new { number = 14 },
+                pull_request = new { number = 14, head = new { sha = "head" } },
             });
             await Assert.That(((IStatusCodeHttpResult)result).StatusCode).IsEqualTo(StatusCodes.Status202Accepted);
             await WaitUntilAsync(() => handler.PullRequestReactions == 1);
@@ -726,7 +725,7 @@ public sealed class ReviewerTests
                 action = "created",
                 repository = new { name = "widgets", owner = new { login = "TerraScale" } },
                 issue = new { number = 14, pull_request = new { } },
-                comment = new { id = 77, body = "@bot recheck" },
+                comment = new { id = 77, body = "@bot recheck", user = new { login = "maintainer" } },
             });
             await WaitUntilAsync(() => handler.CommentReactions == 1);
             await Assert.That(handler.PullRequestReactions).IsEqualTo(1);
@@ -741,17 +740,17 @@ public sealed class ReviewerTests
         var database = Path.Combine(Path.GetTempPath(), "ts-reviewer-" + Guid.NewGuid().ToString("N") + ".db");
         var options = Options(database);
         var handler = new SynchronizedWebhookFakeHandler();
-        var forgejo = new ForgejoClient(new HttpClient(handler), options);
+        var github = new GitHubClient(new HttpClient(handler), options, (_, _, _) => Task.FromResult("installation-test-token"));
         using var store = new ContextStore(options);
-        var indexer = new ContextIndexer(forgejo, store, Embedder, options, NullLogger<ContextIndexer>.Instance);
+        var indexer = new ContextIndexer(github, store, Embedder, options, NullLogger<ContextIndexer>.Instance);
         var engine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance);
-        var (webhookHandler, queue) = await StartWebhookAsync(forgejo, engine, indexer, options);
+        var (webhookHandler, queue) = await StartWebhookAsync(github, engine, indexer, options);
 
         try
         {
             var result = await PostWebhookAsync(webhookHandler, new
             {
-                action = "synchronized",
+                action = "synchronize",
                 number = 14,
                 repository = new { name = "widgets", owner = new { login = "TerraScale" } },
                 pull_request = new { number = 14, head = new { sha = updatedHead } },
@@ -765,12 +764,12 @@ public sealed class ReviewerTests
         finally { await queue.StopAsync(CancellationToken.None); File.Delete(database); }
     }
 
-    private static async Task<(WebhookHandler Handler, ReviewQueue Queue)> StartWebhookAsync(ForgejoClient forgejo, ReviewEngine engine, ContextIndexer indexer, ReviewerOptions options)
+    private static async Task<(WebhookHandler Handler, ReviewQueue Queue)> StartWebhookAsync(GitHubClient github, ReviewEngine engine, ContextIndexer indexer, ReviewerOptions options)
     {
-        var reviewer = new PullRequestReviewer(forgejo, engine, options, NullLogger<PullRequestReviewer>.Instance);
+        var reviewer = new PullRequestReviewer(github, engine, options, NullLogger<PullRequestReviewer>.Instance);
         var queue = new ReviewQueue(reviewer, NullLogger<ReviewQueue>.Instance);
         await queue.StartAsync(CancellationToken.None);
-        return (new WebhookHandler(forgejo, queue, reviewer, indexer, options, NullLogger<WebhookHandler>.Instance), queue);
+        return (new WebhookHandler(github, queue, reviewer, indexer, options, NullLogger<WebhookHandler>.Instance), queue);
     }
 
     private static async Task<IResult> PostWebhookAsync(WebhookHandler handler, object payload)
@@ -779,8 +778,11 @@ public sealed class ReviewerTests
         context.Request.Method = "POST";
         var bytes = JsonSerializer.SerializeToUtf8Bytes(payload);
         context.Request.Body = new MemoryStream(bytes);
-        context.Request.Headers["X-Forgejo-Signature"] = Convert.ToHexString(
+        context.Request.Headers["X-Hub-Signature-256"] = "sha256=" + Convert.ToHexString(
             HMACSHA256.HashData(Encoding.UTF8.GetBytes("webhook-test-secret"), bytes));
+        using var document = JsonDocument.Parse(bytes);
+        context.Request.Headers["X-GitHub-Event"] = document.RootElement.TryGetProperty("issue", out _) ? "issue_comment" : document.RootElement.TryGetProperty("after", out _) ? "push" : "pull_request";
+        context.Request.Headers["X-GitHub-Delivery"] = Guid.NewGuid().ToString("D");
         return await handler.HandleAsync(context.Request, CancellationToken.None);
     }
 
@@ -802,6 +804,8 @@ public sealed class ReviewerTests
             var path = request.RequestUri!.AbsolutePath;
             if (request.Method == HttpMethod.Get)
             {
+                if (path.EndsWith("/permission", StringComparison.Ordinal))
+                    return new(HttpStatusCode.OK) { Content = JsonContent.Create(new { permission = "write" }) };
                 if (path.EndsWith("/pulls/9", StringComparison.Ordinal))
                     return new(HttpStatusCode.OK) { Content = JsonContent.Create(pullRequest) };
                 if (path.EndsWith("/comments", StringComparison.Ordinal))
@@ -855,6 +859,16 @@ public sealed class ReviewerTests
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
+            if (request.Method == HttpMethod.Get && request.RequestUri?.AbsolutePath.EndsWith("/status", StringComparison.Ordinal) == true)
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = JsonContent.Create(new { statuses = Array.Empty<object>() }) });
+            if (request.Method == HttpMethod.Get && request.RequestUri?.AbsolutePath.EndsWith("/permission", StringComparison.Ordinal) == true)
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = JsonContent.Create(new { permission = "write" }) });
+            if (request.Method == HttpMethod.Get && request.RequestUri?.AbsolutePath.EndsWith("/pulls/14", StringComparison.Ordinal) == true)
+            {
+                var repo = new Repository(new Owner("TerraScale"), "widgets");
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = JsonContent.Create(
+                    new PullRequest(14, "change", "", new Branch(new string('b', 40), "main", repo), new Branch("head", "feature", repo))) });
+            }
             if (request.Method == HttpMethod.Post && request.RequestUri?.AbsolutePath.EndsWith("/issues/14/reactions", StringComparison.Ordinal) == true)
                 PullRequestReactions++;
             if (request.Method == HttpMethod.Post && request.RequestUri?.AbsolutePath.EndsWith("/issues/comments/77/reactions", StringComparison.Ordinal) == true)
@@ -917,10 +931,14 @@ public sealed class ReviewerTests
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             var path = request.RequestUri!.AbsolutePath;
+            if (request.Method == HttpMethod.Get && path.EndsWith("/status", StringComparison.Ordinal))
+                return new(HttpStatusCode.OK) { Content = JsonContent.Create(new { statuses = Array.Empty<object>() }) };
             if (request.Method == HttpMethod.Get && path.EndsWith("/pulls/14", StringComparison.Ordinal))
             {
                 ReviewPullRequested.TrySetResult(true);
-                return new(HttpStatusCode.NotFound);
+                var repo = new Repository(new Owner("TerraScale"), "widgets");
+                return new(HttpStatusCode.OK) { Content = JsonContent.Create(new PullRequest(14, "change", "",
+                    new Branch(new string('b', 40), "main", repo), new Branch("updated-head-sha", "feature", repo))) };
             }
 
             if (request.Method == HttpMethod.Post && path.Contains("/statuses/", StringComparison.Ordinal))

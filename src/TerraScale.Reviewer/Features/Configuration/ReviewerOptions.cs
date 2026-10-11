@@ -3,10 +3,11 @@ using System.Text.Json;
 namespace TerraScale.Reviewer.Features.Configuration;
 
 public sealed record ReviewerOptions(
-    string ListenUrl, string ForgejoUrl, string ForgejoToken, string ProxyUrl, string ProxyToken,
+    string ListenUrl, string GitHubUrl, string GitHubAppId, string AnthropicUrl, string AnthropicApiKey,
     string Organization, string BotLogin,
     string WebhookSecret, string ContextApiToken, string ContextDatabasePath, int ContextMaxFiles,
-    int ContextMaxAttempts = 5, TimeSpan? ContextRetryBaseDelay = null, string OperatorToken = "")
+    int ContextMaxAttempts = 5, TimeSpan? ContextRetryBaseDelay = null, string OperatorToken = "",
+    string GitHubInstallationId = "", string GitHubPrivateKeyPath = "")
 {
     public TimeSpan ContextRetryDelay => ContextRetryBaseDelay ?? TimeSpan.FromSeconds(1);
     public static ReviewerOptions Load(string[] args)
@@ -14,12 +15,11 @@ public sealed record ReviewerOptions(
         var values = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
         {
             ["listen"] = "http://+:8080",
-            ["forgejo-url"] = "https://git.terrascale.tech",
-            ["forgejo-token"] = null,
-            ["proxy-url"] = "http://10.11.99.1:8318",
-            ["proxy-token"] = null,
-            ["organization"] = "TerraScale",
-            ["bot-login"] = "terrascale-bot",
+            ["github-app-id"] = null,
+            ["github-installation-id"] = null,
+            ["github-private-key-path"] = null,
+            ["anthropic-api-key"] = null,
+            ["bot-login"] = null,
             ["webhook-secret"] = string.Empty,
             ["context-api-token"] = string.Empty,
             ["context-database"] = "data/reviewer-context.db",
@@ -72,8 +72,14 @@ public sealed record ReviewerOptions(
             if (!values.ContainsKey(key)) throw new InvalidOperationException($"unknown option: {key}");
             values[key] = value;
         }
-        var forgejoToken = Required(values, "forgejo-token", "TS_REVIEWER_FORGEJO_TOKEN");
-        var proxyToken = Required(values, "proxy-token", "TS_REVIEWER_PROXY_TOKEN");
+        var appId = Required(values, "github-app-id", "TS_REVIEWER_GITHUB_APP_ID");
+        var installationId = Required(values, "github-installation-id", "TS_REVIEWER_GITHUB_INSTALLATION_ID");
+        var privateKeyPath = Required(values, "github-private-key-path", "TS_REVIEWER_GITHUB_PRIVATE_KEY_PATH");
+        var anthropicKey = Required(values, "anthropic-api-key", "TS_REVIEWER_ANTHROPIC_API_KEY");
+        var botLogin = Required(values, "bot-login", "TS_REVIEWER_BOT_LOGIN");
+        if (!long.TryParse(appId, out var parsedAppId) || parsedAppId <= 0
+            || !long.TryParse(installationId, out var parsedInstallationId) || parsedInstallationId <= 0)
+            throw new InvalidOperationException("GitHub App and installation IDs must be positive integers");
         var webhookSecret = Required(values, "webhook-secret", "TS_REVIEWER_WEBHOOK_SECRET");
         var contextApiToken = Required(values, "context-api-token", "TS_REVIEWER_CONTEXT_API_TOKEN");
         var operatorToken = Required(values, "operator-token", "TS_REVIEWER_OPERATOR_TOKEN");
@@ -84,10 +90,10 @@ public sealed record ReviewerOptions(
         if (!TimeSpan.TryParse(values["context-retry-base-delay"], out var contextRetryBaseDelay)
             || contextRetryBaseDelay <= TimeSpan.Zero || contextRetryBaseDelay > TimeSpan.FromMinutes(1))
             throw new InvalidOperationException("context-retry-base-delay must be positive and at most one minute");
-        return new ReviewerOptions(Trim(values["listen"]!), Trim(values["forgejo-url"]!), forgejoToken,
-            Trim(values["proxy-url"]!), proxyToken, values["organization"]!, values["bot-login"]!,
+        return new ReviewerOptions(Trim(values["listen"]!), "https://api.github.com", appId,
+            "https://api.anthropic.com", anthropicKey, "TerraScale", botLogin,
             webhookSecret, contextApiToken, values["context-database"]!, contextMaxFiles,
-            contextMaxAttempts, contextRetryBaseDelay, operatorToken);
+            contextMaxAttempts, contextRetryBaseDelay, operatorToken, installationId, privateKeyPath);
     }
     private static string Required(IReadOnlyDictionary<string, string?> values, string key, string environmentName) =>
         string.IsNullOrWhiteSpace(values[key]) ? throw new InvalidOperationException($"{environmentName} is required") : values[key]!;

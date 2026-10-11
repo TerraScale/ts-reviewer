@@ -1,26 +1,27 @@
 using System.Collections.Concurrent;
 using System.Threading.Channels;
 using TerraScale.Reviewer.Features.Configuration;
-using TerraScale.Reviewer.Features.Forgejo;
+using TerraScale.Reviewer.Features.GitHub;
 
 namespace TerraScale.Reviewer.Features.Context;
 
 public sealed class ContextIndexer : BackgroundService
 {
-    private readonly ForgejoClient _forgejo;
+    private readonly GitHubClient _github;
     private readonly ContextStore _store;
+    internal ContextStore DeliveryStore => _store;
     private readonly ContextEmbedder _embeddings;
     private readonly ReviewerOptions _options;
     private readonly ILogger<ContextIndexer> _logger;
     private readonly string _workerId = Environment.MachineName + ":" + Environment.ProcessId + ":" + Guid.NewGuid().ToString("N");
     private const int QueueCapacity = 1024;
-    private const int FetchParallelism = 2; // Bound simultaneous Forgejo file downloads independently of review workers.
+    private const int FetchParallelism = 2; // Bound simultaneous GitHub file downloads independently of review workers.
     private readonly Channel<IndexRequest> _queue;
     private readonly ConcurrentDictionary<string, TaskCompletionSource<bool>> _pending = new(StringComparer.OrdinalIgnoreCase);
 
-    internal ContextIndexer(ForgejoClient forgejo, ContextStore store, ContextEmbedder embeddings, ReviewerOptions options, ILogger<ContextIndexer> logger)
+    internal ContextIndexer(GitHubClient github, ContextStore store, ContextEmbedder embeddings, ReviewerOptions options, ILogger<ContextIndexer> logger)
     {
-        (_forgejo, _store, _embeddings, _options, _logger) = (forgejo, store, embeddings, options, logger);
+        (_github, _store, _embeddings, _options, _logger) = (github, store, embeddings, options, logger);
         _queue = Channel.CreateBounded<IndexRequest>(new BoundedChannelOptions(QueueCapacity)
         {
             SingleReader = true,
@@ -160,12 +161,12 @@ public sealed class ContextIndexer : BackgroundService
     private async Task IndexAsync(IndexRequest request, CancellationToken ct)
     {
         var repository = request.Owner + "/" + request.Name;
-        var tree = await _forgejo.TreeAsync(request.Owner, request.Name, request.Commit, ct);
+        var tree = await _github.TreeAsync(request.Owner, request.Name, request.Commit, ct);
         var files = tree.Where(x => x.Type == "blob" && x.Size is > 0 and <= 1_000_000 && IsSourceFile(x.Path)).Take(_options.ContextMaxFiles).ToList();
         var chunks = new ConcurrentBag<CodeChunk>();
         await Parallel.ForEachAsync(files, new ParallelOptions { MaxDegreeOfParallelism = FetchParallelism, CancellationToken = ct }, async (file, token) =>
         {
-            var content = await _forgejo.FileAsync(request.Owner, request.Name, request.Commit, file.Path, token);
+            var content = await _github.FileAsync(request.Owner, request.Name, request.Commit, file.Path, token);
             foreach (var chunk in CodeChunker.Split(file.Path, content)) chunks.Add(chunk);
         });
         var orderedChunks = chunks.OrderBy(x => x.Path, StringComparer.Ordinal).ThenBy(x => x.StartLine).ToList();

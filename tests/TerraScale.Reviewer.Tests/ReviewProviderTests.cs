@@ -12,8 +12,8 @@ using TUnit.Core;
 
 public sealed class ReviewProviderTests
 {
-    private static readonly ReviewerOptions Options = new("http://+:8080", "https://forgejo.test", "forgejo",
-        "https://router.test/v1", "proxy-secret", "TerraScale", "bot", "webhook", "context", "unused", 100);
+    private static readonly ReviewerOptions Options = new("http://+:8080", "https://github.test", "github-app",
+        "https://anthropic.test", "anthropic-secret", "TerraScale", "bot", "webhook", "context", "unused", 100);
 
     private static JsonObject Request() => new()
     {
@@ -52,7 +52,101 @@ public sealed class ReviewProviderTests
     };
 
     [Test]
-    public async Task RetriesThroughFlashAndResetsTheBudgetForTheNextStep()
+    [Arguments("any", "disabled", 200000, 128000)]
+    [Arguments("tool", "enabled", 16384, 16384)]
+    [Arguments("auto", "adaptive", 4096, 4096)]
+    public async Task NormalizesPinnedOcrOptionsWithoutChangingSignedHistory(string choice, string thinking, int requested, int expected)
+    {
+        var transport = new Transport((_, model, _) => Task.FromResult(Success(model)));
+        await using var provider = Create(transport);
+        var request = Request();
+        request["tool_choice"] = new JsonObject { ["type"] = choice, ["name"] = "file_read" };
+        request["thinking"] = new JsonObject { ["type"] = thinking, ["budget_tokens"] = 1024 };
+        request["temperature"] = 0.2;
+        request["top_p"] = 0.5;
+        request["top_k"] = 5;
+        request["max_tokens"] = requested;
+        request["messages"] = JsonNode.Parse("""
+            [{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"signed-history"},
+              {"type":"redacted_thinking","data":"redacted-history"},
+              {"type":"tool_use","id":"read_1","name":"file_read","input":{"file_path":"a.cs"}}]},
+             {"role":"user","content":[{"type":"tool_result","tool_use_id":"read_1","content":"class A {}"}]}]
+            """);
+        var history = request["messages"]!.ToJsonString();
+        var tools = request["tools"]!.ToJsonString();
+        await provider.SendAsync(request, CancellationToken.None);
+        var forwarded = transport.Bodies.Single();
+        await Assert.That(forwarded["tool_choice"]!["type"]!.GetValue<string>()).IsEqualTo("auto");
+        await Assert.That(forwarded["tool_choice"]!.AsObject().Count).IsEqualTo(1);
+        await Assert.That(forwarded["thinking"] is null && forwarded["temperature"] is null && forwarded["top_p"] is null && forwarded["top_k"] is null).IsTrue();
+        await Assert.That(forwarded["max_tokens"]!.GetValue<int>()).IsEqualTo(expected);
+        await Assert.That(forwarded["messages"]!.ToJsonString()).IsEqualTo(history);
+        await Assert.That(forwarded["tools"]!.ToJsonString()).IsEqualTo(tools);
+    }
+
+    [Test]
+    public async Task RequestsWithoutToolsDoNotForwardToolChoice()
+    {
+        var transport = new Transport((_, model, _) => Task.FromResult(Success(model)));
+        await using var provider = Create(transport);
+        var request = Request();
+        request.Remove("tools");
+        request["tool_choice"] = new JsonObject { ["type"] = "any" };
+        await provider.SendAsync(request, CancellationToken.None);
+        await Assert.That(transport.Bodies.Single()["tool_choice"]).IsNull();
+    }
+
+    [Test]
+    [Arguments("bash")]
+    [Arguments("mcp_build")]
+    [Arguments("server_type")]
+    public async Task RejectsExecutableToolsBeforeCallingAnthropic(string tool)
+    {
+        var transport = new Transport((_, model, _) => Task.FromResult(Success(model)));
+        await using var provider = Create(transport);
+        await provider.StartAsync(CancellationToken.None);
+        using var client = new HttpClient();
+        client.DefaultRequestHeaders.Add("x-api-key", provider.Token);
+        var request = Request();
+        var definition = new JsonObject { ["name"] = tool == "server_type" ? "file_read" : tool, ["input_schema"] = new JsonObject { ["type"] = "object" } };
+        if (tool == "server_type") definition["type"] = "bash_20250124";
+        request["tools"]!.AsArray().Add(definition);
+        using var response = await client.PostAsJsonAsync(provider.Url + "/v1/messages", request);
+        await Assert.That(response.StatusCode).IsEqualTo(HttpStatusCode.BadRequest);
+        await Assert.That(transport.Models.Count).IsEqualTo(0);
+    }
+
+    [Test]
+    [Arguments("upstream-message")]
+    [Arguments("unknown-error-type")]
+    [Arguments("transport")]
+    public async Task ProviderFailuresNeverExposeUpstreamCredentialsOrPromptMaterial(string failure)
+    {
+        const string sensitive = "private-key-and-prompt";
+        var transport = new Transport((_, _, _) =>
+        {
+            if (failure == "transport") throw new HttpRequestException(sensitive);
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.Unauthorized)
+            {
+                Content = JsonContent.Create(new { error = new { type = failure == "unknown-error-type" ? sensitive : "authentication_error", message = sensitive } })
+            });
+        });
+        var log = new CaptureLogger();
+        await using var provider = new ReviewProvider(Options, log, "review", new HttpClient(transport), (_, _) => Task.CompletedTask);
+        await provider.StartAsync(CancellationToken.None);
+        using var client = new HttpClient();
+        client.DefaultRequestHeaders.Add("x-api-key", provider.Token);
+        using var response = await client.PostAsJsonAsync(provider.Url + "/v1/messages", Request());
+        var body = await response.Content.ReadAsStringAsync();
+        await Assert.That(response.StatusCode).IsEqualTo(HttpStatusCode.BadRequest);
+        await Assert.That(body.Contains(sensitive)).IsFalse();
+        await Assert.That(provider.Failure!.Contains(sensitive)).IsFalse();
+        await Assert.That(log.Messages.Any(message => message.Contains(sensitive))).IsFalse();
+        await Assert.That(transport.Models.Count).IsEqualTo(30);
+    }
+
+    [Test]
+    public async Task RetriesOpusAndResetsTheBudgetForTheNextStep()
     {
         var delay = new List<TimeSpan>();
         var log = new CaptureLogger();
@@ -62,11 +156,11 @@ public sealed class ReviewProviderTests
             (wait, _) => { delay.Add(wait); return Task.CompletedTask; });
         await provider.SendAsync(Request(), CancellationToken.None);
         await provider.SendAsync(Request(), CancellationToken.None);
-        await Assert.That(string.Join(",", transport.Models)).IsEqualTo("glm-5.3,glm-5.3,glm-5.3,glm-5.3-flash,glm-5.3");
+        await Assert.That(string.Join(",", transport.Models)).IsEqualTo("claude-opus-5-5,claude-opus-5-5,claude-opus-5-5,claude-opus-5-5,claude-opus-5-5");
         await Assert.That(delay.Count).IsEqualTo(3);
-        await Assert.That(log.Messages.Any(x => x.Contains("model glm-5.3-flash; attempts 4; retries 3; succeeded"))).IsTrue();
-        await Assert.That(log.Messages.Any(x => x.Contains("step 2; model glm-5.3; attempts 1; retries 0; succeeded"))).IsTrue();
-        await Assert.That(provider.ModelsUsed).IsEqualTo("glm-5.3 → glm-5.3-flash");
+        await Assert.That(log.Messages.Any(x => x.Contains("model claude-opus-5-5; attempts 4; retries 3; succeeded"))).IsTrue();
+        await Assert.That(log.Messages.Any(x => x.Contains("step 2; model claude-opus-5-5; attempts 1; retries 0; succeeded"))).IsTrue();
+        await Assert.That(provider.ModelsUsed).IsEqualTo("claude-opus-5-5");
     }
 
     [Test]
@@ -95,7 +189,7 @@ public sealed class ReviewProviderTests
         await Assert.That(elapsed > ReviewProvider.StepTimeout).IsTrue();
         await Assert.That(elapsed > TimeSpan.FromHours(4)).IsTrue();
         await Assert.That(transport.Models.Count).IsEqualTo(39);
-        await Assert.That(log.Messages.Any(x => x.Contains("step 2; model glm-5.3; attempts 26; retries 25; succeeded"))).IsTrue();
+        await Assert.That(log.Messages.Any(x => x.Contains("step 2; model claude-opus-5-5; attempts 26; retries 25; succeeded"))).IsTrue();
         await Assert.That(provider.Failure).IsNull();
     }
 
@@ -113,7 +207,7 @@ public sealed class ReviewProviderTests
     [Arguments(401)]
     [Arguments(403)]
     [Arguments(400)]
-    public async Task ThirtyAttemptsAreSharedAcrossModelsAndCannotBeReopenedByOcr(int upstreamStatus)
+    public async Task ThirtyOpusAttemptsCannotBeReopenedByOcr(int upstreamStatus)
     {
         var delays = 0;
         var transport = new Transport((_, _, _) => Task.FromResult(new HttpResponseMessage((HttpStatusCode)upstreamStatus)
@@ -127,16 +221,15 @@ public sealed class ReviewProviderTests
         {
             using var response = await client.PostAsJsonAsync(provider.Url + "/v1/messages", Request());
             await Assert.That(response.StatusCode).IsEqualTo(HttpStatusCode.BadRequest);
-            await Assert.That((await response.Content.ReadAsStringAsync()).Contains($"failed after 30 attempts: HTTP {upstreamStatus}: upstream rejected")).IsTrue();
+            await Assert.That((await response.Content.ReadAsStringAsync()).Contains($"failed after 30 attempts: HTTP {upstreamStatus}: provider request failed")).IsTrue();
         }
         await Assert.That(transport.Models.Count).IsEqualTo(30);
         await Assert.That(delays).IsEqualTo(29);
-        await Assert.That(transport.Models.Count(x => x == "glm-5.3")).IsEqualTo(15);
-        await Assert.That(transport.Models.Count(x => x == "glm-5.3-flash")).IsEqualTo(15);
+        await Assert.That(transport.Models.All(x => x == "claude-opus-5-5")).IsTrue();
     }
 
     [Test]
-    public async Task StreamingRequestsAreRejectedBeforeCallingTheRouter()
+    public async Task StreamingRequestsAreRejectedBeforeCallingAnthropic()
     {
         var transport = new Transport((_, model, _) => Task.FromResult(Success(model)));
         await using var provider = Create(transport);
@@ -158,7 +251,7 @@ public sealed class ReviewProviderTests
     [NotInParallel]
     [Arguments(false)]
     [Arguments(true)]
-    public async Task LargePromptsReachTheRouterWithKnownLengthOrChunkedBodies(bool chunked)
+    public async Task LargePromptsReachAnthropicWithKnownLengthOrChunkedBodies(bool chunked)
     {
         var transport = new Transport((_, model, _) => Task.FromResult(Success(model)));
         await using var provider = Create(transport);
@@ -176,7 +269,7 @@ public sealed class ReviewProviderTests
         if (chunked) request.Headers.TransferEncodingChunked = true;
         using var response = await client.SendAsync(request);
         await Assert.That(response.StatusCode).IsEqualTo(HttpStatusCode.OK);
-        await Assert.That(transport.Models.Single()).IsEqualTo("glm-5.3");
+        await Assert.That(transport.Models.Single()).IsEqualTo("claude-opus-5-5");
         await Assert.That(provider.Failure).IsNull();
     }
 
@@ -243,9 +336,12 @@ public sealed class ReviewProviderTests
     [Arguments("""{"type":"thinking","signature":"signed"}""", false)]
     [Arguments("""{"type":"thinking","thinking":"reasoning","signature":false}""", false)]
     [Arguments("""{"type":"thinking","thinking":"reasoning"}""", false)]
+    [Arguments("""{"type":"thinking","thinking":"","signature":""}""", false)]
     [Arguments("""{"type":"redacted_thinking","data":null}""", false)]
+    [Arguments("""{"type":"redacted_thinking","data":""}""", false)]
     [Arguments("""{"type":"redacted_thinking"}""", false)]
     [Arguments("""{"type":"thinking","thinking":"reasoning","signature":"signed"}""", true)]
+    [Arguments("""{"type":"thinking","thinking":"","signature":"signed"}""", true)]
     [Arguments("""{"type":"redacted_thinking","data":"redacted"}""", true)]
     public async Task ThinkingBlocksAreValidatedEvenWithUsableText(string block, bool valid)
     {
@@ -382,7 +478,7 @@ public sealed class ReviewProviderTests
         {
             started.TrySetResult();
             await Task.Delay(Timeout.InfiniteTimeSpan, ct);
-            return Success("glm-5.3");
+            return Success("claude-opus-5-5");
         });
         await using var provider = Create(transport);
         using var cancellation = new CancellationTokenSource();
@@ -602,11 +698,15 @@ public sealed class ReviewProviderTests
     private sealed class Transport(Func<int, string, CancellationToken, Task<HttpResponseMessage>> send) : HttpMessageHandler
     {
         internal List<string> Models { get; } = [];
+        internal List<JsonObject> Bodies { get; } = [];
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
-            if (request.RequestUri!.AbsoluteUri != "https://router.test/v1/messages"
-                || request.Headers.Authorization?.ToString() != "Bearer proxy-secret") throw new InvalidOperationException("incorrect router endpoint or credentials");
+            if (request.RequestUri!.AbsoluteUri != "https://anthropic.test/v1/messages"
+                || request.Headers.Authorization is not null
+                || request.Headers.GetValues("x-api-key").Single() != "anthropic-secret"
+                || request.Headers.GetValues("anthropic-version").Single() != "2023-06-01") throw new InvalidOperationException("incorrect Anthropic endpoint or credentials");
             using var document = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(ct));
+            Bodies.Add(JsonNode.Parse(document.RootElement.GetRawText())!.AsObject());
             if (document.RootElement.GetProperty("stream").GetBoolean()) throw new InvalidOperationException("OCR must use buffered responses");
             var model = document.RootElement.GetProperty("model").GetString()!;
             Models.Add(model);
