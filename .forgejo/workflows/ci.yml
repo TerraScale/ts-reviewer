@@ -55,13 +55,25 @@ jobs:
         run: |
           set -euo pipefail
           # ts-libs publishes only YYYY.MMDD.HHmm[.ss]; any other pin is an old package.
+          found=$(grep -rhoE 'Include="TerraScale\.Logging" Version="' --include=Directory.Packages.props --include='*.csproj' . | wc -l || true)
           bad=$(grep -rhoE 'Include="TerraScale\.(Logging|Endpoints)" Version="[^"]*"' --include=Directory.Packages.props --include='*.csproj' . | grep -vE 'Version="[0-9]{4}\.[0-9]{3,4}\.[0-9]{1,4}(\.[0-9]{1,2})?"' || true)
+          if [[ $found -lt 1 ]]; then echo "Expected a TerraScale.Logging pin" >&2; exit 1; fi
           if [[ -n $bad ]]; then echo "Non-calendar ts-libs pins: $bad" >&2; exit 1; fi
 
       - name: Restore reviewer tests
         run: >-
           dotnet restore tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj
           --runtime linux-x64 --nologo
+
+      - name: The audit script pins the central TUnit version
+        run: |
+          set -euo pipefail
+          # The script opts out of central package management, so its inline pin must follow Directory.Packages.props.
+          central=$(sed -n 's:.*Include="TUnit" Version="\([^"]*\)".*:\1:p' Directory.Packages.props)
+          if [[ -z $central ]] || ! grep -qx "#:package TUnit@$central" scripts/check-nuget-vulnerabilities.tests.cs; then
+            echo "scripts/check-nuget-vulnerabilities.tests.cs must pin TUnit@${central:-<central version>}" >&2
+            exit 1
+          fi
 
       - name: Verify dependency audit failure handling
         run: dotnet run scripts/check-nuget-vulnerabilities.tests.cs -- --minimum-expected-tests 13
