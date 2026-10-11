@@ -14,10 +14,11 @@
     <ContainerUser>1654</ContainerUser>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="FastBertTokenizer" Version="0.4.67" />
-    <PackageReference Include="LiteDB" Version="6.0.0-prerelease.289" />
-    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.17.0" />
+    <PackageReference Include="FastBertTokenizer" />
+    <PackageReference Include="LiteDB" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" />
+    <PackageReference Include="TerraScale.Logging" />
     <!-- Supplies the bge-micro-v2 model and vocabulary at build time; ContextEmbedder runs them. -->
-    <PackageReference Include="SmartComponents.LocalEmbeddings" Version="0.1.0-preview10148" />
+    <PackageReference Include="SmartComponents.LocalEmbeddings" />
   </ItemGroup>
 </Project>
