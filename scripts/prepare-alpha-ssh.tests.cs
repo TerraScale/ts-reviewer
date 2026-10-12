@@ -16,6 +16,7 @@ public sealed class AlphaSshTests
     [Arguments("identity_denied")]
     [Arguments("login_denied")]
     [Arguments("sign_denied")]
+    [Arguments("sign_and_revoke_denied")]
     [Arguments("sign_redirect")]
     [Arguments("wrong_certificate")]
     [Arguments("revoke_denied")]
@@ -56,7 +57,7 @@ public sealed class AlphaSshTests
                     }
                     var response = new HttpResponseMessage(behavior switch
                     {
-                        "sign_denied" => HttpStatusCode.Forbidden,
+                        "sign_denied" or "sign_and_revoke_denied" => HttpStatusCode.Forbidden,
                         "sign_redirect" => HttpStatusCode.Redirect,
                         _ => HttpStatusCode.OK
                     }) { Content = JsonContent.Create(new { data = new { signed_key = behavior == "wrong_certificate" ? "synthetic-provider-secret" : "ssh-ed25519-cert-v01@openssh.com synthetic-certificate" } }) };
@@ -64,7 +65,7 @@ public sealed class AlphaSshTests
                     return response;
                 case "/v1/auth/token/revoke-self":
                     await Assert.That(request.Headers.GetValues("X-Vault-Token").Single()).IsEqualTo("synthetic-bao-token");
-                    return new(behavior == "revoke_denied" ? HttpStatusCode.Forbidden : HttpStatusCode.NoContent);
+                    return new(behavior is "revoke_denied" or "sign_and_revoke_denied" ? HttpStatusCode.Forbidden : HttpStatusCode.NoContent);
                 default: throw new InvalidOperationException("Unexpected credential destination.");
             }
         }));

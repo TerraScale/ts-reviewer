@@ -71,6 +71,7 @@ public static class AlphaSsh
         using var login = await JsonAsync(http, loginRequest, "OpenBao authentication");
         var token = login.RootElement.GetProperty("auth").GetProperty("client_token").GetString();
         if (string.IsNullOrWhiteSpace(token)) throw new InvalidOperationException();
+        var signedSuccessfully = false;
         try
         {
             using var signRequest = new HttpRequestMessage(HttpMethod.Post, Bao + "ssh-client-signer/sign/ts-reviewer-alpha")
@@ -81,14 +82,24 @@ public static class AlphaSsh
             using var signed = await JsonAsync(http, signRequest, "OpenBao SSH signing");
             var certificate = signed.RootElement.GetProperty("data").GetProperty("signed_key").GetString();
             if (certificate is null || !certificate.StartsWith("ssh-ed25519-cert-v01@openssh.com ", StringComparison.Ordinal)) throw new InvalidOperationException();
+            signedSuccessfully = true;
             return certificate;
         }
         finally
         {
-            using var revoke = new HttpRequestMessage(HttpMethod.Post, Bao + "auth/token/revoke-self");
-            revoke.Headers.Add("X-Vault-Token", token);
-            using var response = await http.SendAsync(revoke, HttpCompletionOption.ResponseHeadersRead);
-            if (!response.IsSuccessStatusCode) throw new IdentityException("OpenBao token revocation", response.StatusCode);
+            try
+            {
+                using var revoke = new HttpRequestMessage(HttpMethod.Post, Bao + "auth/token/revoke-self");
+                revoke.Headers.Add("X-Vault-Token", token);
+                using var response = await http.SendAsync(revoke, HttpCompletionOption.ResponseHeadersRead);
+                if (!response.IsSuccessStatusCode) throw new IdentityException("OpenBao token revocation", response.StatusCode);
+            }
+            catch (Exception ex) when (!signedSuccessfully)
+            {
+                // Preserve the signing failure while reporting failed cleanup without provider diagnostics.
+                var reason = ex is IdentityException ? ex.Message : "OpenBao token revocation";
+                Console.Error.WriteLine($"{reason} also failed; details suppressed.");
+            }
         }
     }
 
