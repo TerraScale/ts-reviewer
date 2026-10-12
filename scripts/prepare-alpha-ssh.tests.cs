@@ -75,6 +75,8 @@ public sealed class AlphaSshTests
         else
         {
             var failure = await Assert.That(async () => { await AlphaSsh.SignAsync(http, "https://pipelines.actions.githubusercontent.com/idtoken", "synthetic-runner-token", "synthetic-ephemeral-public-key"); }).Throws<InvalidOperationException>();
+            await Assert.That(TUnit.Core.TestContext.Current!.GetErrorOutput()).IsEqualTo(behavior == "sign_and_revoke_denied"
+                ? "OpenBao token revocation HTTP 403 also failed; details suppressed." + Environment.NewLine : "");
             var message = failure!.Message;
             await Assert.That(message.Contains("synthetic", StringComparison.Ordinal)).IsFalse();
             if (behavior != "wrong_certificate")
