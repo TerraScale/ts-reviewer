@@ -44,10 +44,11 @@ jobs:
           dotnet run scripts/provision-reviewer-secrets.tests.cs
       - name: Audit all dependencies
         run: dotnet run scripts/check-nuget-vulnerabilities.cs src/TerraScale.Reviewer/TerraScale.Reviewer.csproj tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj
-      - name: Publish the checked application and Alpha utility
+      - name: Publish the checked application and Alpha utilities
         run: |
           dotnet publish src/TerraScale.Reviewer -c Release -r linux-x64 --self-contained true -o artifacts/ci/reviewer -p:SourceRevisionId="$GITHUB_SHA"
           dotnet publish scripts/deploy-alpha.cs -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o artifacts/ci/deploy
+          dotnet publish scripts/provision-reviewer-secrets.cs -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o artifacts/ci/setup
       - name: Verify pinned OCR tooling without model calls
         run: docker build --file Containerfile --tag ts-reviewer-tooling-check .
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -57,6 +58,7 @@ jobs:
           path: |
             artifacts/ci/reviewer/
             artifacts/ci/deploy/
+            artifacts/ci/setup/
 
   image:
     name: Publish the exact checked image

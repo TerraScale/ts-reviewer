@@ -75,6 +75,46 @@ public sealed class DeploymentTests
     }
 
     [Test]
+    public async Task Secret_file_metadata_is_checked_without_reading_values_before_deployment()
+    {
+        var metadata = "600:1654:1654\n600:1654:1654\n";
+        Task<string> Stat(string program, string[] arguments)
+        {
+            if (program != "stat" || !arguments.SequenceEqual(new[] { "-c", "%a:%u:%g", "--",
+                "/var/srv/appdata/ts-reviewer/ts-reviewer.env", "/var/srv/appdata/ts-reviewer/github-app.pem" }))
+                throw new InvalidOperationException("Preflight may inspect secret-file metadata only.");
+            return Task.FromResult(metadata);
+        }
+        await AlphaDeployment.ValidateSecretFilesAsync(Stat);
+        foreach (var unsafeMetadata in new[] { "644:1654:1654\n600:1654:1654\n", "600:0:0\n600:1654:1654\n", "600:1654:1654\n" })
+        {
+            metadata = unsafeMetadata;
+            await Assert.That(() => AlphaDeployment.ValidateSecretFilesAsync(Stat)).Throws<InvalidOperationException>();
+        }
+    }
+
+    [Test]
+    public async Task Rollback_restores_runtime_owner_only_permissions_before_rebuilding()
+    {
+        var restored = false;
+        Task<string> Install(string program, string[] arguments)
+        {
+            if (program != "install" || !arguments.SequenceEqual(new[] { "-m", "0600", "-o", "1654", "-g", "1654", "--",
+                "/root/test-rollback.env", "/var/srv/appdata/ts-reviewer/ts-reviewer.env" }))
+                throw new InvalidOperationException("Rollback must restore owner-only runtime permissions.");
+            restored = true;
+            return Task.FromResult("");
+        }
+        await Assert.That(() => AlphaDeployment.RollAsync(Commit, "rollback-exact-digest", async tag =>
+            {
+                if (tag == Commit) throw new InvalidOperationException("Replacement failed.");
+                await AlphaDeployment.RestoreSecretsAsync("/root/test-rollback.env", Install);
+            }, () => Task.FromResult(restored), _ => Task.CompletedTask, _ => Task.CompletedTask,
+            Digest, "previous-digest")).Throws<InvalidOperationException>();
+        await Assert.That(restored).IsTrue();
+    }
+
+    [Test]
     public async Task Failed_rebuild_rolls_back_an_already_stopped_instance()
     {
         var running = true;

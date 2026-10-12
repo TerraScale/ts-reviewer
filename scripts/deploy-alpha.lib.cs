@@ -31,6 +31,7 @@ public static partial class AlphaDeployment
             using var policy = JsonDocument.Parse(await File.ReadAllTextAsync("/opt/homelab/deployer/apps.json"));
             ValidateHandoff(policy.RootElement);
             await ValidateInstanceAsync(Command);
+            await ValidateSecretFilesAsync(Command);
             var archive = Path.Combine(directory, "image.oci.tar");
             using var image = JsonDocument.Parse(await Command("skopeo", "inspect", "oci-archive:" + archive));
             ValidateImage(image.RootElement, commit, digest);
@@ -79,10 +80,7 @@ public static partial class AlphaDeployment
             await RollAsync(commit, rollbackTag, async tag =>
                 {
                     if (tag == rollbackTag)
-                    {
-                        File.Copy(rollbackEnv, SecretsPath, overwrite: true);
-                        if (OperatingSystem.IsLinux()) File.SetUnixFileMode(SecretsPath, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead | UnixFileMode.OtherRead);
-                    }
+                        await RestoreSecretsAsync(rollbackEnv, Command);
                     await RebuildAsync(tag, Command);
                 }, Healthy,
                 imageDigest => Command("skopeo", "copy", "--quiet", "--preserve-digests", "--src-authfile", RegistryAuth,
@@ -140,6 +138,16 @@ public static partial class AlphaDeployment
         using var instance = JsonDocument.Parse(await command("incus", ["query", "/1.0/instances/ts-reviewer"]));
         ValidateInstance(instance.RootElement);
     }
+
+    public static async Task ValidateSecretFilesAsync(Func<string, string[], Task<string>> command)
+    {
+        var metadata = await command("stat", ["-c", "%a:%u:%g", "--", SecretsPath, PemPath]);
+        if (!metadata.Split('\n', StringSplitOptions.RemoveEmptyEntries).SequenceEqual(new[] { "600:1654:1654", "600:1654:1654" }))
+            throw new InvalidOperationException("Both runtime secret files must have mode 0600 and uid/gid 1654 before deployment.");
+    }
+
+    public static Task<string> RestoreSecretsAsync(string source, Func<string, string[], Task<string>> command) =>
+        command("install", ["-m", "0600", "-o", "1654", "-g", "1654", "--", source, SecretsPath]);
 
     public static void ValidateImage(JsonElement image, string commit, string digest)
     {
