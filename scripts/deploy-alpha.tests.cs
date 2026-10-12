@@ -47,16 +47,27 @@ public sealed class DeploymentTests
     }
 
     [Test]
-    public async Task Missing_or_writable_secret_mount_prevents_service_stop()
+    public async Task Incus_JSON_query_validates_expanded_shifted_readonly_mounts_before_service_stop()
     {
         const string valid = """
-            {"config":{"oci.entrypoint":"sh -c 'set -a; . /secrets/ts-reviewer.env; set +a; exec /app/TerraScale.Reviewer'"},
-             "devices":{"env":{"type":"disk","source":"/var/srv/appdata/ts-reviewer/ts-reviewer.env","path":"/secrets/ts-reviewer.env","readonly":"true"},
-                        "pem":{"type":"disk","source":"/var/srv/appdata/ts-reviewer/github-app.pem","path":"/secrets/github-app.pem","readonly":"true"}}}
+            {"config":{},"devices":{},
+             "expanded_config":{"oci.entrypoint":"sh -c 'set -a; . /secrets/ts-reviewer.env; set +a; exec /app/TerraScale.Reviewer'"},
+             "expanded_devices":{"env":{"type":"disk","source":"/var/srv/appdata/ts-reviewer/ts-reviewer.env","path":"/secrets/ts-reviewer.env","readonly":"true","shift":"true"},
+                                 "pem":{"type":"disk","source":"/var/srv/appdata/ts-reviewer/github-app.pem","path":"/secrets/github-app.pem","readonly":"true","shift":"true"}}}
             """;
-        using var instance = JsonDocument.Parse(valid);
-        AlphaDeployment.ValidateInstance(instance.RootElement);
-        foreach (var broken in new[] { valid.Replace("\"readonly\":\"true\"", "\"readonly\":\"false\""), valid.Replace("exec /app/TerraScale.Reviewer", "exec /unrelated-service") })
+        Task<string> Query(string program, string[] arguments)
+        {
+            if (program != "incus" || !arguments.SequenceEqual(new[] { "query", "/1.0/instances/ts-reviewer" }))
+                throw new InvalidOperationException("Only the read-only Incus JSON API may run during instance validation.");
+            return Task.FromResult(valid);
+        }
+        await AlphaDeployment.ValidateInstanceAsync(Query);
+        foreach (var broken in new[]
+        {
+            valid.Replace("\"readonly\":\"true\"", "\"readonly\":\"false\""),
+            valid.Replace("\"shift\":\"true\"", "\"shift\":\"false\""),
+            valid.Replace("exec /app/TerraScale.Reviewer", "exec /unrelated-service")
+        })
         {
             using var rejected = JsonDocument.Parse(broken);
             await Assert.That(() => AlphaDeployment.ValidateInstance(rejected.RootElement)).Throws<InvalidOperationException>();

@@ -30,8 +30,7 @@ public static partial class AlphaDeployment
 
             using var policy = JsonDocument.Parse(await File.ReadAllTextAsync("/opt/homelab/deployer/apps.json"));
             ValidateHandoff(policy.RootElement);
-            using var instance = JsonDocument.Parse(await Command("incus", "config", "show", "ts-reviewer", "--expanded", "--format=json"));
-            ValidateInstance(instance.RootElement);
+            await ValidateInstanceAsync(Command);
             var archive = Path.Combine(directory, "image.oci.tar");
             using var image = JsonDocument.Parse(await Command("skopeo", "inspect", "oci-archive:" + archive));
             ValidateImage(image.RootElement, commit, digest);
@@ -117,22 +116,29 @@ public static partial class AlphaDeployment
 
     public static void ValidateInstance(JsonElement instance)
     {
-        var config = instance.GetProperty("config");
+        var config = instance.GetProperty("expanded_config");
         var entrypoint = config.GetProperty("oci.entrypoint").GetString() ?? "";
         if (!entrypoint.Contains(". /secrets/ts-reviewer.env", StringComparison.Ordinal)
             || !(entrypoint.Contains("exec /app/TerraScale.Reviewer", StringComparison.Ordinal)
                 || entrypoint.Contains("exec /ts-reviewer", StringComparison.Ordinal)))
             throw new InvalidOperationException("The Incus entrypoint must source the runtime secret file and execute the reviewer binary.");
-        var devices = instance.GetProperty("devices");
+        var devices = instance.GetProperty("expanded_devices");
         foreach (var (source, target) in new[] { (SecretsPath, "/secrets/ts-reviewer.env"), (PemPath, "/secrets/github-app.pem") })
         {
             if (!devices.EnumerateObject().Any(device =>
                     device.Value.TryGetProperty("type", out var type) && type.GetString() == "disk"
                     && device.Value.TryGetProperty("source", out var from) && from.GetString() == source
                     && device.Value.TryGetProperty("path", out var to) && to.GetString() == target
-                    && device.Value.TryGetProperty("readonly", out var readOnly) && readOnly.GetString() == "true"))
-                throw new InvalidOperationException("The approved Incus secret-file and GitHub PEM mounts must both be present and read-only.");
+                    && device.Value.TryGetProperty("readonly", out var readOnly) && readOnly.GetString() == "true"
+                    && device.Value.TryGetProperty("shift", out var shift) && shift.GetString() == "true"))
+                throw new InvalidOperationException("The approved Incus secret-file and GitHub PEM mounts must both be present, read-only, and shifted for the runtime user.");
         }
+    }
+
+    public static async Task ValidateInstanceAsync(Func<string, string[], Task<string>> command)
+    {
+        using var instance = JsonDocument.Parse(await command("incus", ["query", "/1.0/instances/ts-reviewer"]));
+        ValidateInstance(instance.RootElement);
     }
 
     public static void ValidateImage(JsonElement image, string commit, string digest)
