@@ -14,6 +14,12 @@ on:
 permissions:
   contents: read
 
+# Superseded branch/PR runs are cancelled. Each main run gets its own group, so a publish is never cut off and a deploy
+# waiting for Alpha approval does not hold back later main checks; the deploy job serializes itself below.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: true
+
 env:
   CI: true # Standard .NET/Actions CI detection, required by the local-priority rule.
 
@@ -21,9 +27,7 @@ jobs:
   checks:
     name: Check and build ts-reviewer
     runs-on: ubuntu-latest
-    concurrency:
-      group: ts-reviewer-checks-${{ github.event_name }}-${{ github.ref }}
-      cancel-in-progress: true
+    timeout-minutes: 15
     steps:
       - name: Verify the requested trusted commit before running CI
         if: github.event_name == 'workflow_dispatch'
@@ -36,6 +40,12 @@ jobs:
       - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
         with:
           global-json-file: global.json
+      # No packages.lock.json, so setup-dotnet's built-in cache can't be used; key on the project files instead.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', 'Directory.Packages.props', 'Directory.Build.props', 'global.json', 'nuget.config') }}
+          restore-keys: nuget-${{ runner.os }}-
       - name: TUnit tests and migration/deployment fixtures
         run: |
           dotnet run --project tests/TerraScale.Reviewer.Tests -c Release
@@ -51,8 +61,17 @@ jobs:
           dotnet publish scripts/deploy-alpha.cs -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o artifacts/ci/deploy
           dotnet publish scripts/provision-reviewer-secrets.cs -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o artifacts/ci/setup
           dotnet publish scripts/prepare-alpha-ssh.cs -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o artifacts/ci/ssh
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Verify pinned OCR tooling without model calls
-        run: docker build --file Containerfile --tag ts-reviewer-tooling-check .
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Containerfile
+          platforms: linux/amd64
+          push: false
+          tags: ts-reviewer-tooling-check
+          cache-from: type=gha,scope=tooling
+          cache-to: type=gha,mode=max,scope=tooling
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: checked-${{ github.sha }}
@@ -68,6 +87,7 @@ jobs:
     needs: checks
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       packages: write
@@ -100,6 +120,8 @@ jobs:
           provenance: false # SDK base-image reader expects one image manifest, not an attestation index.
           push: true
           tags: ghcr.io/terrascale/ts-reviewer:tooling-${{ github.sha }}
+          cache-from: type=gha,scope=tooling
+          cache-to: type=gha,mode=max,scope=tooling
       - name: PublishContainer directly from the checked publish directory
         env:
           TOOLING_DIGEST: ${{ steps.tooling.outputs.digest }}
@@ -132,6 +154,7 @@ jobs:
     name: Verify Alpha environment setup
     needs: image
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
       actions: read
@@ -151,6 +174,7 @@ jobs:
     needs: [checks, image, deployment-gate]
     runs-on: ubuntu-latest
     environment: alpha
+    timeout-minutes: 20
     permissions:
       contents: read
       id-token: write # Short-lived GitHub identity for OpenBao SSH signing and Tailscale federation.
