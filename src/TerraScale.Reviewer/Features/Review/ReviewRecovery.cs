@@ -1,5 +1,5 @@
 using TerraScale.Reviewer.Features.Configuration;
-using TerraScale.Reviewer.Features.Forgejo;
+using TerraScale.Reviewer.Features.GitHub;
 
 namespace TerraScale.Reviewer.Features.Review;
 
@@ -14,19 +14,24 @@ namespace TerraScale.Reviewer.Features.Review;
 /// alone: their outcome is published, and re-running a persistently failing
 /// review on every restart would loop; a recheck comment retries them.
 /// </summary>
-public sealed class ReviewRecovery(ForgejoClient forgejo, ReviewQueue queue, PullRequestReviewer reviewer, ReviewerOptions options, ILogger<ReviewRecovery> logger) : BackgroundService
+public sealed class ReviewRecovery(GitHubClient github, ReviewQueue queue, PullRequestReviewer reviewer, ReviewerOptions options, ILogger<ReviewRecovery> logger) : BackgroundService
 {
     private const int PageSize = 50;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        try
+        while (!stoppingToken.IsCancellationRequested)
         {
-            var recovered = await RecoverAsync(stoppingToken);
-            logger.LogInformation("startup recovery queued {Count} pending or unreviewed pull request(s)", recovered);
+            try
+            {
+                var recovered = await RecoverAsync(stoppingToken);
+                logger.LogInformation("review recovery queued {Count} pending or unreviewed pull request(s)", recovered);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { return; }
+            catch (Exception ex) { logger.LogWarning(ex, "review recovery failed; retrying in one minute"); }
+            try { await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken); }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { return; }
         }
-        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
-        catch (Exception ex) { logger.LogWarning(ex, "startup recovery of pending reviews failed; re-trigger them with a recheck comment"); }
     }
 
     internal async Task<int> RecoverAsync(CancellationToken ct)
@@ -36,7 +41,7 @@ public sealed class ReviewRecovery(ForgejoClient forgejo, ReviewQueue queue, Pul
         {
             // The reviewer's token carries repository scope only, so the
             // organization's repositories come from repository search.
-            var repositories = await forgejo.SearchRepositoriesAsync(page, PageSize, ct);
+            var repositories = await github.SearchRepositoriesAsync(page, PageSize, ct);
             foreach (var repository in repositories.Where(x => !x.Archived && string.Equals(x.Owner.Login, options.Organization, StringComparison.OrdinalIgnoreCase)))
                 recovered += await RecoverRepositoryAsync(repository.Owner.Login, repository.Name, ct);
             if (repositories.Count < PageSize) return recovered;
@@ -48,15 +53,13 @@ public sealed class ReviewRecovery(ForgejoClient forgejo, ReviewQueue queue, Pul
         var recovered = 0;
         for (var page = 1; ; page++)
         {
-            var pulls = await forgejo.OpenPullsAsync(owner, name, page, PageSize, ct);
+            var pulls = await github.OpenPullsAsync(owner, name, page, PageSize, ct);
             foreach (var pull in pulls)
             {
-                var status = await forgejo.CombinedStatusAsync(owner, name, pull.Head.Sha, ct);
-                var current = status?.Statuses?.FirstOrDefault(x => x.Context == PullRequestReviewer.StatusContext);
-                if (current is not null && current.State != "pending") continue;
+                var current = await reviewer.LatestOwnedStatusAsync(pull, owner, name, ct);
+                if (PullRequestReviewer.IsCompleted(current, pull)) continue;
                 logger.LogInformation("recovering review for {Repository}#{Number} at {Head}: {Reason}", owner + "/" + name, pull.Number, pull.Head.Sha, current is null ? "head never reviewed" : "review was pending");
-                queue.Enqueue(new ReviewRequest(owner, name, pull.Number, pull.Head.Sha),
-                    _ => reviewer.PublishStatusAsync(owner, name, pull.Head.Sha, "pending", "Review queued"));
+                queue.Enqueue(new ReviewRequest(owner, name, pull.Number, pull.Head.Sha, BaseSha: pull.Base.Sha));
                 recovered++;
             }
             if (pulls.Count < PageSize) return recovered;

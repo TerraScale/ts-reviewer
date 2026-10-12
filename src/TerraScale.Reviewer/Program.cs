@@ -1,19 +1,51 @@
-using TerraScale.Logging;
 using TerraScale.Reviewer.Features.Configuration;
 using TerraScale.Reviewer.Features.Context;
-using TerraScale.Reviewer.Features.Forgejo;
+using TerraScale.Reviewer.Features.GitHub;
 using TerraScale.Reviewer.Features.Review;
 using TerraScale.Reviewer.Features.Webhooks;
+using System.Security.Cryptography;
 
 var options = ReviewerOptions.Load(args);
+try
+{
+    using var key = RSA.Create();
+    key.ImportFromPem(File.ReadAllText(options.GitHubPrivateKeyPath));
+    if (key.KeySize < 2048) throw new CryptographicException();
+    _ = key.ExportParameters(true);
+}
+catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or CryptographicException)
+{
+    throw new InvalidOperationException("GitHub App private key must be a readable RSA private PEM of at least 2048 bits");
+}
+if (args.Contains("--validate-configuration", StringComparer.Ordinal))
+{
+    Console.WriteLine("ts-reviewer configuration valid; no services or model calls started");
+    return;
+}
 var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.UseUrls(options.ListenUrl);
-// No per-request framework traces: health probes and Forgejo API calls would
+// No per-request framework traces: health probes and GitHub API calls would
 // otherwise rotate the container log within minutes and bury review outcomes.
-builder.Logging.AddTerraScaleLogging("ts-reviewer");
+builder.Logging.ClearProviders();
+builder.Logging.AddSimpleConsole(console =>
+{
+    console.SingleLine = true;
+    console.TimestampFormat = "yyyy-MM-dd HH:mm:ss ";
+});
+builder.Logging.AddFilter("Microsoft", LogLevel.Warning);
 builder.Services.AddSingleton(options);
-builder.Services.AddHttpClient<ForgejoClient>();
-builder.Services.AddSingleton<ReviewEngine>();
+builder.Services.AddHttpClient<GitHubClient>()
+    .RemoveAllLoggers() // Archive redirects can contain temporary credentials in their query.
+    .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler { AllowAutoRedirect = false });
+builder.Services.AddHttpClient("anthropic-billing")
+    .RemoveAllLoggers()
+    .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler { AllowAutoRedirect = false });
+builder.Services.AddSingleton(serviceProvider => new WorkspaceBudget(options,
+    serviceProvider.GetRequiredService<IHttpClientFactory>().CreateClient("anthropic-billing"),
+    serviceProvider.GetRequiredService<ContextStore>(), TimeProvider.System, serviceProvider.GetRequiredService<ILogger<WorkspaceBudget>>()));
+builder.Services.AddSingleton(serviceProvider => new ReviewEngine(options,
+    serviceProvider.GetRequiredService<ILogger<ReviewEngine>>(), serviceProvider.GetRequiredService<GitHubClient>(),
+    serviceProvider.GetRequiredService<WorkspaceBudget>()));
 builder.Services.AddSingleton<PullRequestReviewer>();
 builder.Services.AddSingleton<ReviewQueue>();
 builder.Services.AddHostedService(serviceProvider => serviceProvider.GetRequiredService<ReviewQueue>());
@@ -21,7 +53,7 @@ builder.Services.AddHostedService<ReviewRecovery>();
 builder.Services.AddSingleton<ContextEmbedder>();
 builder.Services.AddSingleton<ContextStore>();
 builder.Services.AddSingleton<ContextIndexer>(serviceProvider => new ContextIndexer(
-    serviceProvider.GetRequiredService<ForgejoClient>(),
+    serviceProvider.GetRequiredService<GitHubClient>(),
     serviceProvider.GetRequiredService<ContextStore>(),
     serviceProvider.GetRequiredService<ContextEmbedder>(),
     serviceProvider.GetRequiredService<ReviewerOptions>(),
@@ -38,6 +70,6 @@ app.MapGet("/context/healthz", async (ContextStore store, CancellationToken canc
 app.MapGet("/admin/context/dead-letter", ContextEndpoints.DeadLetters);
 app.MapPost("/admin/context/dead-letter/replay", ContextEndpoints.ReplayDeadLetterAsync);
 app.Lifetime.ApplicationStarted.Register(() =>
-    app.Logger.LogInformation("ts-reviewer listening on {Address}; primary {PrimaryModel}; fallback {FallbackModel}; max_concurrent {MaxConcurrent}; file_groups 1; max_attempts {MaxAttempts}",
-        options.ListenUrl, ReviewProvider.PrimaryModel, ReviewProvider.FallbackModel, ReviewQueue.WorkerCount, ReviewProvider.MaxAttempts));
+    app.Logger.LogInformation("ts-reviewer listening on {Address}; initial_model {Model}; workspace tiers $100 Sonnet/$150 Haiku/$200 stop; max_concurrent {MaxConcurrent}; file_groups 1; max_attempts {MaxAttempts}",
+        options.ListenUrl, ReviewProvider.PrimaryModel, ReviewQueue.WorkerCount, ReviewProvider.MaxAttempts));
 await app.RunAsync();

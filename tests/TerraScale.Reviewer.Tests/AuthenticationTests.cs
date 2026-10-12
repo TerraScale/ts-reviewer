@@ -10,8 +10,8 @@ using TUnit.Core;
 
 public sealed class AuthenticationTests
 {
-    private static ReviewerOptions Options => new("http://+:8080", "https://forgejo.test", "forgejo",
-        "https://proxy.test", "proxy", "TerraScale", "bot",
+    private static ReviewerOptions Options => new("http://+:8080", "https://github.test", "123",
+        "https://anthropic.test", "anthropic-test-key", "TerraScale", "bot",
         "webhook-test-secret", "context-test-token", "unused", 100);
 
     [Test]
@@ -19,17 +19,33 @@ public sealed class AuthenticationTests
     [Arguments("webhook-secret", "   ")]
     [Arguments("context-api-token", "")]
     [Arguments("context-api-token", "   ")]
+    [Arguments("anthropic-admin-api-key", "")]
+    [Arguments("anthropic-workspace-id", "")]
     public async Task ConfigurationRejectsMissingInboundCredentials(string key, string value)
     {
         string? error = null;
         try
         {
-            ReviewerOptions.Load(["--forgejo-token=forgejo", "--proxy-token=proxy",
+            ReviewerOptions.Load(["--github-app-id=123", "--github-installation-id=456", "--github-private-key-path=unused",
+                "--anthropic-api-key=anthropic-test-key", "--anthropic-admin-api-key=billing-test-key", "--anthropic-workspace-id=wrkspc_test", "--bot-login=bot", "--operator-token=operator-test-token",
                 "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token", $"--{key}={value}"]);
         }
         catch (InvalidOperationException exception) { error = exception.Message; }
         var environmentName = "TS_REVIEWER_" + key.Replace('-', '_').ToUpperInvariant();
         await Assert.That(error).IsEqualTo(environmentName + " is required");
+    }
+
+    [Test]
+    [Arguments("default")]
+    [Arguments("wrkspc_")]
+    [Arguments("incorrect")]
+    [Arguments("wrkspc_bad/id")]
+    public async Task ConfigurationRequiresRealWorkspaceIdentityIncludingDefault(string workspace)
+    {
+        await Assert.That(() => ReviewerOptions.Load(["--github-app-id=123", "--github-installation-id=456", "--github-private-key-path=unused",
+            "--anthropic-api-key=anthropic-test-key", "--anthropic-admin-api-key=billing-test-key", "--anthropic-workspace-id=" + workspace,
+            "--bot-login=bot", "--operator-token=operator-test-token", "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token"]))
+            .Throws<InvalidOperationException>();
     }
 
     [Test]
@@ -75,8 +91,8 @@ public sealed class AuthenticationTests
         context.Request.Method = "POST";
         var body = "invalid JSON"u8.ToArray();
         context.Request.Body = new MemoryStream(body);
-        context.Request.Headers["X-Forgejo-Signature"] = signature == "empty-key-signature"
-            ? Convert.ToHexString(HMACSHA256.HashData(Encoding.UTF8.GetBytes(secret), body))
+        context.Request.Headers["X-Hub-Signature-256"] = signature == "empty-key-signature"
+            ? "sha256=" + Convert.ToHexString(HMACSHA256.HashData(Encoding.UTF8.GetBytes(secret), body))
             : signature;
         var result = await handler.HandleAsync(context.Request, CancellationToken.None);
         await Assert.That(((IStatusCodeHttpResult)result).StatusCode).IsEqualTo(StatusCodes.Status401Unauthorized);

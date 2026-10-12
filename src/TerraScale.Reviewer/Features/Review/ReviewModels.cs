@@ -1,5 +1,5 @@
 using System.Text.Json.Serialization;
-using TerraScale.Reviewer.Features.Forgejo;
+using TerraScale.Reviewer.Features.GitHub;
 
 namespace TerraScale.Reviewer.Features.Review;
 

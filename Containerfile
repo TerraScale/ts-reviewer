@@ -1,6 +1,6 @@
 # Debian trixie rather than distroless: the OpenCodeReview engine needs a
 # shell-less static binary plus git (>= 2.41, trixie ships 2.47) on PATH.
-# The app itself is a self-contained single-file publish, so no dotnet base.
+# The .NET SDK adds the tested self-contained app with PublishContainer.
 # Base is digest-pinned like the distroless base before it — bump the digest
 # with each roll (security updates included in trixie-slim re-publishes).
 FROM docker.io/library/debian:trixie-slim@sha256:7792b1f7702a86946cd518db72b6a407302c3e9bc1635634368b878189e8221c
@@ -17,13 +17,9 @@ RUN apt-get update \
  && tar -xzf /tmp/ocr.tgz -C /tmp \
  && install -m 0755 /tmp/package/bin/opencodereview /usr/local/bin/ocr \
  && ocr version \
+ && ln -s /app/TerraScale.Reviewer /ts-reviewer \
  && rm -rf /var/lib/apt/lists/* /tmp/package /tmp/ocr.tgz
 
-COPY artifacts/ci/container-publish/TerraScale.Reviewer /ts-reviewer
-COPY artifacts/ci/container-publish/TerraScale.Reviewer.staticwebassets.endpoints.json /TerraScale.Reviewer.staticwebassets.endpoints.json
-COPY --chmod=644 artifacts/ci/container-publish/LocalEmbeddingsModel/default/model.onnx /LocalEmbeddingsModel/default/model.onnx
-COPY --chmod=644 artifacts/ci/container-publish/LocalEmbeddingsModel/default/vocab.txt /LocalEmbeddingsModel/default/vocab.txt
 WORKDIR /tmp
 ENV DOTNET_BUNDLE_EXTRACT_BASE_DIR=/tmp HOME=/tmp
 USER 1654
-ENTRYPOINT ["/ts-reviewer"]

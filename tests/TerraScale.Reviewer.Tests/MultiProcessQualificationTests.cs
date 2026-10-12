@@ -20,14 +20,14 @@ public sealed partial class MultiProcessQualificationTests
     private const long LeaseMs = 5_000;
 
     private static ReviewerOptions Options(string database) =>
-        new("http://+:8080", "https://forgejo.test", "forgejo", "https://proxy.test/v1", "proxy", "TerraScale", "bot", "webhook-test-secret", "context-test-token", database, 100, 5, null, "operator-test-token");
+        new("http://+:8080", "https://github.test", "github", "https://proxy.test/v1", "proxy", "TerraScale", "bot", "webhook-test-secret", "context-test-token", database, 100, 5, null, "operator-test-token");
 
     /// <summary>
     /// Two real child processes share one LiteDB file. The crash child claims a
     /// durable index-job lease and is SIGKILLed while holding it; the production
     /// reviewer service (actual TerraScale.Reviewer binary) recovers the job:
     /// it waits out the expired lease, reclaims with a new fencing token, and
-    /// completes indexing against a live Forgejo HTTP endpoint. Raw process
+    /// completes indexing against a live GitHub HTTP endpoint. Raw process
     /// output and the final queue state are captured as retained evidence and a
     /// qualification receipt is emitted and validated in-test.
     /// </summary>
@@ -44,7 +44,7 @@ public sealed partial class MultiProcessQualificationTests
             using (var setup = new ContextStore(Options(database)))
                 setup.EnqueueIndexJob("TerraScale", "widgets", Commit);
 
-            await using var forgejo = new FakeForgejoServer();
+            await using var github = new FakeGitHubServer();
             var killedLog = Path.Combine(evidence, "process-a.log");
             var workerLog = Path.Combine(evidence, "process-b.log");
             var queueStatePath = Path.Combine(evidence, "queue-state.json");
@@ -62,21 +62,8 @@ public sealed partial class MultiProcessQualificationTests
             await Assert.That(claimed).StartsWith("CLAIMED ");
             var killedToken = claimed!["CLAIMED ".Length..];
 
-            // Process B: the genuine production reviewer service against the same file.
-            var serviceAssembly = Path.Combine(AppContext.BaseDirectory, "TerraScale.Reviewer.dll");
-            await Assert.That(File.Exists(serviceAssembly)).IsTrue();
-            using var worker = StartDotnetChild(serviceAssembly,
-            [
-                "--listen=http://127.0.0.1:0",
-                $"--forgejo-url={forgejo.Url}",
-                "--forgejo-token=qualification",
-                "--proxy-url=http://127.0.0.1:9/v1",
-                "--proxy-token=qualification",
-                "--webhook-secret=qualification",
-                "--context-api-token=qualification",
-                "--operator-token=qualification",
-                $"--context-database={database}",
-            ]);
+            // Process B hosts the real ContextIndexer in the test binary with a mock HTTP transport.
+            using var worker = StartDotnetChild(crashAssembly, ["index-worker", database, github.Url]);
             var workerStdout = worker.StandardOutput.ReadToEndAsync();
             var workerStderr = worker.StandardError.ReadToEndAsync();
 
@@ -101,7 +88,7 @@ public sealed partial class MultiProcessQualificationTests
                 {
                     if (worker.HasExited)
                         throw new InvalidOperationException(
-                            $"production reviewer worker exited early with code {worker.ExitCode}\n"
+                            $"context indexing fixture worker exited early with code {worker.ExitCode}\n"
                             + $"stdout:\n{await workerStdout}\nstderr:\n{await workerStderr}");
                     var job = TryReadJob(jobs, jobKey);
                     if (job is not null)
@@ -164,7 +151,7 @@ public sealed partial class MultiProcessQualificationTests
             await File.WriteAllTextAsync(workerLog,
                 $"pid={worker.Id} exit=sigkill\n--- stdout ---\n{workerOutput}\n--- stderr ---\n{workerError}\n");
             await Assert.That(workerOutput).Contains($"\"Repository\":\"{Repository}\",\"Commit\":\"{Commit}\"");
-            await Assert.That(forgejo.FileRequests).IsEqualTo(1);
+            await Assert.That(github.FileRequests).IsEqualTo(1);
 
             var queueState = new
             {
@@ -175,7 +162,7 @@ public sealed partial class MultiProcessQualificationTests
                 job_status = (object?)null,
                 commit_indexed = verify.IsIndexed(Repository, Commit),
                 top_hit_path = hits[0].Path,
-                forgejo_file_requests = forgejo.FileRequests,
+                github_file_requests = github.FileRequests,
                 lease = new
                 {
                     ttl_ms = LeaseMs,
@@ -226,7 +213,7 @@ public sealed partial class MultiProcessQualificationTests
                         ["top_hit_score"] = Math.Round(hits[0].Score, 4),
                         ["pending_jobs"] = 0,
                         ["dead_letters"] = 0,
-                        ["forgejo_file_requests"] = forgejo.FileRequests,
+                        ["github_file_requests"] = github.FileRequests,
                     },
                     new Dictionary<string, object?> { ["note"] = "rehearsal receipt: human control-owner approval pending" },
                 },
@@ -406,9 +393,9 @@ public sealed partial class MultiProcessQualificationTests
     [GeneratedRegex("^[0-9a-f]{40}$")]
     private static partial Regex RevisionPattern();
 
-    /// <summary>A minimal live Forgejo API over real HTTP so the separate worker
-    /// process exercises the production ForgejoClient, not an in-process fake.</summary>
-    private sealed class FakeForgejoServer : IAsyncDisposable
+    /// <summary>A minimal live GitHub API over real HTTP so the separate worker
+    /// process exercises GitHubClient over a mocked HTTP endpoint.</summary>
+    private sealed class FakeGitHubServer : IAsyncDisposable
     {
         private readonly HttpListener _listener = new();
         private readonly CancellationTokenSource _stopping = new();
@@ -419,7 +406,7 @@ public sealed partial class MultiProcessQualificationTests
         public int FileRequests => _fileRequests;
         public string Url => _listener.Prefixes.Single();
 
-        public FakeForgejoServer()
+        public FakeGitHubServer()
         {
             using var probe = new TcpListener(IPAddress.Loopback, 0);
             probe.Start();
@@ -441,23 +428,17 @@ public sealed partial class MultiProcessQualificationTests
                 var path = context.Request.Url!.AbsolutePath;
                 try
                 {
-                    if (path.Contains("/git/trees/", StringComparison.Ordinal))
-                    {
-                        await WriteJsonAsync(context.Response, new
-                        {
-                            tree = new object[] { new { path = "src/Widget.cs", type = "blob", size = 58, sha = "file-sha" } },
-                        });
-                    }
-                    else if (path.Contains("/contents/", StringComparison.Ordinal))
+                    if (path.Contains("/tarball/", StringComparison.Ordinal))
                     {
                         Interlocked.Increment(ref _fileRequests);
-                        // Hold the first file response so the reclaim lease is observably
-                        // held while the test reads the shared queue state.
+                        // Hold the archive response while the test observes the reclaimed lease.
                         if (Interlocked.Decrement(ref _stallsLeft) >= 0)
                             await Task.Delay(TimeSpan.FromMilliseconds(1_500), cancellationToken);
-                        var content = Convert.ToBase64String(
-                            Encoding.UTF8.GetBytes("public class Widget { public Widget CreateWidget() => new(); }"));
-                        await WriteJsonAsync(context.Response, new { content, encoding = "base64", type = "file" });
+                        var archive = ArchiveFixtures.Widget;
+                        context.Response.StatusCode = (int)HttpStatusCode.OK;
+                        context.Response.ContentType = "application/gzip";
+                        context.Response.ContentLength64 = archive.Length;
+                        await context.Response.OutputStream.WriteAsync(archive, cancellationToken);
                     }
                     else context.Response.StatusCode = (int)HttpStatusCode.NotFound;
                 }
@@ -465,15 +446,6 @@ public sealed partial class MultiProcessQualificationTests
                 catch (Exception) { context.Response.StatusCode = (int)HttpStatusCode.InternalServerError; }
                 finally { context.Response.Close(); }
             }
-        }
-
-        private static async Task WriteJsonAsync(HttpListenerResponse response, object value)
-        {
-            response.StatusCode = (int)HttpStatusCode.OK;
-            response.ContentType = "application/json";
-            var bytes = Json.SerializeToUtf8Bytes(value);
-            response.ContentLength64 = bytes.Length;
-            await response.OutputStream.WriteAsync(bytes);
         }
 
         public async ValueTask DisposeAsync()

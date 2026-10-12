@@ -5,7 +5,7 @@ namespace TerraScale.Reviewer.Features.Review;
 
 /// <summary>A request to review the current head of one pull request.</summary>
 /// <param name="HeadSha">Head the request was raised for, when known. An outdated head is skipped before reviewing; the SHA also drives deduplication.</param>
-public sealed record ReviewRequest(string Owner, string Name, int Number, string? HeadSha)
+public sealed record ReviewRequest(string Owner, string Name, int Number, string? HeadSha, bool Rerun = false, string? BaseSha = null)
 {
     internal Task QueuedStatus { get; init; } = Task.CompletedTask;
     public string Key => $"{Owner}/{Name}#{Number}".ToLowerInvariant();
@@ -39,7 +39,7 @@ public enum ReviewAdmission
 /// </remarks>
 public sealed class ReviewQueue : BackgroundService
 {
-    public const int WorkerCount = 2;
+    public const int WorkerCount = 16;
     public const string NewerHead = "a newer push replaced this head";
     public const string Closed = "the pull request was closed";
 
@@ -51,14 +51,18 @@ public sealed class ReviewQueue : BackgroundService
     private readonly Dictionary<string, PullRequestSlot> _slots = new(StringComparer.Ordinal);
     private readonly Dictionary<string, Task> _publications = new(StringComparer.Ordinal);
     private readonly Channel<string> _ready = Channel.CreateUnbounded<string>(new UnboundedChannelOptions { AllowSynchronousContinuations = false });
+    private long _generation;
 
     public ReviewQueue(PullRequestReviewer reviewer, ILogger<ReviewQueue> logger)
-        : this(reviewer.RunAsync, reviewer.SkipAsync, WorkerCount, logger) { }
+    {
+        _runner = (request, ct) => reviewer.RunAsync(request, ct, (head, basis) => ResolveHead(request, head, basis));
+        (_skip, _workers, _logger) = (reviewer.SkipAsync, WorkerCount, logger);
+    }
 
     internal ReviewQueue(Func<ReviewRequest, CancellationToken, Task> runner, Func<ReviewRequest, string, Task> skip, int workers, ILogger<ReviewQueue> logger)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(workers, 1);
-        ArgumentOutOfRangeException.ThrowIfGreaterThan(workers, 2);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(workers, WorkerCount);
         (_runner, _skip, _workers, _logger) = (runner, skip, workers, logger);
     }
 
@@ -70,6 +74,7 @@ public sealed class ReviewQueue : BackgroundService
         lock (_gate)
         {
             if (!_slots.TryGetValue(request.Key, out var slot)) _slots[request.Key] = slot = new PullRequestSlot();
+            slot.Generation = ++_generation;
             if (slot is { Running: { } running, StopReason: null })
             {
                 if (SameHead(running, request) && slot.Waiting is null)
@@ -127,14 +132,14 @@ public sealed class ReviewQueue : BackgroundService
     }
 
     /// <summary>Resolves an admitted command's head without losing its FIFO position.</summary>
-    public ReviewRequest? ResolveHead(ReviewRequest request, string sha)
+    public ReviewRequest? ResolveHead(ReviewRequest request, string sha, string? baseSha = null)
     {
         CancellationTokenSource? stale = null;
         ReviewRequest? resolved = null;
         lock (_gate)
         {
             if (!_slots.TryGetValue(request.Key, out var slot)) return null;
-            var prepared = request with { HeadSha = sha };
+            var prepared = request with { HeadSha = sha, BaseSha = baseSha ?? request.BaseSha };
             if (slot.Waiting?.QueuedStatus == request.QueuedStatus)
             {
                 if (slot is { Running: { } running, StopReason: null }
@@ -158,7 +163,18 @@ public sealed class ReviewQueue : BackgroundService
     }
 
     /// <summary>Drops waiting work and cancels any running review when the pull request closes.</summary>
-    public bool Cancel(string owner, string name, int number)
+    public bool Cancel(string owner, string name, int number) => Cancel(owner, name, number, null);
+
+    public async Task CancelWhenClosedAsync(string owner, string name, int number, Func<Task<bool>> isClosed)
+    {
+        var key = new ReviewRequest(owner, name, number, null).Key;
+        long generation;
+        lock (_gate) generation = _slots.GetValueOrDefault(key)?.Generation ?? 0;
+        try { if (await isClosed()) Cancel(owner, name, number, generation); }
+        catch (Exception ex) { _logger.LogWarning(ex, "could not verify closure for {PullRequest}", key); }
+    }
+
+    private bool Cancel(string owner, string name, int number, long? expectedGeneration)
     {
         var key = new ReviewRequest(owner, name, number, null).Key;
         ReviewRequest? waiting;
@@ -166,6 +182,7 @@ public sealed class ReviewQueue : BackgroundService
         lock (_gate)
         {
             if (!_slots.TryGetValue(key, out var slot)) return false;
+            if (expectedGeneration is not null && slot.Generation != expectedGeneration) return false;
             // A slot without a running review is still in the ready channel;
             // the worker that dequeues it finds nothing waiting and skips it.
             waiting = slot.Waiting;
@@ -297,7 +314,8 @@ public sealed class ReviewQueue : BackgroundService
     }
 
     private static bool SameHead(ReviewRequest left, ReviewRequest right) =>
-        string.Equals(left.HeadSha, right.HeadSha, StringComparison.OrdinalIgnoreCase);
+        string.Equals(left.HeadSha, right.HeadSha, StringComparison.OrdinalIgnoreCase)
+        && (left.BaseSha is null || right.BaseSha is null || string.Equals(left.BaseSha, right.BaseSha, StringComparison.OrdinalIgnoreCase));
 
     /// <summary>Whether <paramref name="request"/> is for a different head than <paramref name="current"/>; unknown heads never count.</summary>
     private static bool NewHead(ReviewRequest current, ReviewRequest request) =>
@@ -305,6 +323,7 @@ public sealed class ReviewQueue : BackgroundService
 
     private sealed class PullRequestSlot
     {
+        public long Generation { get; set; }
         public ReviewRequest? Waiting { get; set; }
         public long WaitingSince { get; set; }
         public ReviewRequest? Running { get; set; }
