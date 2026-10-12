@@ -35,11 +35,7 @@ public static partial class AlphaDeployment
             var archive = Path.Combine(directory, "image.oci.tar");
             using var image = JsonDocument.Parse(await Command("skopeo", "inspect", "oci-archive:" + archive));
             ValidateImage(image.RootElement, commit, digest);
-            await Command("sh", "-c",
-                "set -a; . /var/srv/appdata/ts-reviewer/ts-reviewer.env; set +a; " +
-                "test \"$TS_REVIEWER_GITHUB_PRIVATE_KEY_PATH\" = /secrets/github-app.pem || exit 1; " +
-                "export TS_REVIEWER_GITHUB_PRIVATE_KEY_PATH=/var/srv/appdata/ts-reviewer/github-app.pem; " +
-                "exec \"$1\" --validate-configuration", "reviewer-preflight", Path.Combine(directory, "reviewer", "TerraScale.Reviewer"));
+            await ValidateConfigurationAsync(directory, Command);
 
             var state = File.Exists(StatePath)
                 ? JsonSerializer.Deserialize<DeploymentState>(await File.ReadAllTextAsync(StatePath))
@@ -110,6 +106,13 @@ public static partial class AlphaDeployment
         if (!policy.TryGetProperty("apps", out var apps) || apps.ValueKind != JsonValueKind.Object
             || apps.TryGetProperty("ts-reviewer", out _))
             throw new InvalidOperationException("HomeLab must transfer ts-reviewer image ownership from its Forgejo poller to this GitHub pipeline first.");
+        if (!policy.TryGetProperty("external_image_rolls", out var external) || !external.TryGetProperty("ts-reviewer", out var owner)
+            || owner.GetProperty("repo").GetString() != "TerraScale/ts-reviewer"
+            || owner.GetProperty("branch").GetString() != "main"
+            || owner.GetProperty("workflow").GetString() != ".github/workflows/ci.yml"
+            || owner.GetProperty("harbor").GetString() != "homelab/ts-reviewer"
+            || owner.GetProperty("instance").GetString() != "ts-reviewer")
+            throw new InvalidOperationException("HomeLab must explicitly declare the main-only ts-reviewer GitHub image-roll owner before deployment.");
     }
 
     public static void ValidateInstance(JsonElement instance)
@@ -145,6 +148,14 @@ public static partial class AlphaDeployment
         if (!metadata.Split('\n', StringSplitOptions.RemoveEmptyEntries).SequenceEqual(new[] { "600:1654:1654", "600:1654:1654" }))
             throw new InvalidOperationException("Both runtime secret files must have mode 0600 and uid/gid 1654 before deployment.");
     }
+
+    public static Task<string> ValidateConfigurationAsync(string directory, Func<string, string[], Task<string>> command) =>
+        // Reviewed application artifacts must never execute as host root during preflight.
+        command("setpriv", ["--reuid=1654", "--regid=1654", "--clear-groups", "--no-new-privs", "sh", "-c",
+            "set -a; . /var/srv/appdata/ts-reviewer/ts-reviewer.env; set +a; " +
+            "test \"$TS_REVIEWER_GITHUB_PRIVATE_KEY_PATH\" = /secrets/github-app.pem || exit 1; " +
+            "export TS_REVIEWER_GITHUB_PRIVATE_KEY_PATH=/var/srv/appdata/ts-reviewer/github-app.pem; " +
+            "exec \"$1\" --validate-configuration", "reviewer-preflight", Path.Combine(directory, "reviewer", "TerraScale.Reviewer")]);
 
     public static Task<string> RestoreSecretsAsync(string source, Func<string, string[], Task<string>> command) =>
         command("install", ["-m", "0600", "-o", "1654", "-g", "1654", "--", source, SecretsPath]);

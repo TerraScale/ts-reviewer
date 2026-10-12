@@ -24,6 +24,8 @@ public sealed class DeploymentTests
     [Arguments("{\"enabled\":false,\"apps\":{}}")]
     [Arguments("{\"apps\":{\"ts-reviewer\":{}}}")]
     [Arguments("{}")]
+    [Arguments("{\"apps\":{}}")]
+    [Arguments("{\"apps\":{},\"external_image_rolls\":{\"ts-reviewer\":{\"repo\":\"untrusted/repo\"}}}")]
     public async Task A_paused_or_Forgejo_owned_deployer_prevents_handoff(string value)
     {
         using var policy = JsonDocument.Parse(value);
@@ -33,7 +35,11 @@ public sealed class DeploymentTests
     [Test]
     public void Handoff_requires_no_new_deployment_switch()
     {
-        using var policy = JsonDocument.Parse("{\"apps\":{\"other-app\":{}}}");
+        using var policy = JsonDocument.Parse("""
+            {"apps":{"other-app":{}},"external_image_rolls":{"ts-reviewer":{
+              "repo":"TerraScale/ts-reviewer","branch":"main","workflow":".github/workflows/ci.yml",
+              "harbor":"homelab/ts-reviewer","instance":"ts-reviewer"}}}
+            """);
         AlphaDeployment.ValidateHandoff(policy.RootElement);
     }
 
@@ -91,6 +97,23 @@ public sealed class DeploymentTests
             metadata = unsafeMetadata;
             await Assert.That(() => AlphaDeployment.ValidateSecretFilesAsync(Stat)).Throws<InvalidOperationException>();
         }
+    }
+
+    [Test]
+    public async Task Application_preflight_drops_host_root_and_cannot_gain_privileges()
+    {
+        var calls = 0;
+        await AlphaDeployment.ValidateConfigurationAsync("/tmp/checked-artifact", (program, arguments) =>
+        {
+            if (program != "setpriv" || !arguments.Take(6).SequenceEqual(new[]
+                { "--reuid=1654", "--regid=1654", "--clear-groups", "--no-new-privs", "sh", "-c" })
+                || arguments[^1] != "/tmp/checked-artifact/reviewer/TerraScale.Reviewer"
+                || !arguments[^3].Contains("--validate-configuration", StringComparison.Ordinal))
+                throw new InvalidOperationException("Application preflight must execute only as the runtime user, with configuration passed by path.");
+            calls++;
+            return Task.FromResult("");
+        });
+        await Assert.That(calls).IsEqualTo(1);
     }
 
     [Test]

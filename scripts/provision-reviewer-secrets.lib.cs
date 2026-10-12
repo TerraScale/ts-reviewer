@@ -25,12 +25,12 @@ public static class ReviewerSecrets
 
     public static async Task<int> RunAsync(string[] args,
         Func<string[], string?, Task<string>>? execute = null, TextWriter? output = null,
-        Func<string, string, Task>? updateWebhook = null)
+        Func<string, string, Task>? updateWebhook = null, Func<string, Task<string>>? discoverWorkspace = null)
     {
         output ??= Console.Out;
         try
         {
-            if (args.Length != 1 || args[0] is not ("plan" or "provision" or "webhook"))
+            if (args.Length != 1 || args[0] is not ("plan" or "workspace" or "provision" or "webhook"))
                 throw new InvalidOperationException();
             execute ??= Execute;
             using var snapshot = JsonDocument.Parse(await execute(
@@ -40,10 +40,35 @@ public static class ReviewerSecrets
             var version = data.GetProperty("metadata").GetProperty("version").GetInt32();
             if (version <= 0) throw new InvalidOperationException();
             var values = data.GetProperty("data");
+            if (args[0] == "workspace")
+            {
+                if (!Present(values, "TS_REVIEWER_ANTHROPIC_API_KEY")) throw new InvalidOperationException();
+                var workspace = await (discoverWorkspace ?? (key => DiscoverWorkspace(key)))(values.GetProperty("TS_REVIEWER_ANTHROPIC_API_KEY").GetString()!);
+                if (!workspace.StartsWith("wrkspc_", StringComparison.Ordinal) || workspace.Length <= 7
+                    || !workspace.All(c => char.IsAsciiLetterOrDigit(c) || c == '_')) throw new InvalidOperationException();
+                if (Present(values, "TS_REVIEWER_ANTHROPIC_WORKSPACE_ID"))
+                {
+                    if (values.GetProperty("TS_REVIEWER_ANTHROPIC_WORKSPACE_ID").GetString() != workspace) throw new InvalidOperationException();
+                    await output.WriteLineAsync("Anthropic workspace identity already matches the stored inference key; no fields changed.");
+                    return 0;
+                }
+                await execute(["kv", "patch", "-address=https://bao.mariogk.com", "-disable-redirects", "-format=json",
+                    "-mount=secret/homelab", "-method=patch", "-cas=" + version, "ci/ts-reviewer", "-"],
+                    JsonSerializer.Serialize(new Dictionary<string, string> { ["TS_REVIEWER_ANTHROPIC_WORKSPACE_ID"] = workspace }));
+                await output.WriteLineAsync("Anthropic workspace identity discovered through the free token-count endpoint and saved directly to OpenBao; no values printed or vendor credentials changed.");
+                return 0;
+            }
             // Vendor credentials stay in this process; only new fields are sent in the CAS patch.
+            var missing = new List<string>();
             foreach (var key in new[] { "TS_REVIEWER_ANTHROPIC_API_KEY", "TS_REVIEWER_ANTHROPIC_ADMIN_API_KEY",
                 "TS_REVIEWER_ANTHROPIC_WORKSPACE_ID", "TS_REVIEWER_GITHUB_PRIVATE_KEY_PEM" })
-                if (!Present(values, key)) throw new InvalidOperationException();
+                if (!Present(values, key)) missing.Add(key);
+            if (missing.Count != 0)
+            {
+                await output.WriteLineAsync("OpenBao /ci/ts-reviewer is missing these secure field names; no writes performed:");
+                foreach (var key in missing) await output.WriteLineAsync(key);
+                return 1;
+            }
             var additions = Prepare(values);
             if (args[0] == "webhook")
             {
@@ -78,7 +103,7 @@ public static class ReviewerSecrets
         }
         catch
         {
-            await output.WriteLineAsync("Reviewer secret setup failed without exposing values. Check authenticated OpenBao access, vendor fields, public identities, and CAS version; no automatic retry. Usage: provision-reviewer-secrets.cs plan|provision|webhook.");
+            await output.WriteLineAsync("Reviewer secret setup failed without exposing values. Check authenticated OpenBao access, vendor fields, public identities, and CAS version; no automatic retry. Usage: provision-reviewer-secrets.cs plan|workspace|provision|webhook.");
             return 1;
         }
     }
@@ -105,6 +130,20 @@ public static class ReviewerSecrets
     }
 
     private static string Base64Url(byte[] bytes) => Convert.ToBase64String(bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+
+    public static async Task<string> DiscoverWorkspace(string apiKey, HttpMessageHandler? handler = null)
+    {
+        using var client = new HttpClient(handler ?? new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(30) };
+        using var request = new HttpRequestMessage(HttpMethod.Post, "https://api.anthropic.com/v1/messages/count_tokens");
+        request.Headers.Add("x-api-key", apiKey);
+        request.Headers.Add("anthropic-version", "2023-06-01");
+        request.Content = JsonContent.Create(new { model = "claude-opus-5-5", messages = new[] { new { role = "user", content = "Workspace identity preflight" } } });
+        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+        if (!response.IsSuccessStatusCode || !response.Headers.TryGetValues("anthropic-workspace-id", out var ids)) throw new InvalidOperationException();
+        var workspace = ids.ToArray();
+        if (workspace.Length != 1) throw new InvalidOperationException();
+        return workspace[0];
+    }
 
     public static async Task UpdateWebhook(string jwt, string secret, HttpMessageHandler? handler = null)
     {

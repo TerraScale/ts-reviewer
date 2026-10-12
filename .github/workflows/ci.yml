@@ -42,6 +42,7 @@ jobs:
           dotnet run scripts/check-nuget-vulnerabilities.tests.cs
           dotnet run scripts/deploy-alpha.tests.cs
           dotnet run scripts/provision-reviewer-secrets.tests.cs
+          dotnet run scripts/prepare-alpha-ssh.tests.cs
       - name: Audit all dependencies
         run: dotnet run scripts/check-nuget-vulnerabilities.cs src/TerraScale.Reviewer/TerraScale.Reviewer.csproj tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj
       - name: Publish the checked application and Alpha utilities
@@ -49,6 +50,7 @@ jobs:
           dotnet publish src/TerraScale.Reviewer -c Release -r linux-x64 --self-contained true -o artifacts/ci/reviewer -p:SourceRevisionId="$GITHUB_SHA"
           dotnet publish scripts/deploy-alpha.cs -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o artifacts/ci/deploy
           dotnet publish scripts/provision-reviewer-secrets.cs -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o artifacts/ci/setup
+          dotnet publish scripts/prepare-alpha-ssh.cs -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o artifacts/ci/ssh
       - name: Verify pinned OCR tooling without model calls
         run: docker build --file Containerfile --tag ts-reviewer-tooling-check .
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -59,6 +61,7 @@ jobs:
             artifacts/ci/reviewer/
             artifacts/ci/deploy/
             artifacts/ci/setup/
+            artifacts/ci/ssh/
 
   image:
     name: Publish the exact checked image
@@ -148,6 +151,9 @@ jobs:
     needs: [checks, image, deployment-gate]
     runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: alpha
+    permissions:
+      contents: read
+      id-token: write # Short-lived GitHub identity for OpenBao SSH signing and Tailscale federation.
     concurrency:
       group: ts-reviewer-alpha
       cancel-in-progress: false
@@ -160,6 +166,21 @@ jobs:
         with:
           name: alpha-image-${{ github.sha }}
           path: artifacts/ci/alpha
+      - name: Sign an ephemeral deployment key using scoped OpenBao OIDC trust
+        env:
+          ALPHA_HOST_ED25519_PUBLIC_KEY: ${{ vars.ALPHA_HOST_ED25519_PUBLIC_KEY }} # Unavoidable third-party public host identity; verified by an operator, never discovered with ssh-keyscan.
+        run: |
+          chmod 700 artifacts/ci/ssh/prepare-alpha-ssh
+          artifacts/ci/ssh/prepare-alpha-ssh
+      - name: Join Alpha's network using ephemeral workload identity
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4
+        with:
+          oauth-client-id: ${{ vars.TAILSCALE_ALPHA_CLIENT_ID }} # Unavoidable vendor-issued public federated identity; no OAuth secret.
+          audience: https://github.com/TerraScale/ts-reviewer/alpha
+          tags: tag:ts-reviewer-deploy
+          version: 1.94.2
+          ping: alpha.tail057f.ts.net
+          log-mode: quiet
       - name: Deploy only current main through the existing Alpha SSH capability
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -170,11 +191,19 @@ jobs:
             printf 'A newer main commit supersedes this image; Alpha remains unchanged.\n'
             exit 0
           fi
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 alpha true
+          ssh_config="$RUNNER_TEMP/ts-reviewer-alpha-ssh/config"
+          ssh -F "$ssh_config" -o ConnectTimeout=10 alpha true
           stage="/tmp/ts-reviewer-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes alpha "umask 077; mkdir '$stage'"
-          scp -o BatchMode=yes -o StrictHostKeyChecking=yes artifacts/ci/alpha/image.oci.tar alpha:"$stage/image.oci.tar"
-          scp -o BatchMode=yes -o StrictHostKeyChecking=yes -r artifacts/ci/reviewer alpha:"$stage/reviewer"
-          scp -o BatchMode=yes -o StrictHostKeyChecking=yes artifacts/ci/deploy/deploy-alpha alpha:"$stage/deploy-alpha"
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes alpha \
-            "chmod 700 '$stage/deploy-alpha' '$stage/reviewer/TerraScale.Reviewer'; sudo -n '$stage/deploy-alpha' '$GITHUB_SHA' '$IMAGE_DIGEST' '$stage'"
+          ssh -F "$ssh_config" alpha "umask 077; mkdir '$stage'"
+          scp -F "$ssh_config" artifacts/ci/alpha/image.oci.tar alpha:"$stage/image.oci.tar"
+          scp -F "$ssh_config" -r artifacts/ci/reviewer alpha:"$stage/reviewer"
+          ssh -F "$ssh_config" alpha \
+            "chmod 711 '$stage'; chmod -R a+rX '$stage/reviewer'; sudo -n /usr/local/libexec/ts-reviewer-deploy '$GITHUB_SHA' '$IMAGE_DIGEST' '$stage'"
+      - name: Remove the temporary SSH identity
+        if: always()
+        run: |
+          directory="$RUNNER_TEMP/ts-reviewer-alpha-ssh"
+          if [ -d "$directory" ]; then
+            rm -f -- "$directory/identity" "$directory/identity.pub" "$directory/identity-cert.pub" "$directory/config" "$directory/known_hosts"
+            rmdir -- "$directory"
+          fi

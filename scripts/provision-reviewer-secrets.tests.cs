@@ -40,6 +40,105 @@ public sealed class ReviewerSecretSetupTests
     }
 
     [Test]
+    public async Task Missing_billing_setup_reports_only_field_names_without_writes()
+    {
+        using var output = new StringWriter();
+        var calls = 0;
+        var result = await ReviewerSecrets.RunAsync(["plan"], (args, input) =>
+        {
+            calls++;
+            if (args[1] != "get" || input is not null) throw new Exception(Vendor);
+            return Task.FromResult(Snapshot(new() { ["TS_REVIEWER_ANTHROPIC_API_KEY"] = Vendor }));
+        }, output);
+        await Assert.That(result).IsEqualTo(1);
+        await Assert.That(calls).IsEqualTo(1);
+        await Assert.That(output.ToString().Contains("TS_REVIEWER_ANTHROPIC_ADMIN_API_KEY")).IsTrue();
+        await Assert.That(output.ToString().Contains("TS_REVIEWER_ANTHROPIC_WORKSPACE_ID")).IsTrue();
+        await Assert.That(output.ToString().Contains(Vendor)).IsFalse();
+    }
+
+    [Test]
+    public async Task Workspace_discovery_CAS_patches_only_missing_identity_without_printing_values()
+    {
+        var values = new Dictionary<string, string> { ["TS_REVIEWER_ANTHROPIC_API_KEY"] = Vendor };
+        using var output = new StringWriter();
+        var writes = 0;
+        Task<string> Execute(string[] args, string? input)
+        {
+            if (args[1] == "get") return Task.FromResult(Snapshot(values));
+            if (args[1] != "patch" || !args.Contains("-method=patch") || !args.Contains("-cas=7")) throw new Exception(Vendor);
+            using var patch = JsonDocument.Parse(input!);
+            var fields = patch.RootElement.EnumerateObject().ToArray();
+            if (fields.Length != 1 || fields[0].Name != "TS_REVIEWER_ANTHROPIC_WORKSPACE_ID") throw new Exception(Vendor);
+            values[fields[0].Name] = fields[0].Value.GetString()!;
+            writes++;
+            return Task.FromResult("{}");
+        }
+        for (var i = 0; i < 2; i++)
+            await Assert.That(await ReviewerSecrets.RunAsync(["workspace"], Execute, output, discoverWorkspace: key =>
+            {
+                if (key != Vendor) throw new Exception(Vendor);
+                return Task.FromResult("wrkspc_discovered");
+            })).IsEqualTo(0);
+        await Assert.That(writes).IsEqualTo(1);
+        await Assert.That(output.ToString().Contains(Vendor) || output.ToString().Contains("wrkspc_discovered")).IsFalse();
+    }
+
+    [Test]
+    [Arguments("mismatch")]
+    [Arguments("invalid_header")]
+    [Arguments("read_only")]
+    public async Task Workspace_discovery_never_overwrites_conflicts_or_retries_failed_writes(string failure)
+    {
+        var values = new Dictionary<string, string> { ["TS_REVIEWER_ANTHROPIC_API_KEY"] = Vendor };
+        if (failure == "mismatch") values["TS_REVIEWER_ANTHROPIC_WORKSPACE_ID"] = "wrkspc_existing";
+        using var output = new StringWriter();
+        var writes = 0;
+        var result = await ReviewerSecrets.RunAsync(["workspace"], (args, input) =>
+        {
+            if (args[1] == "get") return Task.FromResult(Snapshot(values));
+            writes++;
+            throw new Exception(Vendor);
+        }, output, discoverWorkspace: _ => Task.FromResult(failure == "invalid_header" ? "synthetic-secret.invalid" : "wrkspc_discovered"));
+        await Assert.That(result).IsEqualTo(1);
+        await Assert.That(writes).IsEqualTo(failure == "read_only" ? 1 : 0);
+        await Assert.That(output.ToString().Contains(Vendor) || output.ToString().Contains("wrkspc_") || output.ToString().Contains("synthetic-secret.invalid")).IsFalse();
+    }
+
+    [Test]
+    [Arguments("valid")]
+    [Arguments("missing")]
+    [Arguments("multiple")]
+    [Arguments("redirect")]
+    [Arguments("unauthorized")]
+    public async Task Discovery_uses_only_free_token_counting_and_requires_one_identity_header(string behavior)
+    {
+        var requests = 0;
+        using var handler = new WebhookHandler(async request =>
+        {
+            requests++;
+            await Assert.That(request.RequestUri!.AbsoluteUri).IsEqualTo("https://api.anthropic.com/v1/messages/count_tokens");
+            await Assert.That(request.Method).IsEqualTo(HttpMethod.Post);
+            await Assert.That(request.Headers.GetValues("x-api-key").Single()).IsEqualTo(Vendor);
+            using var body = JsonDocument.Parse(await request.Content!.ReadAsStringAsync());
+            await Assert.That(body.RootElement.GetProperty("model").GetString()).IsEqualTo("claude-opus-5-5");
+            await Assert.That(body.RootElement.TryGetProperty("thinking", out _) || body.RootElement.TryGetProperty("tool_choice", out _)).IsFalse();
+            var response = new HttpResponseMessage(behavior switch
+            {
+                "redirect" => System.Net.HttpStatusCode.Redirect,
+                "unauthorized" => System.Net.HttpStatusCode.Unauthorized,
+                _ => System.Net.HttpStatusCode.OK
+            });
+            if (behavior != "missing") response.Headers.Add("anthropic-workspace-id", behavior == "multiple" ? new[] { "wrkspc_one", "wrkspc_two" } : new[] { "wrkspc_discovered" });
+            response.Headers.Location = new Uri("https://untrusted.example.invalid/");
+            return response;
+        });
+        if (behavior == "valid") await Assert.That(await ReviewerSecrets.DiscoverWorkspace(Vendor, handler)).IsEqualTo("wrkspc_discovered");
+        else await Assert.That(async () => { await ReviewerSecrets.DiscoverWorkspace(Vendor, handler); }).Throws<InvalidOperationException>();
+        await Assert.That(requests).IsEqualTo(1);
+    }
+
+    [Test]
     public async Task First_handoff_replaces_legacy_credentials_and_CAS_reruns_preserve_GitHub_generation()
     {
         var values = VendorValues();
