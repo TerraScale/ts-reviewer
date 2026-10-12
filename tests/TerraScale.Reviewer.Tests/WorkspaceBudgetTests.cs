@@ -46,7 +46,7 @@ public sealed class WorkspaceBudgetTests
     }
 
     [Test]
-    public async Task PaginatedDaysCannotOmitCurrentDayOrChangeCentsToDollars()
+    public async Task PaginatedPublishedDaysIncludeTodayWhenAvailable()
     {
         using var fixture = new Fixture();
         fixture.Clock.Now = new DateTimeOffset(2026, 10, 2, 12, 0, 0, TimeSpan.Zero);
@@ -61,6 +61,21 @@ public sealed class WorkspaceBudgetTests
         };
         await Assert.That(await Select(fixture.Budget)).IsEqualTo(WorkspaceBudget.Sonnet);
         await Assert.That(fixture.ReportCalls).IsEqualTo(2);
+    }
+
+    [Test]
+    [Arguments(1, "0", "claude-opus-5-5")]
+    [Arguments(12, "10000", "claude-sonnet-5-5")]
+    [Arguments(12, "15000", "claude-haiku-5-5")]
+    [Arguments(12, "20000", "blocked")]
+    public async Task PublishedCostsThroughYesterdayAuthorizeTheRecordedTierAndFirstDayReset(int day, string cents, string expected)
+    {
+        using var fixture = new Fixture();
+        fixture.Clock.Now = new DateTimeOffset(2026, 10, day, 12, 0, 0, TimeSpan.Zero);
+        fixture.Cents = cents;
+        fixture.Modify = report => report["data"]!.AsArray().RemoveAt(day - 1);
+        await Assert.That(await Select(fixture.Budget)).IsEqualTo(expected);
+        await Assert.That(fixture.ReportCalls).IsEqualTo(1);
     }
 
     [Test]
@@ -87,6 +102,8 @@ public sealed class WorkspaceBudgetTests
     public async Task PersistedHighWaterPreventsUpgradesAfterRefreshAndRestartButResetsWithUtcMonth()
     {
         using var fixture = new Fixture();
+        fixture.Clock.Now = new DateTimeOffset(2026, 10, 2, 12, 0, 0, TimeSpan.Zero);
+        fixture.Modify = report => report["data"]!.AsArray().RemoveAt(fixture.Clock.Now.Day - 1);
         fixture.Cents = "15000";
         await Assert.That(await Select(fixture.Budget)).IsEqualTo(WorkspaceBudget.Haiku);
         fixture.Cents = "0";
@@ -100,7 +117,7 @@ public sealed class WorkspaceBudgetTests
     }
 
     [Test]
-    public async Task MidnightForcesNewDayCoverageEvenWithinTheRefreshInterval()
+    public async Task MidnightForcesPublishedCostRefreshEvenWithinTheRefreshInterval()
     {
         using var fixture = new Fixture();
         fixture.Clock.Now = new DateTimeOffset(2026, 10, 1, 23, 59, 59, TimeSpan.Zero);
@@ -122,7 +139,7 @@ public sealed class WorkspaceBudgetTests
     }
 
     [Test]
-    [Arguments("missing_today")]
+    [Arguments("missing_completed_day")]
     [Arguments("duplicate_day")]
     [Arguments("partial_day")]
     [Arguments("wrong_currency")]
@@ -136,6 +153,7 @@ public sealed class WorkspaceBudgetTests
     public async Task IncompleteOrMalformedReportFailsClosedWithoutLeakingBodies(string corruption)
     {
         using var fixture = new Fixture();
+        if (corruption == "missing_completed_day") fixture.Clock.Now = new DateTimeOffset(2026, 10, 2, 12, 0, 0, TimeSpan.Zero);
         fixture.Cents = "15000";
         fixture.Modify = report =>
         {
@@ -143,7 +161,7 @@ public sealed class WorkspaceBudgetTests
             var result = bucket["results"]![0]!.AsObject();
             switch (corruption)
             {
-                case "missing_today": report["data"] = new JsonArray(); break;
+                case "missing_completed_day": report["data"]!.AsArray().RemoveAt(0); break;
                 case "duplicate_day": report["data"]!.AsArray().Add(bucket.DeepClone()); break;
                 case "partial_day": bucket["ending_at"] = "2026-10-01T12:00:00Z"; break;
                 case "wrong_currency": result["currency"] = "EUR"; break;

@@ -78,7 +78,7 @@ internal sealed class WorkspaceBudget(ReviewerOptions options, HttpClient http, 
         // The default's real ID is returned by identity APIs, but cost reports use null for it.
         var isDefault = !await ListedNonDefaultAsync(ct);
         var first = new DateTime(today.Year, today.Month, 1, 0, 0, 0, DateTimeKind.Utc);
-        // Include today's bucket; refuse reports that silently omit it, including unsupported future endpoints.
+        // The user accepts unpublished current-day costs; include them as soon as the provider reports them.
         var path = "/v1/organizations/cost_report?starting_at=" + Uri.EscapeDataString(first.ToString("O"))
             + "&ending_at=" + Uri.EscapeDataString(today.AddDays(1).AddSeconds(1).ToString("O"))
             + "&bucket_width=1d&limit=31&group_by%5B%5D=workspace_id";
@@ -109,7 +109,8 @@ internal sealed class WorkspaceBudget(ReviewerOptions options, HttpClient http, 
             page = root.GetProperty("next_page").GetString();
             if (string.IsNullOrWhiteSpace(page) || !pages.Add(page) || pages.Count > 31) throw new BillingException("invalid pagination");
         } while (true);
-        if (days.Count != today.Day) throw new BillingException($"daily coverage {days.Count}/{today.Day}");
+        var completedDays = days.Count - (days.Contains(today) ? 1 : 0);
+        if (completedDays != today.Day - 1) throw new BillingException($"completed daily coverage {completedDays}/{today.Day - 1}");
         return cents / 100m;
     }
 

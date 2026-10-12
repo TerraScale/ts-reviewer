@@ -9,6 +9,8 @@ public static class AlphaSsh
 {
     private const string Bao = "https://bao.mariogk.com/v1/";
     private const string Host = "alpha.tail057f.ts.net";
+    private sealed class IdentityException(string step, System.Net.HttpStatusCode status)
+        : InvalidOperationException($"{step} HTTP {(int)status}");
 
     public static async Task<int> RunAsync()
     {
@@ -46,9 +48,10 @@ public static class AlphaSsh
             Console.WriteLine("Temporary Alpha SSH identity signed through GitHub OIDC; no credential values printed.");
             return 0;
         }
-        catch
+        catch (Exception ex)
         {
-            Console.Error.WriteLine("Alpha CI identity setup failed. Verify main-only OpenBao OIDC/signing trust, pinned host identity, and scoped Alpha account; details suppressed.");
+            var reason = ex is IdentityException ? $" at {ex.Message}" : "";
+            Console.Error.WriteLine($"Alpha CI identity setup failed{reason}. Verify main-only OpenBao OIDC/signing trust, pinned host identity, and scoped Alpha account; details suppressed.");
             return 1;
         }
     }
@@ -60,14 +63,15 @@ public static class AlphaSsh
             || !string.IsNullOrEmpty(uri.UserInfo) || !string.IsNullOrEmpty(uri.Fragment)) throw new InvalidOperationException();
         using var identityRequest = new HttpRequestMessage(HttpMethod.Get, oidcUrl + (uri.Query.Length == 0 ? "?" : "&") + "audience=" + Uri.EscapeDataString("https://bao.mariogk.com"));
         identityRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", oidcToken);
-        using var identity = await JsonAsync(http, identityRequest);
+        using var identity = await JsonAsync(http, identityRequest, "GitHub OIDC request");
         using var loginRequest = new HttpRequestMessage(HttpMethod.Post, Bao + "auth/github-actions/login")
         {
             Content = JsonContent.Create(new { role = "ts-reviewer-alpha", jwt = identity.RootElement.GetProperty("value").GetString() })
         };
-        using var login = await JsonAsync(http, loginRequest);
+        using var login = await JsonAsync(http, loginRequest, "OpenBao authentication");
         var token = login.RootElement.GetProperty("auth").GetProperty("client_token").GetString();
         if (string.IsNullOrWhiteSpace(token)) throw new InvalidOperationException();
+        var signedSuccessfully = false;
         try
         {
             using var signRequest = new HttpRequestMessage(HttpMethod.Post, Bao + "ssh-client-signer/sign/ts-reviewer-alpha")
@@ -75,26 +79,36 @@ public static class AlphaSsh
                 Content = JsonContent.Create(new { public_key = publicKey, cert_type = "user", valid_principals = "ts-reviewer-deploy", ttl = "10m" })
             };
             signRequest.Headers.Add("X-Vault-Token", token);
-            using var signed = await JsonAsync(http, signRequest);
+            using var signed = await JsonAsync(http, signRequest, "OpenBao SSH signing");
             var certificate = signed.RootElement.GetProperty("data").GetProperty("signed_key").GetString();
             if (certificate is null || !certificate.StartsWith("ssh-ed25519-cert-v01@openssh.com ", StringComparison.Ordinal)) throw new InvalidOperationException();
+            signedSuccessfully = true;
             return certificate;
         }
         finally
         {
-            using var revoke = new HttpRequestMessage(HttpMethod.Post, Bao + "auth/token/revoke-self");
-            revoke.Headers.Add("X-Vault-Token", token);
-            using var response = await http.SendAsync(revoke, HttpCompletionOption.ResponseHeadersRead);
-            if (!response.IsSuccessStatusCode) throw new InvalidOperationException();
+            try
+            {
+                using var revoke = new HttpRequestMessage(HttpMethod.Post, Bao + "auth/token/revoke-self");
+                revoke.Headers.Add("X-Vault-Token", token);
+                using var response = await http.SendAsync(revoke, HttpCompletionOption.ResponseHeadersRead);
+                if (!response.IsSuccessStatusCode) throw new IdentityException("OpenBao token revocation", response.StatusCode);
+            }
+            catch (Exception ex) when (!signedSuccessfully)
+            {
+                // Preserve the signing failure while reporting failed cleanup without provider diagnostics.
+                var reason = ex is IdentityException ? ex.Message : "OpenBao token revocation";
+                Console.Error.WriteLine($"{reason} also failed; details suppressed.");
+            }
         }
     }
 
     private static string Required(string name) => Environment.GetEnvironmentVariable(name) is { Length: > 0 } value ? value : throw new InvalidOperationException();
 
-    private static async Task<JsonDocument> JsonAsync(HttpClient http, HttpRequestMessage request)
+    private static async Task<JsonDocument> JsonAsync(HttpClient http, HttpRequestMessage request, string step)
     {
         using var response = await http.SendAsync(request);
-        if (!response.IsSuccessStatusCode) throw new InvalidOperationException();
+        if (!response.IsSuccessStatusCode) throw new IdentityException(step, response.StatusCode);
         await using var body = await response.Content.ReadAsStreamAsync();
         return await JsonDocument.ParseAsync(body);
     }

@@ -13,8 +13,10 @@ public sealed class AlphaSshTests
 {
     [Test]
     [Arguments("success")]
+    [Arguments("identity_denied")]
     [Arguments("login_denied")]
     [Arguments("sign_denied")]
+    [Arguments("sign_and_revoke_denied")]
     [Arguments("sign_redirect")]
     [Arguments("wrong_certificate")]
     [Arguments("revoke_denied")]
@@ -31,7 +33,8 @@ public sealed class AlphaSshTests
                     await Assert.That(request.RequestUri.Host).IsEqualTo("pipelines.actions.githubusercontent.com");
                     await Assert.That(Uri.UnescapeDataString(request.RequestUri.Query)).IsEqualTo("?audience=https://bao.mariogk.com");
                     await Assert.That(request.Headers.Authorization!.Parameter).IsEqualTo("synthetic-runner-token");
-                    return new(HttpStatusCode.OK) { Content = JsonContent.Create(new { value = "synthetic-oidc-jwt" }) };
+                    return new(behavior == "identity_denied" ? HttpStatusCode.Forbidden : HttpStatusCode.OK)
+                        { Content = JsonContent.Create(new { value = "synthetic-oidc-jwt" }) };
                 case "/v1/auth/github-actions/login":
                     await Assert.That(request.RequestUri.Host).IsEqualTo("bao.mariogk.com");
                     await Assert.That(request.Headers.Authorization).IsNull();
@@ -54,7 +57,7 @@ public sealed class AlphaSshTests
                     }
                     var response = new HttpResponseMessage(behavior switch
                     {
-                        "sign_denied" => HttpStatusCode.Forbidden,
+                        "sign_denied" or "sign_and_revoke_denied" => HttpStatusCode.Forbidden,
                         "sign_redirect" => HttpStatusCode.Redirect,
                         _ => HttpStatusCode.OK
                     }) { Content = JsonContent.Create(new { data = new { signed_key = behavior == "wrong_certificate" ? "synthetic-provider-secret" : "ssh-ed25519-cert-v01@openssh.com synthetic-certificate" } }) };
@@ -62,16 +65,32 @@ public sealed class AlphaSshTests
                     return response;
                 case "/v1/auth/token/revoke-self":
                     await Assert.That(request.Headers.GetValues("X-Vault-Token").Single()).IsEqualTo("synthetic-bao-token");
-                    return new(behavior == "revoke_denied" ? HttpStatusCode.Forbidden : HttpStatusCode.NoContent);
+                    return new(behavior is "revoke_denied" or "sign_and_revoke_denied" ? HttpStatusCode.Forbidden : HttpStatusCode.NoContent);
                 default: throw new InvalidOperationException("Unexpected credential destination.");
             }
         }));
         if (behavior == "success")
             await Assert.That(await AlphaSsh.SignAsync(http, "https://pipelines.actions.githubusercontent.com/idtoken", "synthetic-runner-token", "synthetic-ephemeral-public-key"))
                 .IsEqualTo("ssh-ed25519-cert-v01@openssh.com synthetic-certificate");
-        else await Assert.That(async () => { await AlphaSsh.SignAsync(http, "https://pipelines.actions.githubusercontent.com/idtoken", "synthetic-runner-token", "synthetic-ephemeral-public-key"); }).Throws<InvalidOperationException>();
-        await Assert.That(calls.Count).IsEqualTo(behavior == "login_denied" ? 2 : 4);
-        if (behavior != "login_denied") await Assert.That(calls.Last()).IsEqualTo("/v1/auth/token/revoke-self");
+        else
+        {
+            var failure = await Assert.That(async () => { await AlphaSsh.SignAsync(http, "https://pipelines.actions.githubusercontent.com/idtoken", "synthetic-runner-token", "synthetic-ephemeral-public-key"); }).Throws<InvalidOperationException>();
+            await Assert.That(TUnit.Core.TestContext.Current!.GetErrorOutput()).IsEqualTo(behavior == "sign_and_revoke_denied"
+                ? "OpenBao token revocation HTTP 403 also failed; details suppressed." + Environment.NewLine : "");
+            var message = failure!.Message;
+            await Assert.That(message.Contains("synthetic", StringComparison.Ordinal)).IsFalse();
+            if (behavior != "wrong_certificate")
+                await Assert.That(message).IsEqualTo(behavior switch
+                {
+                    "identity_denied" => "GitHub OIDC request HTTP 403",
+                    "login_denied" => "OpenBao authentication HTTP 403",
+                    "revoke_denied" => "OpenBao token revocation HTTP 403",
+                    "sign_redirect" => "OpenBao SSH signing HTTP 302",
+                    _ => "OpenBao SSH signing HTTP 403"
+                });
+        }
+        await Assert.That(calls.Count).IsEqualTo(behavior == "identity_denied" ? 1 : behavior == "login_denied" ? 2 : 4);
+        if (behavior is not ("login_denied" or "identity_denied")) await Assert.That(calls.Last()).IsEqualTo("/v1/auth/token/revoke-self");
     }
 
     [Test]
