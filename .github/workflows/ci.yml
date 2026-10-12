@@ -20,7 +20,7 @@ env:
 jobs:
   checks:
     name: Check and build ts-reviewer
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     concurrency:
       group: ts-reviewer-checks-${{ github.event_name }}-${{ github.ref }}
       cancel-in-progress: true
@@ -67,7 +67,7 @@ jobs:
     name: Publish the exact checked image
     needs: checks
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
@@ -131,7 +131,7 @@ jobs:
   deployment-gate:
     name: Verify Alpha environment setup
     needs: image
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       actions: read
@@ -149,7 +149,7 @@ jobs:
   deploy:
     name: Deploy Alpha with health check and rollback
     needs: [checks, image, deployment-gate]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     environment: alpha
     permissions:
       contents: read
