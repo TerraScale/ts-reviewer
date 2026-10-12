@@ -52,7 +52,7 @@ public sealed class PullRequestReviewer(GitHubClient github, ReviewEngine engine
             // Only this app's outcome for this exact PR and base can suppress a paid review.
             if (!request.Rerun && IsCompleted(await LatestOwnedStatusAsync(pr, owner, name, ct), pr)) return;
             reviewStarted = true;
-            logger.LogInformation("review started for {Repository}#{Number} with model {Model}", owner + "/" + name, number, ReviewProvider.PrimaryModel);
+            logger.LogInformation("review started for {Repository}#{Number}; model selected by workspace monthly bill", owner + "/" + name, number);
             await PublishStatusAsync(owner, name, sha, "pending", StatusDescription(pr.Number, pr.Base.Sha, "Review in progress"));
             await ReviewAsync(pr, owner, name, number, ct);
         }

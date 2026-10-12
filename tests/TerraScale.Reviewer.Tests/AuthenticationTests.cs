@@ -19,18 +19,33 @@ public sealed class AuthenticationTests
     [Arguments("webhook-secret", "   ")]
     [Arguments("context-api-token", "")]
     [Arguments("context-api-token", "   ")]
+    [Arguments("anthropic-admin-api-key", "")]
+    [Arguments("anthropic-workspace-id", "")]
     public async Task ConfigurationRejectsMissingInboundCredentials(string key, string value)
     {
         string? error = null;
         try
         {
             ReviewerOptions.Load(["--github-app-id=123", "--github-installation-id=456", "--github-private-key-path=unused",
-                "--anthropic-api-key=anthropic-test-key", "--bot-login=bot", "--operator-token=operator-test-token",
+                "--anthropic-api-key=anthropic-test-key", "--anthropic-admin-api-key=billing-test-key", "--anthropic-workspace-id=wrkspc_test", "--bot-login=bot", "--operator-token=operator-test-token",
                 "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token", $"--{key}={value}"]);
         }
         catch (InvalidOperationException exception) { error = exception.Message; }
         var environmentName = "TS_REVIEWER_" + key.Replace('-', '_').ToUpperInvariant();
         await Assert.That(error).IsEqualTo(environmentName + " is required");
+    }
+
+    [Test]
+    [Arguments("default")]
+    [Arguments("wrkspc_")]
+    [Arguments("incorrect")]
+    [Arguments("wrkspc_bad/id")]
+    public async Task ConfigurationRequiresRealWorkspaceIdentityIncludingDefault(string workspace)
+    {
+        await Assert.That(() => ReviewerOptions.Load(["--github-app-id=123", "--github-installation-id=456", "--github-private-key-path=unused",
+            "--anthropic-api-key=anthropic-test-key", "--anthropic-admin-api-key=billing-test-key", "--anthropic-workspace-id=" + workspace,
+            "--bot-login=bot", "--operator-token=operator-test-token", "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token"]))
+            .Throws<InvalidOperationException>();
     }
 
     [Test]

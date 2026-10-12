@@ -350,6 +350,23 @@ internal sealed class ContextStore : IDisposable
         }
     }
 
+    internal decimal RecordWorkspaceCost(string workspace, string month, decimal cost)
+    {
+        lock (_gate)
+        {
+            _database.BeginTrans();
+            try
+            {
+                var id = "anthropic_cost:" + workspace + ":" + month;
+                var highest = Math.Max(_meta.FindById(id)?["usd"].AsDecimal ?? 0m, cost);
+                _meta.Upsert(new BsonDocument { ["_id"] = id, ["usd"] = highest });
+                _database.Commit();
+                return highest;
+            }
+            catch { _database.Rollback(); throw; }
+        }
+    }
+
     public void Dispose() => _database.Dispose();
 
     private void EnsureVectorIndex(int dimensions)

@@ -151,7 +151,7 @@ public sealed class GitHubCommandTests
             var client = new GitHubClient(new HttpClient(Transport), options, (_, _, _) => Task.FromResult("installation-test-token"));
             _store = new ContextStore(options);
             var indexer = new ContextIndexer(client, _store, new ContextEmbedder(), options, NullLogger<ContextIndexer>.Instance);
-            var reviewer = new PullRequestReviewer(client, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance), options, NullLogger<PullRequestReviewer>.Instance);
+            var reviewer = new PullRequestReviewer(client, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, BillingFixture.Opus), options, NullLogger<PullRequestReviewer>.Instance);
             _queue = new ReviewQueue(reviewer, NullLogger<ReviewQueue>.Instance);
             _webhook = new WebhookHandler(client, _queue, reviewer, indexer, options, NullLogger<WebhookHandler>.Instance);
         }

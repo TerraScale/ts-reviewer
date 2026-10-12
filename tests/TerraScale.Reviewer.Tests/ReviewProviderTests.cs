@@ -132,7 +132,7 @@ public sealed class ReviewProviderTests
             });
         });
         var log = new CaptureLogger();
-        await using var provider = new ReviewProvider(Options, log, "review", new HttpClient(transport), (_, _) => Task.CompletedTask);
+        await using var provider = new ReviewProvider(Options, log, "review", BillingFixture.Opus, new HttpClient(transport), (_, _) => Task.CompletedTask);
         await provider.StartAsync(CancellationToken.None);
         using var client = new HttpClient();
         client.DefaultRequestHeaders.Add("x-api-key", provider.Token);
@@ -152,7 +152,7 @@ public sealed class ReviewProviderTests
         var log = new CaptureLogger();
         var transport = new Transport((attempt, model, _) => Task.FromResult(attempt <= 3
             ? new HttpResponseMessage(HttpStatusCode.TooManyRequests) : Success(model)));
-        await using var provider = new ReviewProvider(Options, log, "TerraScale/widgets#9", new HttpClient(transport),
+        await using var provider = new ReviewProvider(Options, log, "TerraScale/widgets#9", BillingFixture.Opus, new HttpClient(transport),
             (wait, _) => { delay.Add(wait); return Task.CompletedTask; });
         await provider.SendAsync(Request(), CancellationToken.None);
         await provider.SendAsync(Request(), CancellationToken.None);
@@ -177,7 +177,7 @@ public sealed class ReviewProviderTests
             elapsed += failed ? ReviewProvider.AttemptTimeout : TimeSpan.FromSeconds(1);
             return Task.FromResult(failed ? new HttpResponseMessage(HttpStatusCode.GatewayTimeout) : Success(model));
         });
-        await using var provider = new ReviewProvider(Options, log, "review", new HttpClient(transport),
+        await using var provider = new ReviewProvider(Options, log, "review", BillingFixture.Opus, new HttpClient(transport),
             (wait, _) => { elapsed += wait; return Task.CompletedTask; });
         await provider.SendAsync(Request(), CancellationToken.None);
         var firstCallElapsed = elapsed;
@@ -212,7 +212,7 @@ public sealed class ReviewProviderTests
         var delays = 0;
         var transport = new Transport((_, _, _) => Task.FromResult(new HttpResponseMessage((HttpStatusCode)upstreamStatus)
         { Content = JsonContent.Create(new { error = new { message = "upstream rejected" } }) }));
-        await using var provider = new ReviewProvider(Options, NullLogger.Instance, "review", new HttpClient(transport),
+        await using var provider = new ReviewProvider(Options, NullLogger.Instance, "review", BillingFixture.Opus, new HttpClient(transport),
             (_, _) => { delays++; return Task.CompletedTask; });
         await provider.StartAsync(CancellationToken.None);
         using var client = new HttpClient();
@@ -363,7 +363,7 @@ public sealed class ReviewProviderTests
             [new { type = "tool_use", id = "tool_1", name = "code_search", input = new { search_text = "first" } },
              new { type = "tool_use", id = duplicate && attempt == 1 ? "tool_1" : "tool_2", name = "code_search", input = new { search_text = "second" } }], "tool_use")));
         var log = new CaptureLogger();
-        await using var provider = new ReviewProvider(Options, log, "review", new HttpClient(transport), (_, _) => Task.CompletedTask);
+        await using var provider = new ReviewProvider(Options, log, "review", BillingFixture.Opus, new HttpClient(transport), (_, _) => Task.CompletedTask);
         await provider.SendAsync(Request(), CancellationToken.None);
         await Assert.That(transport.Models.Count).IsEqualTo(duplicate ? 2 : 1);
         await Assert.That(log.Messages.Any(x => x.Contains("duplicate tool-call IDs"))).IsEqualTo(duplicate);
@@ -402,7 +402,7 @@ public sealed class ReviewProviderTests
             ? Success(model, [new { type = "tool_use", id = "tool_1", name, input = JsonSerializer.Deserialize<JsonElement>(arguments) }], "tool_use")
             : Success(model)));
         var log = new CaptureLogger();
-        await using var provider = new ReviewProvider(Options, log, "review", new HttpClient(transport), (_, _) => Task.CompletedTask);
+        await using var provider = new ReviewProvider(Options, log, "review", BillingFixture.Opus, new HttpClient(transport), (_, _) => Task.CompletedTask);
         await provider.SendAsync(Request(), CancellationToken.None);
         await Assert.That(transport.Models.Count).IsEqualTo(2);
         await Assert.That(log.Messages.Any(x => x.Contains(name == "unknown_tool" ? "tool not declared" : "schema-invalid tool arguments"))).IsTrue();
@@ -458,7 +458,7 @@ public sealed class ReviewProviderTests
     {
         var delaying = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var transport = new Transport((_, _, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.TooManyRequests)));
-        await using var provider = new ReviewProvider(Options, NullLogger.Instance, "review", new HttpClient(transport),
+        await using var provider = new ReviewProvider(Options, NullLogger.Instance, "review", BillingFixture.Opus, new HttpClient(transport),
             (_, ct) => { delaying.TrySetResult(); return Task.Delay(Timeout.InfiniteTimeSpan, ct); });
         using var cancellation = new CancellationTokenSource();
         var run = provider.SendAsync(Request(), cancellation.Token);
@@ -552,7 +552,7 @@ public sealed class ReviewProviderTests
             }
             return new HttpResponseMessage(HttpStatusCode.TooManyRequests);
         });
-        await using var provider = new ReviewProvider(Options, log, "review", new HttpClient(transport), async (_, ct) =>
+        await using var provider = new ReviewProvider(Options, log, "review", BillingFixture.Opus, new HttpClient(transport), async (_, ct) =>
         {
             if (backoff && transport.Models.Count == 29)
             {
@@ -632,7 +632,7 @@ public sealed class ReviewProviderTests
             if (!backoff) { started.TrySetResult(); await release.Task.WaitAsync(ct); }
             return Success(model);
         });
-        await using var provider = new ReviewProvider(Options, NullLogger.Instance, "review", new HttpClient(transport),
+        await using var provider = new ReviewProvider(Options, NullLogger.Instance, "review", BillingFixture.Opus, new HttpClient(transport),
             async (_, ct) => { started.TrySetResult(); await release.Task.WaitAsync(ct); }, clock);
         await provider.StartAsync(CancellationToken.None);
         using var client = new HttpClient();
@@ -685,7 +685,100 @@ public sealed class ReviewProviderTests
         await Assert.That(transport.Models.Count).IsEqualTo(2);
     }
 
-    private static ReviewProvider Create(Transport transport) => new(Options, NullLogger.Instance, "review", new HttpClient(transport), (_, _) => Task.CompletedTask);
+    private static ReviewProvider Create(Transport transport) => new(Options, NullLogger.Instance, "review", BillingFixture.Opus, new HttpClient(transport), (_, _) => Task.CompletedTask);
+
+    [Test]
+    public async Task ModelTiersChangeBetweenAttemptsWithoutEditingHistoryOrReopeningThirtyAttemptBudget()
+    {
+        var transport = new Transport((_, _, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.Forbidden)));
+        var selections = 0;
+        Task<string> Select(CancellationToken _) => Task.FromResult(++selections <= 10 ? ReviewProvider.PrimaryModel
+            : selections <= 20 ? WorkspaceBudget.Sonnet : WorkspaceBudget.Haiku);
+        await using var provider = new ReviewProvider(Options, NullLogger.Instance, "review", new BillingFixture(Select), new HttpClient(transport), (_, _) => Task.CompletedTask);
+        var request = Request();
+        request["messages"] = JsonNode.Parse("""
+            [{"role":"assistant","content":[{"type":"thinking","thinking":"analysis","signature":"signed-history"},
+              {"type":"redacted_thinking","data":"redacted-history"},
+              {"type":"tool_use","id":"read_1","name":"file_read","input":{"file_path":"a.cs"}}]},
+             {"role":"user","content":[{"type":"tool_result","tool_use_id":"read_1","content":"class A {}"}]}]
+            """);
+        var history = request["messages"]!.ToJsonString();
+        await Assert.That(async () => await provider.SendAsync(request, CancellationToken.None)).Throws<InvalidOperationException>();
+        await Assert.That(transport.Models.Count).IsEqualTo(30);
+        foreach (var model in new[] { ReviewProvider.PrimaryModel, WorkspaceBudget.Sonnet, WorkspaceBudget.Haiku })
+            await Assert.That(transport.Models.Count(m => m == model)).IsEqualTo(10);
+        await Assert.That(transport.Bodies.All(b => b["messages"]!.ToJsonString() == history)).IsTrue();
+        await Assert.That(provider.ModelsUsed).IsEqualTo("claude-opus-5-5, claude-sonnet-5-5, claude-haiku-5-5");
+        await Assert.That(async () => await provider.SendAsync(Request(), CancellationToken.None)).Throws<InvalidOperationException>();
+        await Assert.That(selections).IsEqualTo(30);
+    }
+
+    [Test]
+    [Arguments("claude-sonnet-5-5")]
+    [Arguments("claude-haiku-5-5")]
+    public async Task AcceptsSuccessfulResponsesFromSelectedTierOnly(string selected)
+    {
+        var transport = new Transport((attempt, model, _) => Task.FromResult(Success(attempt == 1 ? ReviewProvider.PrimaryModel : model)));
+        await using var provider = new ReviewProvider(Options, NullLogger.Instance, "review", new BillingFixture(_ => Task.FromResult(selected)), new HttpClient(transport), (_, _) => Task.CompletedTask);
+        await provider.SendAsync(Request(), CancellationToken.None);
+        await Assert.That(transport.Models.SequenceEqual(new[] { selected, selected })).IsTrue();
+        await Assert.That(provider.ModelsUsed).IsEqualTo(selected);
+    }
+
+    [Test]
+    [Arguments(0)]
+    [Arguments(1)]
+    public async Task BillingFailureLatchesWithoutMakingUnauthorizedPaidCalls(int permitted)
+    {
+        var transport = new Transport((_, _, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.Forbidden)));
+        var selections = 0;
+        Task<string> Select(CancellationToken _)
+        {
+            if (++selections > permitted) throw new Exception("synthetic-billing-secret");
+            return Task.FromResult(ReviewProvider.PrimaryModel);
+        }
+        var log = new CaptureLogger();
+        await using var provider = new ReviewProvider(Options, log, "review", new BillingFixture(Select), new HttpClient(transport), (_, _) => Task.CompletedTask);
+        await Assert.That(async () => await provider.SendAsync(Request(), CancellationToken.None)).Throws<InvalidOperationException>();
+        await Assert.That(async () => await provider.SendAsync(Request(), CancellationToken.None)).Throws<InvalidOperationException>();
+        await Assert.That(transport.Models.Count).IsEqualTo(permitted);
+        await Assert.That(selections).IsEqualTo(permitted + 1);
+        await Assert.That(provider.Failure!.Contains("synthetic-billing-secret")).IsFalse();
+        await Assert.That(log.Messages.Any(m => m.Contains("synthetic-billing-secret"))).IsFalse();
+    }
+
+    [Test]
+    [Arguments(null)]
+    [Arguments("wrkspc_wrong")]
+    [Arguments("wrkspc_test")]
+    public async Task SuccessfulMessagesMustConfirmWorkspaceBeforeResponseDelivery(string? workspace)
+    {
+        var transport = new Transport((_, model, _) =>
+        {
+            var response = Success(model);
+            if (workspace is not null) response.Headers.Add("anthropic-workspace-id", workspace);
+            return Task.FromResult(response);
+        });
+        var confirmations = 0;
+        var budget = new BillingFixture(confirm: id =>
+        {
+            confirmations++;
+            if (id != "wrkspc_test") throw new InvalidOperationException("synthetic-inference-secret");
+        });
+        await using var provider = new ReviewProvider(Options, NullLogger.Instance, "review", budget, new HttpClient(transport), (_, _) => Task.CompletedTask);
+        var deliveries = 0;
+        Task Deliver(string _, CancellationToken __) { deliveries++; return Task.CompletedTask; }
+        if (workspace == "wrkspc_test") await provider.SendAsync(Request(), CancellationToken.None, Deliver);
+        else
+        {
+            await Assert.That(async () => await provider.SendAsync(Request(), CancellationToken.None, Deliver)).Throws<InvalidOperationException>();
+            await Assert.That(async () => await provider.SendAsync(Request(), CancellationToken.None)).Throws<InvalidOperationException>();
+            await Assert.That(provider.Failure!.Contains("synthetic-inference-secret")).IsFalse();
+        }
+        await Assert.That(confirmations).IsEqualTo(1);
+        await Assert.That(transport.Models.Count).IsEqualTo(1);
+        await Assert.That(deliveries).IsEqualTo(workspace == "wrkspc_test" ? 1 : 0);
+    }
 
     private sealed class PromptContent(byte[] payload) : HttpContent
     {

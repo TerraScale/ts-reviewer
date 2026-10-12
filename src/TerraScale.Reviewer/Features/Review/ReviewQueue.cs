@@ -39,7 +39,7 @@ public enum ReviewAdmission
 /// </remarks>
 public sealed class ReviewQueue : BackgroundService
 {
-    public const int WorkerCount = 2;
+    public const int WorkerCount = 16;
     public const string NewerHead = "a newer push replaced this head";
     public const string Closed = "the pull request was closed";
 
@@ -62,7 +62,7 @@ public sealed class ReviewQueue : BackgroundService
     internal ReviewQueue(Func<ReviewRequest, CancellationToken, Task> runner, Func<ReviewRequest, string, Task> skip, int workers, ILogger<ReviewQueue> logger)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(workers, 1);
-        ArgumentOutOfRangeException.ThrowIfGreaterThan(workers, 2);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(workers, WorkerCount);
         (_runner, _skip, _workers, _logger) = (runner, skip, workers, logger);
     }
 

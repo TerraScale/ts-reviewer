@@ -7,7 +7,8 @@ public sealed record ReviewerOptions(
     string Organization, string BotLogin,
     string WebhookSecret, string ContextApiToken, string ContextDatabasePath, int ContextMaxFiles,
     int ContextMaxAttempts = 5, TimeSpan? ContextRetryBaseDelay = null, string OperatorToken = "",
-    string GitHubInstallationId = "", string GitHubPrivateKeyPath = "")
+    string GitHubInstallationId = "", string GitHubPrivateKeyPath = "",
+    string AnthropicAdminApiKey = "", string AnthropicWorkspaceId = "")
 {
     public TimeSpan ContextRetryDelay => ContextRetryBaseDelay ?? TimeSpan.FromSeconds(1);
     public static ReviewerOptions Load(string[] args)
@@ -19,6 +20,9 @@ public sealed record ReviewerOptions(
             ["github-installation-id"] = null,
             ["github-private-key-path"] = null,
             ["anthropic-api-key"] = null,
+            // Vendor-issued billing credential and identity are required for whole-workspace accounting.
+            ["anthropic-admin-api-key"] = null,
+            ["anthropic-workspace-id"] = null,
             ["bot-login"] = null,
             ["webhook-secret"] = string.Empty,
             ["context-api-token"] = string.Empty,
@@ -73,6 +77,11 @@ public sealed record ReviewerOptions(
         var installationId = Required(values, "github-installation-id", "TS_REVIEWER_GITHUB_INSTALLATION_ID");
         var privateKeyPath = Required(values, "github-private-key-path", "TS_REVIEWER_GITHUB_PRIVATE_KEY_PATH");
         var anthropicKey = Required(values, "anthropic-api-key", "TS_REVIEWER_ANTHROPIC_API_KEY");
+        var adminKey = Required(values, "anthropic-admin-api-key", "TS_REVIEWER_ANTHROPIC_ADMIN_API_KEY");
+        var workspaceId = Required(values, "anthropic-workspace-id", "TS_REVIEWER_ANTHROPIC_WORKSPACE_ID");
+        if (!workspaceId.StartsWith("wrkspc_", StringComparison.Ordinal)
+            || workspaceId.Length <= 7 || !workspaceId.All(c => char.IsAsciiLetterOrDigit(c) || c == '_'))
+            throw new InvalidOperationException("TS_REVIEWER_ANTHROPIC_WORKSPACE_ID must be a provider-issued wrkspc_ identity, including for the default workspace");
         var botLogin = Required(values, "bot-login", "TS_REVIEWER_BOT_LOGIN");
         if (!long.TryParse(appId, out var parsedAppId) || parsedAppId <= 0
             || !long.TryParse(installationId, out var parsedInstallationId) || parsedInstallationId <= 0)
@@ -83,7 +92,7 @@ public sealed record ReviewerOptions(
         return new ReviewerOptions(Trim(values["listen"]!), "https://api.github.com", appId,
             "https://api.anthropic.com", anthropicKey, "TerraScale", botLogin,
             webhookSecret, contextApiToken, values["context-database"]!, 20_000,
-            5, TimeSpan.FromSeconds(1), operatorToken, installationId, privateKeyPath);
+            5, TimeSpan.FromSeconds(1), operatorToken, installationId, privateKeyPath, adminKey, workspaceId);
     }
     private static string Required(IReadOnlyDictionary<string, string?> values, string key, string environmentName) =>
         string.IsNullOrWhiteSpace(values[key]) ? throw new InvalidOperationException($"{environmentName} is required") : values[key]!;

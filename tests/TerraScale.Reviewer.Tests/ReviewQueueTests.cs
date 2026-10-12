@@ -224,7 +224,7 @@ public sealed class ReviewQueueTests
         var queue = new ReviewQueue(runner.RunAsync, runner.SkipAsync, 1, NullLogger<ReviewQueue>.Instance);
         using var store = new ContextStore(options);
         var indexer = new ContextIndexer(github, store, new ContextEmbedder(), options, NullLogger<ContextIndexer>.Instance);
-        var reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance), options, NullLogger<PullRequestReviewer>.Instance);
+        var reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, BillingFixture.Opus), options, NullLogger<PullRequestReviewer>.Instance);
         var webhook = new WebhookHandler(github, queue, reviewer, indexer, options, NullLogger<WebhookHandler>.Instance);
         try
         {
@@ -252,7 +252,7 @@ public sealed class ReviewQueueTests
         var options = Options("unused.db");
         var transport = new MovedHeadHandler();
         var github = new GitHubClient(new HttpClient(transport), options, (_, _, _) => Task.FromResult("fixture-token"));
-        var reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance), options, NullLogger<PullRequestReviewer>.Instance);
+        var reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, BillingFixture.Opus), options, NullLogger<PullRequestReviewer>.Instance);
         var oldHead = new string('a', 40);
         await reviewer.RunAsync(Request(7, oldHead), CancellationToken.None);
         await Assert.That(transport.Requests.Count).IsEqualTo(3);
@@ -270,7 +270,7 @@ public sealed class ReviewQueueTests
         var queue = new ReviewQueue((_, _) => Task.CompletedTask, (_, _) => Task.CompletedTask, 2, NullLogger<ReviewQueue>.Instance);
         using var store = new ContextStore(options);
         var indexer = new ContextIndexer(github, store, new ContextEmbedder(), options, NullLogger<ContextIndexer>.Instance);
-        var reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance), options, NullLogger<PullRequestReviewer>.Instance);
+        var reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, BillingFixture.Opus), options, NullLogger<PullRequestReviewer>.Instance);
         var webhook = new WebhookHandler(github, queue, reviewer, indexer, options, NullLogger<WebhookHandler>.Instance);
         try
         {
@@ -435,13 +435,14 @@ public sealed class ReviewQueueTests
         var running = 0;
         var peak = 0;
         var completed = 0;
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var queue = new ReviewQueue(async (request, ct) =>
         {
             var now = Interlocked.Increment(ref running);
             InterlockedMax(ref peak, now);
             try
             {
-                await Task.Delay(50, ct);
+                await release.Task.WaitAsync(ct);
                 if (request.Number % 2 == 0) throw new InvalidOperationException("review exploded");
             }
             finally
@@ -453,13 +454,16 @@ public sealed class ReviewQueueTests
         await queue.StartAsync(CancellationToken.None);
         try
         {
-            for (var number = 1; number <= 8; number++) queue.Enqueue(Request(number, "h" + number));
-            await WaitUntilAsync(() => Volatile.Read(ref completed) == 8);
-            await Assert.That(Volatile.Read(ref peak)).IsEqualTo(2);
+            var requests = ReviewQueue.WorkerCount * 2;
+            for (var number = 1; number <= requests; number++) queue.Enqueue(Request(number, "h" + number));
+            await WaitUntilAsync(() => Volatile.Read(ref running) == 16);
+            release.SetResult();
+            await WaitUntilAsync(() => Volatile.Read(ref completed) == requests);
+            await Assert.That(Volatile.Read(ref peak)).IsEqualTo(16);
 
             // Every failure released its worker: a new request still runs.
-            queue.Enqueue(Request(9, "h9"));
-            await WaitUntilAsync(() => Volatile.Read(ref completed) == 9);
+            queue.Enqueue(Request(requests + 1, "next"));
+            await WaitUntilAsync(() => Volatile.Read(ref completed) == requests + 1);
             await WaitUntilAsync(() => queue.Snapshot() == (0, 0));
         }
         finally { await queue.StopAsync(CancellationToken.None); }
@@ -476,7 +480,7 @@ public sealed class ReviewQueueTests
         var queue = await StartAsync(runner, workers: 1);
         using var store = new ContextStore(options);
         var indexer = new ContextIndexer(github, store, new ContextEmbedder(), options, NullLogger<ContextIndexer>.Instance);
-        var reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance), options, NullLogger<PullRequestReviewer>.Instance);
+        var reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, BillingFixture.Opus), options, NullLogger<PullRequestReviewer>.Instance);
         var webhook = new WebhookHandler(github, queue, reviewer, indexer, options, NullLogger<WebhookHandler>.Instance);
         try
         {
@@ -524,7 +528,7 @@ public sealed class ReviewQueueTests
         var github = new GitHubClient(new HttpClient(handler), options, (_, _, _) => Task.FromResult("fixture-token"));
         var runner = new ScriptedRunner();
         var queue = new ReviewQueue(runner.RunAsync, runner.SkipAsync, workers: 1, NullLogger<ReviewQueue>.Instance);
-        var reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance), options, NullLogger<PullRequestReviewer>.Instance);
+        var reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, BillingFixture.Opus), options, NullLogger<PullRequestReviewer>.Instance);
         var recovery = new ReviewRecovery(github, queue, reviewer, options, NullLogger<ReviewRecovery>.Instance);
 
         await Assert.That(await recovery.RecoverAsync(CancellationToken.None)).IsEqualTo(2);

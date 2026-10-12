@@ -23,20 +23,23 @@ internal sealed class ReviewProvider : IAsyncDisposable
     private readonly HttpClient _http;
     private readonly Func<TimeSpan, CancellationToken, Task> _delay;
     private readonly TimeProvider _time;
+    private readonly IWorkspaceBudget _budget;
+    private readonly List<string> _models = [];
     private readonly SemaphoreSlim _serial = new(1);
     private CancellationTokenSource? _lifetime;
     private CancellationTokenSource? _inactivity;
     private WebApplication? _app;
     private int _step;
 
-    public ReviewProvider(ReviewerOptions options, ILogger logger, string review, TimeProvider? time = null)
-        : this(options, logger, review, new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false }), Task.Delay, time) { }
+    public ReviewProvider(ReviewerOptions options, ILogger logger, string review, IWorkspaceBudget budget, TimeProvider? time = null)
+        : this(options, logger, review, budget, new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false }), Task.Delay, time) { }
 
-    internal ReviewProvider(ReviewerOptions options, ILogger logger, string review, HttpClient http,
+    internal ReviewProvider(ReviewerOptions options, ILogger logger, string review, IWorkspaceBudget budget, HttpClient http,
         Func<TimeSpan, CancellationToken, Task> delay, TimeProvider? time = null)
     {
         (_options, _logger, _review, _http, _delay) = (options, logger, review, http, delay);
         _time = time ?? TimeProvider.System;
+        _budget = budget;
         _http.Timeout = Timeout.InfiniteTimeSpan;
     }
 
@@ -44,10 +47,12 @@ internal sealed class ReviewProvider : IAsyncDisposable
     internal string Url { get; private set; } = "";
     internal CancellationToken Lifetime => _lifetime!.Token;
     internal string? Failure { get; private set; }
-    internal string ModelsUsed => PrimaryModel;
+    internal string InitialModel { get; private set; } = "";
+    internal string ModelsUsed => _models.Count == 0 ? InitialModel : string.Join(", ", _models);
 
     internal async Task StartAsync(CancellationToken ct)
     {
+        InitialModel = await _budget.SelectModelAsync(ct);
         _inactivity = new CancellationTokenSource(InactivityTimeout, _time);
         _lifetime = CancellationTokenSource.CreateLinkedTokenSource(ct, _inactivity.Token);
         var builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions { Args = [], ApplicationName = typeof(ReviewProvider).Assembly.FullName });
@@ -118,7 +123,15 @@ internal sealed class ReviewProvider : IAsyncDisposable
             for (var attempt = 1; attempt <= MaxAttempts; attempt++)
             {
                 ct.ThrowIfCancellationRequested();
-                var model = PrimaryModel;
+                string model;
+                try { model = await _budget.SelectModelAsync(ct); }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                catch
+                {
+                    Failure = "Anthropic workspace billing did not authorize this model call; review stopped without a verdict";
+                    throw new InvalidOperationException(Failure);
+                }
+                body["model"] = model;
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 timeout.CancelAfter(AttemptTimeout);
                 string? completed = null;
@@ -130,10 +143,20 @@ internal sealed class ReviewProvider : IAsyncDisposable
                     request.Headers.Add("x-api-key", _options.AnthropicApiKey);
                     request.Headers.Add("anthropic-version", "2023-06-01");
                     request.Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
+                    if (!_models.Contains(model)) _models.Add(model);
                     using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
                     var json = await response.Content.ReadAsStringAsync(timeout.Token);
                     if (response.IsSuccessStatusCode)
                     {
+                        try
+                        {
+                            _budget.ConfirmWorkspace(response.Headers.TryGetValues("anthropic-workspace-id", out var workspace) ? string.Join(",", workspace) : null);
+                        }
+                        catch
+                        {
+                            Failure = "Anthropic response workspace identity missing or mismatched; review stopped without a verdict";
+                            throw new InvalidOperationException(Failure);
+                        }
                         try
                         {
                             ValidateResponse(json, model, body["tools"] as JsonArray);
@@ -151,7 +174,7 @@ internal sealed class ReviewProvider : IAsyncDisposable
                 }
                 catch (OperationCanceledException) when (!ct.IsCancellationRequested) { reason = $"provider timed out after {AttemptTimeout}"; }
                 catch (JsonException) { reason = "provider returned malformed JSON"; }
-                catch (Exception ex) when (ex is HttpRequestException or IOException or InvalidOperationException) { reason = "provider transport failed"; }
+                catch (Exception ex) when (Failure is null && ex is (HttpRequestException or IOException or InvalidOperationException)) { reason = "provider transport failed"; }
                 if (completed is not null)
                 {
                     // Keep delivery under the call lock; a lost response must not reopen the spent budget.
@@ -195,14 +218,13 @@ internal sealed class ReviewProvider : IAsyncDisposable
 
     private static void NormalizeRequest(JsonObject body)
     {
-        body["model"] = PrimaryModel;
         body["stream"] = false;
-        // Opus 5.5 always thinks adaptively and rejects forced tools and sampling overrides from OCR.
+        // Use the common 5.5 tool contract without editing signed cross-model thinking history.
         body.Remove("thinking");
         body.Remove("temperature");
         body.Remove("top_p");
         body.Remove("top_k");
-        // OCR's grouping call uses its 200k prompt limit as output; Opus accepts at most 128k output.
+        // OCR's grouping call uses its 200k prompt limit as output; 5.5 models accept at most 128k output.
         if (body["max_tokens"]?.Deserialize<long>() > ModelOutputLimit) body["max_tokens"] = ModelOutputLimit;
         if (body["tools"] is JsonArray { Count: > 0 } tools)
         {

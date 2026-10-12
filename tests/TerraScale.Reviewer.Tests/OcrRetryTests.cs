@@ -383,7 +383,7 @@ public sealed class OcrRetryTests
         public ReviewEngine Engine(string? ocrPath = null, string? anthropicUrl = null, TimeProvider? time = null) => new(new ReviewerOptions("http://+:8080", _githubUrl, "github-app",
             anthropicUrl ?? "https://anthropic.test", "anthropic-test-key", "TerraScale", "bot",
             "webhook-test-secret", "context-test-token", Path.Combine(_root, "context.db"), 100),
-            NullLogger<ReviewEngine>.Instance, ocrPath ?? _stub, time ?? TimeProvider.System);
+            NullLogger<ReviewEngine>.Instance, BillingFixture.Opus, ocrPath ?? _stub, time ?? TimeProvider.System);
 
         public string Runs => _runs;
         public string OcrPath => _stub;

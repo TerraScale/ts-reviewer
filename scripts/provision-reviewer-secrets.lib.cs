@@ -41,7 +41,8 @@ public static class ReviewerSecrets
             if (version <= 0) throw new InvalidOperationException();
             var values = data.GetProperty("data");
             // Vendor credentials stay in this process; only new fields are sent in the CAS patch.
-            foreach (var key in new[] { "TS_REVIEWER_ANTHROPIC_API_KEY", "TS_REVIEWER_GITHUB_PRIVATE_KEY_PEM" })
+            foreach (var key in new[] { "TS_REVIEWER_ANTHROPIC_API_KEY", "TS_REVIEWER_ANTHROPIC_ADMIN_API_KEY",
+                "TS_REVIEWER_ANTHROPIC_WORKSPACE_ID", "TS_REVIEWER_GITHUB_PRIVATE_KEY_PEM" })
                 if (!Present(values, key)) throw new InvalidOperationException();
             var additions = Prepare(values);
             if (args[0] == "webhook")

@@ -17,6 +17,8 @@ public sealed class ReviewerSecretSetupTests
     private static Dictionary<string, string> VendorValues() => new()
     {
         ["TS_REVIEWER_ANTHROPIC_API_KEY"] = Vendor,
+        ["TS_REVIEWER_ANTHROPIC_ADMIN_API_KEY"] = "synthetic-billing-fixture",
+        ["TS_REVIEWER_ANTHROPIC_WORKSPACE_ID"] = "wrkspc_test",
         ["TS_REVIEWER_GITHUB_PRIVATE_KEY_PEM"] = "synthetic-pem-fixture"
     };
 
@@ -54,6 +56,8 @@ public sealed class ReviewerSecretSetupTests
                 || input is null || args.Any(a => a.Contains(Vendor))) throw new Exception(Vendor);
             using var patch = JsonDocument.Parse(input);
             if (patch.RootElement.TryGetProperty("TS_REVIEWER_ANTHROPIC_API_KEY", out _)
+                || patch.RootElement.TryGetProperty("TS_REVIEWER_ANTHROPIC_ADMIN_API_KEY", out _)
+                || patch.RootElement.TryGetProperty("TS_REVIEWER_ANTHROPIC_WORKSPACE_ID", out _)
                 || patch.RootElement.TryGetProperty("TS_REVIEWER_GITHUB_PRIVATE_KEY_PEM", out _)) throw new Exception(Vendor);
             foreach (var field in patch.RootElement.EnumerateObject())
             {
@@ -162,6 +166,8 @@ public sealed class ReviewerSecretSetupTests
 
     [Test]
     [Arguments("vendor")]
+    [Arguments("billing")]
+    [Arguments("workspace")]
     [Arguments("identity")]
     [Arguments("identity-type")]
     [Arguments("cas")]
@@ -169,6 +175,8 @@ public sealed class ReviewerSecretSetupTests
     {
         var values = VendorValues();
         if (failure == "vendor") values.Remove("TS_REVIEWER_ANTHROPIC_API_KEY");
+        if (failure == "billing") values.Remove("TS_REVIEWER_ANTHROPIC_ADMIN_API_KEY");
+        if (failure == "workspace") values.Remove("TS_REVIEWER_ANTHROPIC_WORKSPACE_ID");
         if (failure is "identity" or "identity-type") values["TS_REVIEWER_GITHUB_APP_ID"] = "1";
         using var output = new StringWriter();
         var patches = 0;
