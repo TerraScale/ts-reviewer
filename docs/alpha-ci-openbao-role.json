@@ -2,7 +2,7 @@
   "role_type": "jwt",
   "bound_audiences": ["https://bao.mariogk.com"],
   "user_claim": "sub",
-  "bound_subject": "repo:TerraScale/ts-reviewer:environment:alpha",
+  "bound_subject": "repo:TerraScale@206395477/ts-reviewer@1414605079:environment:alpha",
   "bound_claims": {
     "repository_id": "1414605079",
     "repository_owner_id": "206395477",
