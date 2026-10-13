@@ -4,6 +4,18 @@ The user approved this scoped integration and the reviewer-only cutover after au
 
 The protected deployment job uses GitHub OIDC twice: a two-minute OpenBao token signs a ten-minute, ephemeral Ed25519 SSH identity, and Tailscale workload federation admits a temporary network node. The signing token is revoked immediately. The workflow removes the private key afterwards; it never uploads it. PR checks run on Alpha's isolated shared-cache runners; trusted main/dispatch checks, image publication, environment verification, and deployment use clean hosted runners. PR artifacts and Alpha's PR-writable caches never enter deployed images. PR jobs have no `id-token: write`, network identity, runtime secrets, or production SSH access.
 
+## Immutable GitHub subject
+
+On 2026-10-13, GitHub's repository OIDC metadata reports `use_immutable_subject: true` and the prefix `repo:TerraScale@206395477/ts-reviewer@1414605079`. The protected `alpha` job therefore needs the exact subject `repo:TerraScale@206395477/ts-reviewer@1414605079:environment:alpha`. The previous name-only subject cannot match that identity; the latest main run stopped at OpenBao login with HTTP 400. The corrected role retains all repository/owner ID, main, push-event, workflow, audience, policy, and lifetime restrictions.
+
+The role declaration lives in this repository. HomeLab's `ops/openbao/secrets.json` and `identities.py` manage KV delivery and machine tokens, not this GitHub JWT role. An existing authenticated operator must apply the corrected role from this checkout:
+
+```sh
+bao write auth/github-actions/role/ts-reviewer-alpha @docs/alpha-ci-openbao-role.json >/dev/null
+```
+
+This updates only the role; it does not activate the reviewer. The live role was not inspected because machine identities cannot read it. Alpha's federated Tailscale client ID is absent from repository/environment variables and is not recorded in HomeLab's sources; the documented client/network and host-account prerequisites still need completion before a deployment can succeed.
+
 ## Operator setup
 
 1. In an existing authenticated OpenBao administrator session, establish **`auth/github-actions`** using the GitHub issuer `https://token.actions.githubusercontent.com` and its discovery document. Preserve any existing roles and refuse a conflicting issuer. Apply [the exact JWT role](alpha-ci-openbao-role.json) as `auth/github-actions/role/ts-reviewer-alpha` and [the policy](alpha-ci-ssh-policy.hcl) as `ts-reviewer-alpha-ssh`. The role binds the immutable repository and owner IDs, protected `alpha` subject, `main`, push events, and this workflow. It grants only one SSH-signing endpoint and self-revocation: no KV reads, secret writes, other signers, or administrative access. The vendor's `token_no_default_policy` field is required to prevent incidental access from its default policy.

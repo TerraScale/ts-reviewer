@@ -12,6 +12,21 @@ using TerraScale.Deployment;
 public sealed class AlphaSshTests
 {
     [Test]
+    public async Task Jwt_role_binds_the_immutable_environment_subject_from_its_repository_claims()
+    {
+        static string RolePath([System.Runtime.CompilerServices.CallerFilePath] string source = "") =>
+            Path.Combine(Path.GetDirectoryName(source)!, "..", "docs", "alpha-ci-openbao-role.json");
+        using var role = JsonDocument.Parse(await File.ReadAllTextAsync(RolePath()));
+        var claims = role.RootElement.GetProperty("bound_claims");
+        var repository = claims.GetProperty("workflow_ref").GetString()!.Split('/');
+        var ownerId = claims.GetProperty("repository_owner_id").GetString();
+        var repositoryId = claims.GetProperty("repository_id").GetString();
+        // GitHub's immutable default subject includes IDs as well as owner/repository names.
+        var subject = $"repo:{repository[0]}@{ownerId}/{repository[1]}@{repositoryId}:environment:alpha";
+        await Assert.That(role.RootElement.GetProperty("bound_subject").GetString()).IsEqualTo(subject);
+    }
+
+    [Test]
     [Arguments("success")]
     [Arguments("identity_denied")]
     [Arguments("login_denied")]
