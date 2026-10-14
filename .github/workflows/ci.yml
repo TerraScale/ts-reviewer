@@ -23,11 +23,10 @@ concurrency:
 env:
   CI: true # Standard .NET/Actions CI detection, required by the local-priority rule.
 
-# PR checks use Alpha's shared runners; trusted builds and deployment use clean hosted runners.
 jobs:
   checks:
     name: Check and build ts-reviewer
-    runs-on: ${{ github.event_name == 'pull_request' && 'alpha' || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Verify the requested trusted commit before running CI
@@ -42,8 +41,7 @@ jobs:
         with:
           global-json-file: global.json
       # No packages.lock.json, so setup-dotnet's built-in cache can't be used; key on the project files instead.
-      - if: github.event_name != 'pull_request'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.nuget/packages
           key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', 'Directory.Packages.props', 'Directory.Build.props', 'global.json', 'nuget.config') }}
@@ -65,9 +63,7 @@ jobs:
           dotnet publish scripts/prepare-alpha-ssh.cs -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o artifacts/ci/ssh
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         with:
-          # On alpha, build on the shared persistent BuildKit daemon (layer + cache-mount reuse).
-          driver: ${{ github.event_name == 'pull_request' && 'remote' || 'docker-container' }}
-          endpoint: ${{ github.event_name == 'pull_request' && 'unix:///run/buildkit/buildkitd.sock' || '' }}
+          driver: docker-container
       - name: Verify pinned OCR tooling without model calls
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -76,8 +72,8 @@ jobs:
           platforms: linux/amd64
           push: false
           tags: ts-reviewer-tooling-check
-          cache-from: ${{ github.event_name != 'pull_request' && 'type=gha,scope=tooling' || '' }}
-          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,mode=max,scope=tooling' || '' }}
+          cache-from: type=gha,scope=tooling
+          cache-to: type=gha,mode=max,scope=tooling
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: checked-${{ github.sha }}
