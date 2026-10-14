@@ -41,7 +41,10 @@ jobs:
         with:
           global-json-file: global.json
       # No packages.lock.json, so setup-dotnet's built-in cache can't be used; key on the project files instead.
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      # Every run restores; only main saves, so PRs never spend the repo cache budget on PR-scoped copies.
+      - name: Restore NuGet packages cache
+        id: nuget-cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/.nuget/packages
           key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', 'Directory.Packages.props', 'Directory.Build.props', 'global.json', 'nuget.config') }}
@@ -61,6 +64,12 @@ jobs:
           dotnet publish scripts/deploy-alpha.cs -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o artifacts/ci/deploy
           dotnet publish scripts/provision-reviewer-secrets.cs -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o artifacts/ci/setup
           dotnet publish scripts/prepare-alpha-ssh.cs -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o artifacts/ci/ssh
+      - name: Save NuGet packages cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.nuget-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.nuget/packages
+          key: ${{ steps.nuget-cache.outputs.cache-primary-key }}
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         with:
           driver: docker-container
@@ -72,8 +81,8 @@ jobs:
           platforms: linux/amd64
           push: false
           tags: ts-reviewer-tooling-check
+          # Read-only here; the main-only image job below writes this scope.
           cache-from: type=gha,scope=tooling
-          cache-to: type=gha,mode=max,scope=tooling
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: checked-${{ github.sha }}
