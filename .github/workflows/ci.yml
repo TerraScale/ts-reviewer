@@ -7,7 +7,7 @@ on:
         description: Exact trusted main commit requested by the maintainer command
         required: true
         type: string
-  # Docs-only PRs run nothing; every main push still publishes its per-SHA image.
+  # Docs-only PRs run nothing; every main push runs CI.
   pull_request:
     paths-ignore: ['**.md', 'docs/**', 'LICENSE', '.github/workflows/codeql.yml', '.github/dependabot.yml']
   push:
@@ -16,7 +16,7 @@ on:
 permissions:
   contents: read
 
-# A newer run for the same PR or branch, main included, cancels the older one; the image is tagged per SHA, so the newest main publishes its own.
+# A newer run for the same PR or branch, main included, cancels the older one.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'merge_group' && github.run_id || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -24,8 +24,7 @@ concurrency:
 env:
   CI: true # Standard .NET/Actions CI detection, required by the local-priority rule.
 
-# Runtime deployment is owned by ts-orch on OCI.
-# One job: main pushes publish the image from the same checked publish directory, with no artifact hop or second runner.
+# CI validates the application without runtime deployment or image publication.
 jobs:
   checks:
     name: Check and build ts-reviewer
@@ -33,7 +32,6 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
-      packages: write # Used only by the main-push login below; no step hands the token to PR code.
     steps:
       - name: Verify the requested trusted commit before running CI
         if: github.event_name == 'workflow_dispatch'
@@ -59,15 +57,13 @@ jobs:
         run: |
           dotnet run --project tests/TerraScale.Reviewer.Tests -c Release
           dotnet run scripts/check-nuget-vulnerabilities.tests.cs
-          dotnet run scripts/provision-reviewer-secrets.tests.cs
       - name: Audit all dependencies
         run: |
           dotnet run scripts/check-nuget-vulnerabilities.cs \
             src/TerraScale.Reviewer/TerraScale.Reviewer.csproj \
             tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj \
             tests/TerraScale.Reviewer.LeaseCrashChild/TerraScale.Reviewer.LeaseCrashChild.csproj \
-            scripts/check-nuget-vulnerabilities.tests.cs \
-            scripts/provision-reviewer-secrets.tests.cs
+            scripts/check-nuget-vulnerabilities.tests.cs
       - name: Publish the checked application
         run: dotnet publish src/TerraScale.Reviewer -c Release -r linux-arm64 --self-contained true -o artifacts/ci/reviewer -p:SourceRevisionId="$GITHUB_SHA"
       - name: Save NuGet packages cache
@@ -80,7 +76,6 @@ jobs:
         with:
           driver: docker-container
       - name: Verify pinned OCR tooling without model calls
-        if: github.event_name != 'push'
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
@@ -88,37 +83,10 @@ jobs:
           platforms: linux/arm64
           push: false
           tags: ts-reviewer-tooling-check
-          # Read-only here; main pushes write this scope.
+          # Reuse the existing tooling cache without publishing new images.
           cache-from: type=gha,scope=tooling
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        if: github.event_name == 'push'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Publish native tooling base
-        if: github.event_name == 'push'
-        id: tooling
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          file: Containerfile
-          platforms: linux/arm64
-          provenance: false # SDK base-image reader expects one image manifest, not an attestation index.
-          push: true
-          tags: ghcr.io/terrascale/ts-reviewer:tooling-${{ github.sha }}
-          cache-from: type=gha,scope=tooling
-          cache-to: type=gha,mode=max,scope=tooling
-      - name: PublishContainer directly from the checked publish directory
-        if: github.event_name == 'push'
-        env:
-          TOOLING_DIGEST: ${{ steps.tooling.outputs.digest }}
-        run: |
-          # PublishRepositoryUrl is required by the SDK to emit the exact OCI commit label.
-          dotnet msbuild src/TerraScale.Reviewer/TerraScale.Reviewer.csproj /t:PublishContainer \
-            -p:Configuration=Release -p:RuntimeIdentifier=linux-arm64 -p:SelfContained=true \
-            -p:PublishDir="$GITHUB_WORKSPACE/artifacts/ci/reviewer/" \
-            -p:PublishRepositoryUrl=true -p:RepositoryUrl=https://github.com/TerraScale/ts-reviewer \
-            -p:ContainerBaseImage="ghcr.io/terrascale/ts-reviewer@$TOOLING_DIGEST" \
-            -p:ContainerRegistry=ghcr.io -p:ContainerRepository=terrascale/ts-reviewer \
-            -p:ContainerImageTag="$GITHUB_SHA" -p:SourceRevisionId="$GITHUB_SHA"
+          name: checked-${{ github.sha }}
+          if-no-files-found: error
+          path: artifacts/ci/reviewer/

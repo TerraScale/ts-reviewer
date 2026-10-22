@@ -7,10 +7,8 @@ Every finding, regardless of severity, produces `REQUEST_CHANGES` and a failed `
 ## GitHub setup on your PC
 
 1. [Open the prefilled TerraScale GitHub App registration](https://github.com/organizations/TerraScale/settings/apps/new?name=TerraScale%20TS%20Reviewer&url=https%3A%2F%2Fgithub.com%2FTerraScale%2Fts-reviewer&public=false&webhook_active=true&webhook_url=https%3A%2F%2Fts-reviewer.mariogk.com%2Fwebhook&contents=read&metadata=read&issues=write&pull_requests=write&statuses=write&events%5B%5D=pull_request&events%5B%5D=issue_comment&events%5B%5D=push). Register for TerraScale only. Contents and Metadata are read-only; Pull requests, Issues, and Commit statuses need write access. Actions: write is used only by explicit trusted CI commands. Administration and Checks permissions are unnecessary. The current App already has Actions: write.
-2. Subscribe to `pull_request`, `issue_comment`, and `push`. After the secure handoff is authorized, the [setup utility](scripts/provision-reviewer-secrets.cs) configures the webhook URL `https://ts-reviewer.mariogk.com/webhook` and HMAC directly from OpenBao through the App-authenticated GitHub API. Never put credentials in links, chat, Git, command arguments, or Actions PR jobs.
-3. [Install the App](https://github.com/organizations/TerraScale/settings/installations) on selected repositories, initially **TerraScale/ts-reviewer**. The App installation is the repository allowlist; fixed TerraScale ownership is checked separately. Its ID and App ID are setup identities, not feature switches.
-4. Generate the App private key in GitHub and store it directly in `TS_REVIEWER_GITHUB_PRIVATE_KEY_PEM`. The setup utility fills the App ID, installation ID, bot login, and PEM path. The PEM must be mounted read-only; the private key is never passed to OCR.
-5. Use the [OCI workload handoff](docs/oci-workload-handoff.md) for ts-orch deployment on `ts-gru-1`, with GHCR images and OCI Vault instance-principal secret delivery. Activation requires GLM 5.3, then GLM 5.3 Flash only; the current Anthropic implementation must be replaced first.
+2. [Install the App](https://github.com/organizations/TerraScale/settings/installations) on selected repositories, initially **TerraScale/ts-reviewer**. The App installation is the repository allowlist; fixed TerraScale ownership is checked separately. Its ID and App ID are setup identities, not feature switches.
+3. Generate the App private key in GitHub and store it directly in `TS_REVIEWER_GITHUB_PRIVATE_KEY_PEM`. The PEM must be mounted read-only; the private key is never passed to OCR.
 
 Verified setup identities (2026-10-11): App **5279339**, installation **170416009**, bot **`terrascale-ts-reviewer[bot]`**. The installation currently covers every TerraScale repository; repository-specific tokens still prevent cross-repository access.
 
@@ -18,7 +16,7 @@ GitHub REST calls use short-lived, repository-scoped installation tokens minted 
 
 ## Secure runtime configuration
 
-Production secrets must be created and delivered automatically through OCI Vault by ts-orch using instance principal. Vendor-issued keys are stored once in Vault. Never copy secret values into workflow YAML, Git, chat or command arguments. The existing OpenBao provisioning utility is not the OCI deployment path.
+Never copy secret values into workflow YAML, Git, chat or command arguments. Runtime deployment is outside the current maintenance scope.
 
 
 
@@ -102,10 +100,9 @@ Run on the dev host:
 ```sh
 nice -n 19 dotnet run --project tests/TerraScale.Reviewer.Tests
 nice -n 19 dotnet run scripts/check-nuget-vulnerabilities.tests.cs
-nice -n 19 dotnet run scripts/provision-reviewer-secrets.tests.cs
 ```
 
 TUnit fixtures exercise GitHub App auth, signatures/events, repository boundaries, rechecks/replays, cancelled/stale heads, publication, and partial clones. The pinned OCR binary also runs against a mock Anthropic server to verify tool results, signed thinking replay, and untrusted rules. No live paid calls are needed.
 
 
-[GitHub CI](.github/workflows/ci.yml) runs checks on native ARM64 GitHub-hosted runners. PR jobs have no deployment credentials and do not publish images. Trusted main pushes publish the exact checked application through .NET SDK `PublishContainer` with a full commit tag and OCI revision label. The orchestrator lane owns runtime deployment and routing on OCI.
+[GitHub CI](.github/workflows/ci.yml) runs checks on native ARM64 GitHub-hosted runners. PR jobs have no deployment credentials and do not publish images. CI retains the checked application artifact. Runtime deployment and container image publication are retired.
