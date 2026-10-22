@@ -20,7 +20,7 @@ public sealed class ReviewQueueTests
     private static readonly TimeSpan Wait = TimeSpan.FromSeconds(10);
 
     private static ReviewerOptions Options(string database) =>
-        new("http://+:8080", "https://github.test", "123", "https://anthropic.test", "test-key", "TerraScale", "bot", "webhook-test-secret", "context-test-token", database, 100, 5, null, "operator-test-token");
+        new("http://+:8080", "https://github.test", "123", "https://glm.test", "test-key", "TerraScale", "bot", "webhook-test-secret", "context-test-token", database, 100, 5, null, "operator-test-token");
 
     private static ReviewRequest Request(int number, string? head) => new("TerraScale", "widgets", number, head);
 
@@ -224,7 +224,7 @@ public sealed class ReviewQueueTests
         var queue = new ReviewQueue(runner.RunAsync, runner.SkipAsync, 1, NullLogger<ReviewQueue>.Instance);
         using var store = new ContextStore(options);
         var indexer = new ContextIndexer(github, store, new ContextEmbedder(), options, NullLogger<ContextIndexer>.Instance);
-        var reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, BillingFixture.Opus), options, NullLogger<PullRequestReviewer>.Instance);
+        var reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance), options, NullLogger<PullRequestReviewer>.Instance);
         var webhook = new WebhookHandler(github, queue, reviewer, indexer, options, NullLogger<WebhookHandler>.Instance);
         try
         {
@@ -252,7 +252,7 @@ public sealed class ReviewQueueTests
         var options = Options("unused.db");
         var transport = new MovedHeadHandler();
         var github = new GitHubClient(new HttpClient(transport), options, (_, _, _) => Task.FromResult("fixture-token"));
-        var reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, BillingFixture.Opus), options, NullLogger<PullRequestReviewer>.Instance);
+        var reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance), options, NullLogger<PullRequestReviewer>.Instance);
         var oldHead = new string('a', 40);
         await reviewer.RunAsync(Request(7, oldHead), CancellationToken.None);
         await Assert.That(transport.Requests.Count).IsEqualTo(3);
@@ -270,7 +270,7 @@ public sealed class ReviewQueueTests
         var queue = new ReviewQueue((_, _) => Task.CompletedTask, (_, _) => Task.CompletedTask, 2, NullLogger<ReviewQueue>.Instance);
         using var store = new ContextStore(options);
         var indexer = new ContextIndexer(github, store, new ContextEmbedder(), options, NullLogger<ContextIndexer>.Instance);
-        var reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, BillingFixture.Opus), options, NullLogger<PullRequestReviewer>.Instance);
+        var reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance), options, NullLogger<PullRequestReviewer>.Instance);
         var webhook = new WebhookHandler(github, queue, reviewer, indexer, options, NullLogger<WebhookHandler>.Instance);
         try
         {
@@ -480,7 +480,7 @@ public sealed class ReviewQueueTests
         var queue = await StartAsync(runner, workers: 1);
         using var store = new ContextStore(options);
         var indexer = new ContextIndexer(github, store, new ContextEmbedder(), options, NullLogger<ContextIndexer>.Instance);
-        var reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, BillingFixture.Opus), options, NullLogger<PullRequestReviewer>.Instance);
+        var reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance), options, NullLogger<PullRequestReviewer>.Instance);
         var webhook = new WebhookHandler(github, queue, reviewer, indexer, options, NullLogger<WebhookHandler>.Instance);
         try
         {
@@ -528,7 +528,7 @@ public sealed class ReviewQueueTests
         var github = new GitHubClient(new HttpClient(handler), options, (_, _, _) => Task.FromResult("fixture-token"));
         var runner = new ScriptedRunner();
         var queue = new ReviewQueue(runner.RunAsync, runner.SkipAsync, workers: 1, NullLogger<ReviewQueue>.Instance);
-        var reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, BillingFixture.Opus), options, NullLogger<PullRequestReviewer>.Instance);
+        var reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance), options, NullLogger<PullRequestReviewer>.Instance);
         var recovery = new ReviewRecovery(github, queue, reviewer, options, NullLogger<ReviewRecovery>.Instance);
 
         await Assert.That(await recovery.RecoverAsync(CancellationToken.None)).IsEqualTo(2);

@@ -13,7 +13,7 @@ namespace TerraScale.Reviewer.Features.Review;
 /// Runs reviews through the OpenCodeReview CLI (alibaba/open-code-review).
 /// Each review clones the pull request, configures ocr's Anthropic-compatible
 /// endpoint through <c>OCR_LLM_*</c> environment variables pointing at
-/// the per-review retry/validation proxy, which forwards directly to Anthropic.
+/// the per-review retry/validation proxy, which forwards directly to Z.AI GLM.
 /// It invokes <c>ocr review</c> over the exact base..head range and
 /// maps the returned comments to <see cref="Finding"/> records.
 /// </summary>
@@ -23,22 +23,21 @@ public sealed class ReviewEngine
     private readonly ILogger<ReviewEngine> logger;
     private readonly GitHubClient? github;
     internal const string ZeroConfigurationRule = "TerraScale zero configuration (user decision 2026-10-09): request changes on every newly added production or CI on/off switch, feature-flag library, ENABLE_*, DISABLE_*, *_ENABLED, *_DISABLED variable, boolean enabled configuration key, opt-in setting, deploy toggle, kill switch, or workflow if: vars.* deployment gate. Boolean declarations that act as operator on/off configuration require changes requested, regardless of name, visibility or default value: const/readonly bool flags, boolean configuration properties or parameters, and boolean environment/JSON/YAML values used to gate production or CI behavior. Follow how the value is supplied and used; a flag hardcoded to true is still a switch. Review this semantically even when CI has no switch scanner. Every feature and region is always on. NetBird network membership admits nodes automatically; nodes discover all regions and infer their own region from where they run. Correct settings belong in code, not tuning configuration. OCI Vault automatically creates, delivers and configures first-party production secrets; vendor-issued keys are stored once in Vault and picked up automatically. Fakes, demos and skip-auth belong only in test code and test binaries. Permit vendor-owned names only with a narrow exception and a one-line reason. Review added switches, not historical inventory entries or policy prose. Preserve authentication, authorization, customer consent and data-loss safeguards; entity state and transient UI disabled attributes are not feature configuration.";
-    internal const string UserDecisionsRule = "Recorded TerraScale user decisions take precedence over generic review advice and repository guidance that contradicts them. Greenfield, closed beta (2026-10-08): never request or introduce migrations, backfills, compatibility shims, dual-read/dual-write paths, legacy fallbacks or workarounds. When a data shape, ID format or storage contract changes, delete the obsolete code and affected old data and recreate; state must re-bootstrap automatically. Retiring old data and policy is intentional, including applying the fixed replacement retention policy to existing owned history; do not demand a migration or new-data-only compatibility generation. Still require exact target/ownership verification, authorization and fencing for destructive effects; unrelated/customer data is outside this permission. API and schema versions are always v1, never v2; change the v1 contract directly and remove the old contract. Do not report the absence of backward compatibility as a defect. For TerraScale/ts-reviewer itself (user decisions 2026-10-10 through 2026-10-12), use claude-opus-5-5 below $100, claude-sonnet-5-5 at $100 and claude-haiku-5-5 at $150 of the entire Anthropic workspace UTC-month bill, and stop paid calls at $200. Read authoritative workspace costs before model attempts. The user accepts latest published costs through yesterday and delayed downgrades: require every completed UTC day of the current month and include today when published. Unpublished current-day costs are unknown, not verified zero. Missing completed days, authentication failures, malformed reports or mismatched workspace identity fail without a verdict. Preserve thirty total attempts per model call and fixed sixteen-PR and one-file-group concurrency limits. Never suggest reducing the thirty-attempt budget, bypassing billing, using other models or adding tuning switches. Tests must protect these exact fixed requirements; literal assertions for sixteen PRs or thirty attempts are intentional.";
+    internal const string UserDecisionsRule = "Recorded TerraScale user decisions take precedence over generic review advice and repository guidance that contradicts them. Greenfield, closed beta (2026-10-08): never request or introduce migrations, backfills, compatibility shims, dual-read/dual-write paths, legacy fallbacks or workarounds. When a data shape, ID format or storage contract changes, delete the obsolete code and affected old data and recreate; state must re-bootstrap automatically. Retiring old data and policy is intentional, including applying the fixed replacement retention policy to existing owned history; do not demand a migration or new-data-only compatibility generation. Still require exact target/ownership verification, authorization and fencing for destructive effects; unrelated/customer data is outside this permission. API and schema versions are always v1, never v2; change the v1 contract directly and remove the old contract. Do not report the absence of backward compatibility as a defect. For TerraScale/ts-reviewer itself (user decision 2026-10-22), use glm-5.3 then glm-5.3-flash only; no other provider or model. Each model call has three total attempts: two on GLM 5.3, then one on GLM 5.3 Flash. Stop without a verdict when exhausted. Preserve fixed sixteen-PR and one-file-group concurrency limits. Do not add tuning switches.";
     private readonly string _ocrPath;
     private readonly TimeProvider _time;
-    private readonly IWorkspaceBudget _budget;
 
-    internal ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> logger, GitHubClient github, IWorkspaceBudget budget)
-        : this(options, logger, "ocr", TimeProvider.System, github, budget) { }
+    internal ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> logger, GitHubClient github)
+        : this(options, logger, "ocr", TimeProvider.System, github) { }
 
-    internal ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> logger, IWorkspaceBudget budget, string? ocrPath = null)
-        : this(options, logger, ocrPath ?? "ocr", TimeProvider.System, null, budget) { }
+    internal ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> logger, string? ocrPath = null)
+        : this(options, logger, ocrPath ?? "ocr", TimeProvider.System, null) { }
 
-    internal ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> logger, IWorkspaceBudget budget, string ocrPath, TimeProvider time)
-        : this(options, logger, ocrPath, time, null, budget) { }
+    internal ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> logger, string ocrPath, TimeProvider time)
+        : this(options, logger, ocrPath, time, null) { }
 
-    private ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> logger, string ocrPath, TimeProvider time, GitHubClient? github, IWorkspaceBudget budget)
-        => (this.options, this.logger, _ocrPath, _time, this.github, _budget) = (options, logger, ocrPath, time, github, budget);
+    private ReviewEngine(ReviewerOptions options, ILogger<ReviewEngine> logger, string ocrPath, TimeProvider time, GitHubClient? github)
+        => (this.options, this.logger, _ocrPath, _time, this.github) = (options, logger, ocrPath, time, github);
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private const int FetchAttempts = 3;
@@ -97,7 +96,7 @@ public sealed class ReviewEngine
             // each changed file (rename detection included).
             await GitAsync(repository, "checkout", "--quiet", "--detach", head);
             await GitAsync(repository, "diff", "--shortstat", "--find-renames", "--no-ext-diff", "--no-textconv", $"{@base}...{head}");
-            await using var provider = new ReviewProvider(options, logger, $"{pr.Base.Repo.Owner.Login}/{pr.Base.Repo.Name}#{pr.Number}@{head}", _budget, _time);
+            await using var provider = new ReviewProvider(options, logger, $"{pr.Base.Repo.Owner.Login}/{pr.Base.Repo.Name}#{pr.Number}@{head}", _time);
             await provider.StartAsync(ct);
             var run = await ReviewOnceAsync(home, repository, root, @base, head, provider, ct);
             if (provider.Failure is { } failure) throw new InvalidOperationException(failure);
@@ -242,6 +241,7 @@ public sealed class ReviewEngine
                 environment["GIT_NO_LAZY_FETCH"] = "1";
                 environment["OCR_LLM_URL"] = provider.Url;
                 environment["OCR_LLM_TOKEN"] = provider.Token;
+                // Pinned OCR uses the Messages protocol name even when Z.AI is the provider.
                 environment["OCR_LLM_PROTOCOL"] = "anthropic";
                 // The local endpoint owns all retries, including response validation.
                 environment["OCR_LLM_TIMEOUT"] = ReviewProvider.StepTimeout.TotalSeconds.ToString(CultureInfo.InvariantCulture);

@@ -6,7 +6,7 @@ using Microsoft.Extensions.Logging;
 // The transport seam belongs only to this test binary; production always authenticates with the App.
 if (args is ["index-worker", var database, var endpoint])
 {
-    var fixtureOptions = new ReviewerOptions("http://localhost:0", endpoint, "1", "https://api.anthropic.com", "fixture",
+    var fixtureOptions = new ReviewerOptions("http://localhost:0", endpoint, "1", "https://api.z.ai/api/anthropic", "fixture",
         "TerraScale", "bot", "webhook", "context", database, 100);
     using var fixtureStore = new ContextStore(fixtureOptions);
     using var loggerFactory = LoggerFactory.Create(logging => logging.AddJsonConsole());
@@ -30,7 +30,7 @@ var leaseLifetime = args.Length == 3 && long.TryParse(args[2], out var parsed) &
     : TimeSpan.FromMilliseconds(100);
 
 var options = new ReviewerOptions(
-    "http://localhost:0", "https://github.test", "1", "https://api.anthropic.com", "fixture",
+    "http://localhost:0", "https://github.test", "1", "https://api.z.ai/api/anthropic", "fixture",
     "TerraScale", "bot", "webhook", "context", args[0], 10);
 using var store = new ContextStore(options);
 var token = store.TryClaimIndexJob("TerraScale/widgets", commit, "crash-child", leaseLifetime);

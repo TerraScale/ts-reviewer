@@ -62,7 +62,7 @@ public sealed class ContextArchiveTests
         finally { await indexer.StopAsync(CancellationToken.None); File.Delete(database); }
     }
     private static ReviewerOptions Options(string database) => new("http://localhost:0", "https://github.test", "1",
-        "https://api.anthropic.com", "fixture", "TerraScale", "bot", "webhook", "context", database, 20_000);
+        "https://glm.test", "fixture", "TerraScale", "bot", "webhook", "context", database, 20_000);
     private static GitHubClient Client(HttpMessageHandler transport, ReviewerOptions options) =>
         new(new HttpClient(transport), options, (_, _, _) => Task.FromResult("installation-test-token"));
     private sealed class ArchiveTransport(byte[] archive) : HttpMessageHandler

@@ -13,11 +13,11 @@ using TUnit.Core;
 public sealed class AuthenticationTests
 {
     private static ReviewerOptions Options => new("http://+:8080", "https://github.test", "123",
-        "https://anthropic.test", "anthropic-test-key", "TerraScale", "bot",
+        "https://glm.test", "glm-test-key", "TerraScale", "bot",
         "webhook-test-secret", "context-test-token", "unused", 100);
-    private static readonly string[] SecretKeys = ["webhook-secret", "context-api-token", "operator-token"];
+    private static readonly string[] SecretKeys = ["glm-api-key", "webhook-secret", "context-api-token", "operator-token"];
     private static readonly string[] Credentials = ["--github-app-id=123", "--github-installation-id=456", "--github-private-key-path=unused",
-        "--anthropic-api-key=anthropic-test-key", "--anthropic-admin-api-key=billing-test-key", "--anthropic-workspace-id=wrkspc_test", "--bot-login=bot", "--operator-token=operator-test-token",
+        "--glm-api-key=glm-test-key", "--bot-login=bot", "--operator-token=operator-test-token",
         "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token"];
 
     [Test]
@@ -25,8 +25,7 @@ public sealed class AuthenticationTests
     [Arguments("webhook-secret", "   ")]
     [Arguments("context-api-token", "")]
     [Arguments("context-api-token", "   ")]
-    [Arguments("anthropic-admin-api-key", "")]
-    [Arguments("anthropic-workspace-id", "")]
+    [Arguments("glm-api-key", "")]
     [Arguments("operator-token", "")]
     public async Task ConfigurationRejectsMissingInboundCredentials(string key, string value)
     {
@@ -57,8 +56,9 @@ public sealed class AuthenticationTests
         args.Add("--config=" + fixture.ConfigPath);
         if (source == "arguments") args.AddRange(SecretKeys.Select(key => "--" + key + "-file=" + fixture.SecretPath));
         var options = ReviewerOptions.Load([.. args]);
-        foreach (var value in new[] { options.WebhookSecret, options.ContextApiToken, options.OperatorToken })
+        foreach (var value in new[] { options.GlmApiKey, options.WebhookSecret, options.ContextApiToken, options.OperatorToken })
             await Assert.That(value).IsEqualTo(" synthetic\ncontent ");
+        await Assert.That(options.GlmUrl).IsEqualTo("https://api.z.ai/api/anthropic");
     }
 
     [Test]
@@ -73,13 +73,13 @@ public sealed class AuthenticationTests
         else File.WriteAllText(fixture.SecretPath, content);
         var path = content == "directory" ? Path.GetTempPath() : fixture.SecretPath;
         string? error = null;
-        try { ReviewerOptions.Load([.. Credentials.Where(arg => !arg.StartsWith("--webhook-secret=", StringComparison.Ordinal)), "--webhook-secret-file=" + path]); }
+        try { ReviewerOptions.Load([.. Credentials.Where(arg => !arg.StartsWith("--glm-api-key=", StringComparison.Ordinal)), "--glm-api-key-file=" + path]); }
         catch (InvalidOperationException exception)
         {
             error = exception.Message;
             await Assert.That(exception.InnerException).IsNull();
         }
-        await Assert.That(error).IsEqualTo("webhook-secret-file must name a readable file containing a nonblank secret");
+        await Assert.That(error).IsEqualTo("glm-api-key-file must name a readable file containing a nonblank secret");
     }
 
     [Test]
@@ -112,16 +112,18 @@ public sealed class AuthenticationTests
     }
 
     [Test]
-    [Arguments("default")]
-    [Arguments("wrkspc_")]
-    [Arguments("incorrect")]
-    [Arguments("wrkspc_bad/id")]
-    public async Task ConfigurationRequiresRealWorkspaceIdentityIncludingDefault(string workspace)
+    [Arguments("anthropic-api-key")]
+    [Arguments("anthropic-admin-api-key")]
+    [Arguments("anthropic-workspace-id")]
+    [Arguments("anthropic-url")]
+    public async Task ConfigurationRejectsRetiredAnthropicKeysFromEverySource(string key)
     {
-        await Assert.That(() => ReviewerOptions.Load(["--github-app-id=123", "--github-installation-id=456", "--github-private-key-path=unused",
-            "--anthropic-api-key=anthropic-test-key", "--anthropic-admin-api-key=billing-test-key", "--anthropic-workspace-id=" + workspace,
-            "--bot-login=bot", "--operator-token=operator-test-token", "--webhook-secret=webhook-test-secret", "--context-api-token=context-test-token"]))
-            .Throws<InvalidOperationException>();
+        using var fixture = new ConfigurationFixture();
+        await Assert.That(() => ReviewerOptions.Load([.. Credentials, "--" + key + "=retired"])).Throws<InvalidOperationException>();
+        File.WriteAllText(fixture.ConfigPath, JsonSerializer.Serialize(new Dictionary<string, string> { [key] = "retired" }));
+        await Assert.That(() => ReviewerOptions.Load([.. Credentials, "--config=" + fixture.ConfigPath])).Throws<InvalidOperationException>();
+        Environment.SetEnvironmentVariable(EnvironmentName(key), "retired");
+        await Assert.That(() => ReviewerOptions.Load(Credentials)).Throws<InvalidOperationException>();
     }
 
     private static string EnvironmentName(string key) => "TS_REVIEWER_" + key.Replace('-', '_').ToUpperInvariant();

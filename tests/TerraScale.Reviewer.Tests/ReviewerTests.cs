@@ -19,7 +19,7 @@ public sealed class ReviewerTests
     private static readonly ContextEmbedder Embedder = new();
 
     private static ReviewerOptions Options(string database) =>
-        new("http://+:8080", "https://github.test", "github", "https://proxy.test/v1", "proxy", "TerraScale", "bot", "webhook-test-secret", "context-test-token", database, 100, 5, null, "operator-test-token");
+        new("http://+:8080", "https://github.test", "github", "https://glm.test", "glm-test-key", "TerraScale", "bot", "webhook-test-secret", "context-test-token", database, 100, 5, null, "operator-test-token");
 
     private static float[] UnitVector(int index)
     {
@@ -63,7 +63,7 @@ public sealed class ReviewerTests
         await Assert.That(UnifiedDiff.ReviewPosition(files[0].Patch, 2)).IsGreaterThan(0);
     }
 
-    private static readonly string[] Credentials = ["--github-app-id=1", "--github-installation-id=2", "--github-private-key-path=unused.pem", "--anthropic-api-key=anthropic-test-key", "--anthropic-admin-api-key=billing-test-key", "--anthropic-workspace-id=wrkspc_test", "--bot-login=bot", "--webhook-secret=secret", "--context-api-token=context", "--operator-token=operator"];
+    private static readonly string[] Credentials = ["--github-app-id=1", "--github-installation-id=2", "--github-private-key-path=unused.pem", "--glm-api-key=glm-test-key", "--bot-login=bot", "--webhook-secret=secret", "--context-api-token=context", "--operator-token=operator"];
 
     [Test]
     public async Task UnifiedDiffDoesNotReadChangedContentAsFileHeaders()
@@ -108,7 +108,7 @@ public sealed class ReviewerTests
                 await Assert.That(rejected).IsTrue();
             }
             var options = ReviewerOptions.Load(Credentials);
-            await Assert.That(options.AnthropicUrl).IsEqualTo("https://api.anthropic.com");
+            await Assert.That(options.GlmUrl).IsEqualTo("https://api.z.ai/api/anthropic");
         }
         finally { foreach (var (name, value) in previous) Environment.SetEnvironmentVariable(name, value); }
     }
@@ -221,8 +221,8 @@ public sealed class ReviewerTests
         await Assert.That(formatted.Contains("<summary>Suggested fix</summary>")).IsTrue();
         await Assert.That(formatted.Contains("model")).IsFalse();
 
-        var withModel = PullRequestReviewer.Format(pullRequest, new ReviewResult("ignored", [finding]), "claude-opus-5-5");
-        await Assert.That(withModel.Contains("model `claude-opus-5-5`")).IsTrue();
+        var withModel = PullRequestReviewer.Format(pullRequest, new ReviewResult("ignored", [finding]), "glm-5.3");
+        await Assert.That(withModel.Contains("model `glm-5.3`")).IsTrue();
     }
 
     [Test]
@@ -303,7 +303,7 @@ public sealed class ReviewerTests
             await RunChmodAsync(Path.Combine(stub, "ocr"));
 
             var options = Options(database) with { GitHubUrl = root };
-            var engine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, BillingFixture.Opus, Path.Combine(stub, "ocr"));
+            var engine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, Path.Combine(stub, "ocr"));
             var repository = new Repository(new Owner("TerraScale"), "widgets");
             var pullRequest = new PullRequest(9, "Test change", "", new Branch(baseSha, "main", repository),
                 new Branch(headSha, "feature", fork ? new Repository(new Owner("untrusted-outsider"), "fork") : repository));
@@ -340,13 +340,15 @@ public sealed class ReviewerTests
             await Assert.That(recorded.Contains("--format json")).IsTrue();
             await Assert.That(recorded.Contains("--background " + ReviewEngine.UserDecisionsRule + " " + ReviewEngine.ZeroConfigurationRule)).IsTrue();
             await Assert.That(recorded.Contains("Boolean declarations that act as operator on/off configuration require changes requested")).IsTrue();
-            await Assert.That(recorded.Contains("Never suggest reducing the thirty-attempt budget")).IsTrue();
             await Assert.That(recorded.Contains("fixed sixteen-PR and one-file-group concurrency limits")).IsTrue();
+            await Assert.That(ReviewEngine.UserDecisionsRule.Contains("use glm-5.3 then glm-5.3-flash only; no other provider or model", StringComparison.Ordinal)).IsTrue();
+            await Assert.That(ReviewEngine.UserDecisionsRule.Contains("three total attempts: two on GLM 5.3, then one on GLM 5.3 Flash", StringComparison.Ordinal)).IsTrue();
+            await Assert.That(recorded.Contains("claude-", StringComparison.Ordinal)).IsFalse();
             await Assert.That(recorded.Contains("entity state and transient UI disabled attributes are not feature configuration")).IsTrue();
             await Assert.That(recorded.Contains("--concurrency 1")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_URL=http://127.0.0.1:")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_TOKEN=")).IsTrue();
-            await Assert.That(recorded.Contains("--model claude-opus-5-5 ")).IsTrue();
+            await Assert.That(recorded.Contains("--model glm-5.3 ")).IsTrue();
             await Assert.That(recorded.Contains("OCR_LLM_MODEL")).IsFalse();
             await Assert.That(recorded.Contains("OCR_LLM_PROTOCOL=anthropic")).IsTrue();
             await Assert.That(recorded.Contains("--timeout 0 ")).IsTrue();
@@ -401,7 +403,7 @@ public sealed class ReviewerTests
                 await Assert.That(publishedReview.GetProperty("comments")[0].GetProperty("line").GetInt32()).IsGreaterThan(0);
                 // Exhausted OCR failures must resolve the pending head with a clear error.
                 await File.WriteAllTextAsync(Path.Combine(stub, "ocr"), "#!/bin/sh\necho 'Error: model context exhausted' >&2\nexit 1\n");
-                var failingEngine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, BillingFixture.Opus, Path.Combine(stub, "ocr"));
+                var failingEngine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, Path.Combine(stub, "ocr"));
                 var failedTransport = new ReviewPublicationHandler(pullRequest);
                 using var failedHttp = new HttpClient(failedTransport);
                 var reviewer = new PullRequestReviewer(new GitHubClient(failedHttp, apiOptions, (_, _, _) => Task.FromResult("installation-test-token")), failingEngine, apiOptions, NullLogger<PullRequestReviewer>.Instance);
@@ -452,7 +454,7 @@ public sealed class ReviewerTests
             await RunChmodAsync(Path.Combine(stub, "ocr"));
 
             var options = Options(Path.Combine(root, "context.db")) with { GitHubUrl = root };
-            var engine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, BillingFixture.Opus, Path.Combine(stub, "ocr"));
+            var engine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, Path.Combine(stub, "ocr"));
             var repository = new Repository(new Owner("TerraScale"), "widgets");
             var pullRequest = new PullRequest(9, "Test change", "", new Branch(baseSha, "main", repository), new Branch(headSha, "feature", repository));
             var canceled = false;
@@ -707,7 +709,7 @@ public sealed class ReviewerTests
         var github = new GitHubClient(new HttpClient(handler), options, (_, _, _) => Task.FromResult("installation-test-token"));
         using var store = new ContextStore(options);
         var indexer = new ContextIndexer(github, store, Embedder, options, NullLogger<ContextIndexer>.Instance);
-        var engine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, BillingFixture.Opus);
+        var engine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance);
         var (webhookHandler, queue) = await StartWebhookAsync(github, engine, indexer, options);
         try
         {
@@ -744,7 +746,7 @@ public sealed class ReviewerTests
         var github = new GitHubClient(new HttpClient(handler), options, (_, _, _) => Task.FromResult("installation-test-token"));
         using var store = new ContextStore(options);
         var indexer = new ContextIndexer(github, store, Embedder, options, NullLogger<ContextIndexer>.Instance);
-        var engine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, BillingFixture.Opus);
+        var engine = new ReviewEngine(options, NullLogger<ReviewEngine>.Instance);
         var (webhookHandler, queue) = await StartWebhookAsync(github, engine, indexer, options);
 
         try

@@ -24,7 +24,9 @@ using TUnit.Core;
 public sealed class OcrRetryTests
 {
     [Test]
-    public async Task PinnedOcrCompletesReviewThroughLocalProvider()
+    [Arguments(false)]
+    [Arguments(true)]
+    public async Task PinnedOcrCompletesReviewThroughLocalProvider(bool signed)
     {
         if (!OperatingSystem.IsLinux() || RuntimeInformation.ProcessArchitecture != Architecture.Arm64)
             throw new TUnit.Core.Exceptions.SkipTestException("requires the production Linux ARM64 OCR binary");
@@ -46,8 +48,8 @@ public sealed class OcrRetryTests
         {
             using var document = await JsonDocument.ParseAsync(request.Body);
             var body = document.RootElement;
-            correctRequests &= request.Headers["x-api-key"] == "anthropic-test-key"
-                && request.Headers.Authorization.Count == 0
+            correctRequests &= request.Headers.Authorization == "Bearer glm-test-key"
+                && request.Headers["x-api-key"].Count == 0
                 && request.Headers["anthropic-version"] == "2023-06-01"
                 && body.GetProperty("model").GetString() == ReviewProvider.PrimaryModel
                 && (!body.TryGetProperty("stream", out var stream) || !stream.GetBoolean())
@@ -62,7 +64,8 @@ public sealed class OcrRetryTests
                         && content[2].TryGetProperty("id", out var id) && id.GetString() == "read_1")
                         preservedThinking |= content[0].GetProperty("type").GetString() == "thinking"
                             && content[0].GetProperty("thinking").GetString() == ""
-                            && content[0].GetProperty("signature").GetString() == "signed_1"
+                            && (signed ? content[0].GetProperty("signature").GetString() == "signed_1"
+                                : !content[0].TryGetProperty("signature", out var signature) || string.IsNullOrEmpty(signature.GetString()))
                             && content[1].GetProperty("type").GetString() == "redacted_thinking"
                             && content[1].GetProperty("data").GetString() == "redacted_1";
                     foreach (var block in content.EnumerateArray())
@@ -82,7 +85,8 @@ public sealed class OcrRetryTests
                 stop_reason = "tool_use",
                 usage = new { input_tokens = 10, output_tokens = 3 },
                 content = new object[] {
-                  new { type = "thinking", thinking = "", signature = "signed_" + calls },
+                  signed ? new { type = "thinking", thinking = "", signature = "signed_" + calls }
+                    : (object)new { type = "thinking", thinking = "" },
                   new { type = "redacted_thinking", data = "redacted_" + calls },
                   new {
                     type = "tool_use", id = first ? "read_1" : "done_" + calls,
@@ -380,10 +384,10 @@ public sealed class OcrRetryTests
             if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(_stub, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
 
-        public ReviewEngine Engine(string? ocrPath = null, string? anthropicUrl = null, TimeProvider? time = null) => new(new ReviewerOptions("http://+:8080", _githubUrl, "github-app",
-            anthropicUrl ?? "https://anthropic.test", "anthropic-test-key", "TerraScale", "bot",
+        public ReviewEngine Engine(string? ocrPath = null, string? glmUrl = null, TimeProvider? time = null) => new(new ReviewerOptions("http://+:8080", _githubUrl, "github-app",
+            glmUrl ?? "https://glm.test", "glm-test-key", "TerraScale", "bot",
             "webhook-test-secret", "context-test-token", Path.Combine(_root, "context.db"), 100),
-            NullLogger<ReviewEngine>.Instance, BillingFixture.Opus, ocrPath ?? _stub, time ?? TimeProvider.System);
+            NullLogger<ReviewEngine>.Instance, ocrPath ?? _stub, time ?? TimeProvider.System);
 
         public string Runs => _runs;
         public string OcrPath => _stub;

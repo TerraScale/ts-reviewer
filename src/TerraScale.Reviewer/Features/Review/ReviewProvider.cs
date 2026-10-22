@@ -10,9 +10,10 @@ namespace TerraScale.Reviewer.Features.Review;
 /// <summary>Owns the retry budget for each OCR model call, before OCR's SDK can retry it.</summary>
 internal sealed class ReviewProvider : IAsyncDisposable
 {
-    internal const string PrimaryModel = "claude-opus-5-5";
+    internal const string PrimaryModel = "glm-5.3";
     internal const int ModelOutputLimit = 128000;
-    internal const int MaxAttempts = 30;
+    internal const string FallbackModel = "glm-5.3-flash";
+    internal const int MaxAttempts = 3;
     internal static readonly TimeSpan AttemptTimeout = TimeSpan.FromMinutes(20);
     internal static readonly TimeSpan InactivityTimeout = TimeSpan.FromMinutes(20);
     // Leave SDK headroom beyond all attempts and worst-case retry waits.
@@ -23,7 +24,6 @@ internal sealed class ReviewProvider : IAsyncDisposable
     private readonly HttpClient _http;
     private readonly Func<TimeSpan, CancellationToken, Task> _delay;
     private readonly TimeProvider _time;
-    private readonly IWorkspaceBudget _budget;
     private readonly List<string> _models = [];
     private readonly SemaphoreSlim _serial = new(1);
     private CancellationTokenSource? _lifetime;
@@ -31,15 +31,14 @@ internal sealed class ReviewProvider : IAsyncDisposable
     private WebApplication? _app;
     private int _step;
 
-    public ReviewProvider(ReviewerOptions options, ILogger logger, string review, IWorkspaceBudget budget, TimeProvider? time = null)
-        : this(options, logger, review, budget, new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false }), Task.Delay, time) { }
+    public ReviewProvider(ReviewerOptions options, ILogger logger, string review, TimeProvider? time = null)
+        : this(options, logger, review, new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false }), Task.Delay, time) { }
 
-    internal ReviewProvider(ReviewerOptions options, ILogger logger, string review, IWorkspaceBudget budget, HttpClient http,
+    internal ReviewProvider(ReviewerOptions options, ILogger logger, string review, HttpClient http,
         Func<TimeSpan, CancellationToken, Task> delay, TimeProvider? time = null)
     {
         (_options, _logger, _review, _http, _delay) = (options, logger, review, http, delay);
         _time = time ?? TimeProvider.System;
-        _budget = budget;
         _http.Timeout = Timeout.InfiniteTimeSpan;
     }
 
@@ -52,7 +51,7 @@ internal sealed class ReviewProvider : IAsyncDisposable
 
     internal async Task StartAsync(CancellationToken ct)
     {
-        InitialModel = await _budget.SelectModelAsync(ct);
+        InitialModel = PrimaryModel;
         _inactivity = new CancellationTokenSource(InactivityTimeout, _time);
         _lifetime = CancellationTokenSource.CreateLinkedTokenSource(ct, _inactivity.Token);
         var builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions { Args = [], ApplicationName = typeof(ReviewProvider).Assembly.FullName });
@@ -123,24 +122,18 @@ internal sealed class ReviewProvider : IAsyncDisposable
             for (var attempt = 1; attempt <= MaxAttempts; attempt++)
             {
                 ct.ThrowIfCancellationRequested();
-                string model;
-                try { model = await _budget.SelectModelAsync(ct); }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-                catch
-                {
-                    Failure = "Anthropic workspace billing did not authorize this model call; review stopped without a verdict";
-                    throw new InvalidOperationException(Failure);
-                }
+                var model = attempt < MaxAttempts ? PrimaryModel : FallbackModel;
                 body["model"] = model;
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 timeout.CancelAfter(AttemptTimeout);
                 string? completed = null;
                 try
                 {
-                    var endpoint = _options.AnthropicUrl.TrimEnd('/');
+                    var endpoint = _options.GlmUrl.TrimEnd('/');
                     endpoint += endpoint.EndsWith("/v1", StringComparison.Ordinal) ? "/messages" : "/v1/messages";
                     using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
-                    request.Headers.Add("x-api-key", _options.AnthropicApiKey);
+                    request.Headers.Authorization = new("Bearer", _options.GlmApiKey);
+                    // OCR uses Messages; Z.AI requires the protocol version header for compatibility.
                     request.Headers.Add("anthropic-version", "2023-06-01");
                     request.Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
                     if (!_models.Contains(model)) _models.Add(model);
@@ -148,15 +141,6 @@ internal sealed class ReviewProvider : IAsyncDisposable
                     var json = await response.Content.ReadAsStringAsync(timeout.Token);
                     if (response.IsSuccessStatusCode)
                     {
-                        try
-                        {
-                            _budget.ConfirmWorkspace(response.Headers.TryGetValues("anthropic-workspace-id", out var workspace) ? string.Join(",", workspace) : null);
-                        }
-                        catch
-                        {
-                            Failure = "Anthropic response workspace identity missing or mismatched; review stopped without a verdict";
-                            throw new InvalidOperationException(Failure);
-                        }
                         try
                         {
                             ValidateResponse(json, model, body["tools"] as JsonArray);
@@ -168,7 +152,6 @@ internal sealed class ReviewProvider : IAsyncDisposable
                     }
                     else
                     {
-                        // User decision 2026-10-10: exhaust 30 attempts before reporting any upstream failure, including 401/403.
                         reason = $"HTTP {(int)response.StatusCode}: {ProviderError(json)}";
                     }
                 }
@@ -193,7 +176,7 @@ internal sealed class ReviewProvider : IAsyncDisposable
             }
             _logger.LogError("review {Review}; step {Step}; attempts {Attempts}; retries {Retries}; exhausted: {Reason}",
                 _review, step, MaxAttempts, MaxAttempts - 1, reason);
-            Failure = $"Claude review step {step} failed after {MaxAttempts} attempts: {reason}";
+            Failure = $"GLM review step {step} failed after {MaxAttempts} attempts: {reason}";
             throw new InvalidOperationException(Failure);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested && _lifetime is { IsCancellationRequested: false })
@@ -219,12 +202,12 @@ internal sealed class ReviewProvider : IAsyncDisposable
     private static void NormalizeRequest(JsonObject body)
     {
         body["stream"] = false;
-        // Use the common 5.5 tool contract without editing signed cross-model thinking history.
+        // Let GLM select its required thinking mode while preserving complete tool/thinking history.
         body.Remove("thinking");
         body.Remove("temperature");
         body.Remove("top_p");
         body.Remove("top_k");
-        // OCR's grouping call uses its 200k prompt limit as output; 5.5 models accept at most 128k output.
+        // OCR's grouping call uses its prompt limit as output; GLM accepts at most 128k output.
         if (body["max_tokens"]?.Deserialize<long>() > ModelOutputLimit) body["max_tokens"] = ModelOutputLimit;
         if (body["tools"] is JsonArray { Count: > 0 } tools)
         {
@@ -280,7 +263,7 @@ internal sealed class ReviewProvider : IAsyncDisposable
                     break;
                 case "thinking":
                     if (!block.TryGetProperty("thinking", out var thinking) || thinking.ValueKind != JsonValueKind.String
-                        || !block.TryGetProperty("signature", out var signature) || signature.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(signature.GetString()))
+                        || (block.TryGetProperty("signature", out var signature) && signature.ValueKind != JsonValueKind.String))
                         throw new InvalidOperationException("provider returned a malformed thinking block");
                     break;
                 case "redacted_thinking":

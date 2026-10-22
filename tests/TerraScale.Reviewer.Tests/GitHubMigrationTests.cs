@@ -18,7 +18,7 @@ public sealed class GitHubMigrationTests
 {
     private static readonly ContextEmbedder Embedder = new();
     private static ReviewerOptions Options(string database = "unused") => new("http://+:8080", "https://github.test", "123",
-        "https://anthropic.test", "test-key", "TerraScale", "reviewer[bot]", "webhook-test-secret", "context-test-token", database,
+        "https://glm.test", "test-key", "TerraScale", "reviewer[bot]", "webhook-test-secret", "context-test-token", database,
         100, 5, null, "operator-test-token", "456", "unused");
 
     [Test]
@@ -371,7 +371,7 @@ public sealed class GitHubMigrationTests
         var transport = new Transport(request => Task.FromResult(Json(request.RequestUri!.Query.EndsWith("&page=1", StringComparison.Ordinal)
             ? Enumerable.Repeat(spoofed, 100).ToArray() : new[] { owned })));
         var options = Options();
-        var reviewer = new PullRequestReviewer(Client(transport), new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, BillingFixture.Opus), options, NullLogger<PullRequestReviewer>.Instance);
+        var reviewer = new PullRequestReviewer(Client(transport), new ReviewEngine(options, NullLogger<ReviewEngine>.Instance), options, NullLogger<PullRequestReviewer>.Instance);
         var repo = new Repository(new Owner("TerraScale"), "widgets");
         var pull = new PullRequest(7, "title", "", new Branch(baseSha, "main", repo), new Branch(new string('a', 40), "head", repo));
         var status = await reviewer.LatestOwnedStatusAsync(pull, "TerraScale", "widgets", CancellationToken.None);
@@ -490,7 +490,7 @@ public sealed class GitHubMigrationTests
             var github = new GitHubClient(new HttpClient(Transport), options, tokenFactory ?? ((_, _, _) => Task.FromResult("fixture-installation-token")));
             _store = new ContextStore(options);
             var context = new ContextIndexer(github, _store, Embedder, options, NullLogger<ContextIndexer>.Instance);
-            Reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, BillingFixture.Opus), options, NullLogger<PullRequestReviewer>.Instance);
+            Reviewer = new PullRequestReviewer(github, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance), options, NullLogger<PullRequestReviewer>.Instance);
             Queue = realReviewer ? new ReviewQueue(Reviewer, NullLogger<ReviewQueue>.Instance)
                 : new ReviewQueue(runner ?? ((request, _) => { ReviewedHead.TrySetResult(request.HeadSha!); return Task.CompletedTask; }),
                     (_, _) => Task.CompletedTask, 1, NullLogger<ReviewQueue>.Instance);

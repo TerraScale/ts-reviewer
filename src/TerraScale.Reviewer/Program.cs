@@ -37,15 +37,8 @@ builder.Services.AddSingleton(options);
 builder.Services.AddHttpClient<GitHubClient>()
     .RemoveAllLoggers() // Archive redirects can contain temporary credentials in their query.
     .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler { AllowAutoRedirect = false });
-builder.Services.AddHttpClient("anthropic-billing")
-    .RemoveAllLoggers()
-    .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler { AllowAutoRedirect = false });
-builder.Services.AddSingleton(serviceProvider => new WorkspaceBudget(options,
-    serviceProvider.GetRequiredService<IHttpClientFactory>().CreateClient("anthropic-billing"),
-    serviceProvider.GetRequiredService<ContextStore>(), TimeProvider.System, serviceProvider.GetRequiredService<ILogger<WorkspaceBudget>>()));
 builder.Services.AddSingleton(serviceProvider => new ReviewEngine(options,
-    serviceProvider.GetRequiredService<ILogger<ReviewEngine>>(), serviceProvider.GetRequiredService<GitHubClient>(),
-    serviceProvider.GetRequiredService<WorkspaceBudget>()));
+    serviceProvider.GetRequiredService<ILogger<ReviewEngine>>(), serviceProvider.GetRequiredService<GitHubClient>()));
 builder.Services.AddSingleton<PullRequestReviewer>();
 builder.Services.AddSingleton<ReviewQueue>();
 builder.Services.AddHostedService(serviceProvider => serviceProvider.GetRequiredService<ReviewQueue>());
@@ -70,7 +63,7 @@ app.MapGet("/context/healthz", async (ContextStore store, CancellationToken canc
 app.MapGet("/admin/context/dead-letter", ContextEndpoints.DeadLetters);
 app.MapPost("/admin/context/dead-letter/replay", ContextEndpoints.ReplayDeadLetterAsync);
 app.Lifetime.ApplicationStarted.Register(() =>
-    app.Logger.LogInformation("ts-reviewer listening on {Address}; initial_model {Model}; workspace tiers $100 Sonnet/$150 Haiku/$200 stop; max_concurrent {MaxConcurrent}; file_groups 1; max_attempts {MaxAttempts}",
-        options.ListenUrl, ReviewProvider.PrimaryModel, ReviewQueue.WorkerCount, ReviewProvider.MaxAttempts));
+    app.Logger.LogInformation("ts-reviewer listening on {Address}; initial_model {Model}; fallback_model {Fallback}; max_concurrent {MaxConcurrent}; file_groups 1; max_attempts {MaxAttempts}",
+        options.ListenUrl, ReviewProvider.PrimaryModel, ReviewProvider.FallbackModel, ReviewQueue.WorkerCount, ReviewProvider.MaxAttempts));
 await app.Services.GetRequiredService<GitHubClient>().ConfigureWebhookAsync(app.Lifetime.ApplicationStopping);
 await app.RunAsync();

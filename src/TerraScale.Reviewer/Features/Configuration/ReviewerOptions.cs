@@ -3,33 +3,32 @@ using System.Text.Json;
 namespace TerraScale.Reviewer.Features.Configuration;
 
 public sealed record ReviewerOptions(
-    string ListenUrl, string GitHubUrl, string GitHubAppId, string AnthropicUrl, string AnthropicApiKey,
+    string ListenUrl, string GitHubUrl, string GitHubAppId, string GlmUrl, string GlmApiKey,
     string Organization, string BotLogin,
     string WebhookSecret, string ContextApiToken, string ContextDatabasePath, int ContextMaxFiles,
     int ContextMaxAttempts = 5, TimeSpan? ContextRetryBaseDelay = null, string OperatorToken = "",
-    string GitHubInstallationId = "", string GitHubPrivateKeyPath = "",
-    string AnthropicAdminApiKey = "", string AnthropicWorkspaceId = "")
+    string GitHubInstallationId = "", string GitHubPrivateKeyPath = "")
 {
     public TimeSpan ContextRetryDelay => ContextRetryBaseDelay ?? TimeSpan.FromSeconds(1);
     public static ReviewerOptions Load(string[] args)
     {
+        if (Environment.GetEnvironmentVariables().Keys.Cast<string>().Any(key =>
+            key.StartsWith("TS_REVIEWER_ANTHROPIC_", StringComparison.OrdinalIgnoreCase)))
+            throw new InvalidOperationException("retired Anthropic configuration is not supported");
         var values = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
         {
             ["listen"] = "http://+:8080",
             ["github-app-id"] = null,
             ["github-installation-id"] = null,
             ["github-private-key-path"] = null,
-            ["anthropic-api-key"] = null,
-            // Vendor-issued billing credential and identity are required for whole-workspace accounting.
-            ["anthropic-admin-api-key"] = null,
-            ["anthropic-workspace-id"] = null,
+            ["glm-api-key"] = null,
             ["bot-login"] = null,
             ["webhook-secret"] = string.Empty,
             ["context-api-token"] = string.Empty,
             ["context-database"] = "data/reviewer-context.db",
             ["operator-token"] = string.Empty
         };
-        string[] secretKeys = ["webhook-secret", "context-api-token", "operator-token"];
+        string[] secretKeys = ["glm-api-key", "webhook-secret", "context-api-token", "operator-token"];
         foreach (var key in secretKeys) values[key + "-file"] = null;
         var supplied = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var overrides = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
@@ -92,12 +91,7 @@ public sealed record ReviewerOptions(
         var appId = Required(values, "github-app-id", "TS_REVIEWER_GITHUB_APP_ID");
         var installationId = Required(values, "github-installation-id", "TS_REVIEWER_GITHUB_INSTALLATION_ID");
         var privateKeyPath = Required(values, "github-private-key-path", "TS_REVIEWER_GITHUB_PRIVATE_KEY_PATH");
-        var anthropicKey = Required(values, "anthropic-api-key", "TS_REVIEWER_ANTHROPIC_API_KEY");
-        var adminKey = Required(values, "anthropic-admin-api-key", "TS_REVIEWER_ANTHROPIC_ADMIN_API_KEY");
-        var workspaceId = Required(values, "anthropic-workspace-id", "TS_REVIEWER_ANTHROPIC_WORKSPACE_ID");
-        if (!workspaceId.StartsWith("wrkspc_", StringComparison.Ordinal)
-            || workspaceId.Length <= 7 || !workspaceId.All(c => char.IsAsciiLetterOrDigit(c) || c == '_'))
-            throw new InvalidOperationException("TS_REVIEWER_ANTHROPIC_WORKSPACE_ID must be a provider-issued wrkspc_ identity, including for the default workspace");
+        var glmKey = Required(values, "glm-api-key", "TS_REVIEWER_GLM_API_KEY");
         var botLogin = Required(values, "bot-login", "TS_REVIEWER_BOT_LOGIN");
         if (!long.TryParse(appId, out var parsedAppId) || parsedAppId <= 0
             || !long.TryParse(installationId, out var parsedInstallationId) || parsedInstallationId <= 0)
@@ -106,9 +100,9 @@ public sealed record ReviewerOptions(
         var contextApiToken = Required(values, "context-api-token", "TS_REVIEWER_CONTEXT_API_TOKEN");
         var operatorToken = Required(values, "operator-token", "TS_REVIEWER_OPERATOR_TOKEN");
         return new ReviewerOptions(Trim(values["listen"]!), "https://api.github.com", appId,
-            "https://api.anthropic.com", anthropicKey, "TerraScale", botLogin,
+            "https://api.z.ai/api/anthropic", glmKey, "TerraScale", botLogin,
             webhookSecret, contextApiToken, values["context-database"]!, 20_000,
-            5, TimeSpan.FromSeconds(1), operatorToken, installationId, privateKeyPath, adminKey, workspaceId);
+            5, TimeSpan.FromSeconds(1), operatorToken, installationId, privateKeyPath);
     }
     private static string ReadSecretFile(string? path, string key)
     {

@@ -86,7 +86,7 @@ public sealed class GitHubCommandTests
     public async Task DispatchPreparationFailureCannotMarkReceiptSent()
     {
         using var transport = new Transport();
-        var options = new ReviewerOptions("http://localhost:0", "https://github.test", "1", "https://api.anthropic.com", "fixture", "TerraScale", "bot", "webhook", "context", "unused", 100);
+        var options = new ReviewerOptions("http://localhost:0", "https://github.test", "1", "https://glm.test", "fixture", "TerraScale", "bot", "webhook", "context", "unused", 100);
         var client = new GitHubClient(new HttpClient(transport), options, (_, _, _) => throw new HttpRequestException("fixture failed authentication"));
         var markedSent = false;
         var failed = false;
@@ -147,11 +147,11 @@ public sealed class GitHubCommandTests
         private readonly WebhookHandler _webhook;
         internal Fixture()
         {
-            var options = new ReviewerOptions("http://localhost:0", "https://github.test", "1", "https://api.anthropic.com", "fixture", "TerraScale", "bot", "webhook", "context", _database, 100);
+            var options = new ReviewerOptions("http://localhost:0", "https://github.test", "1", "https://glm.test", "fixture", "TerraScale", "bot", "webhook", "context", _database, 100);
             var client = new GitHubClient(new HttpClient(Transport), options, (_, _, _) => Task.FromResult("installation-test-token"));
             _store = new ContextStore(options);
             var indexer = new ContextIndexer(client, _store, new ContextEmbedder(), options, NullLogger<ContextIndexer>.Instance);
-            var reviewer = new PullRequestReviewer(client, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance, BillingFixture.Opus), options, NullLogger<PullRequestReviewer>.Instance);
+            var reviewer = new PullRequestReviewer(client, new ReviewEngine(options, NullLogger<ReviewEngine>.Instance), options, NullLogger<PullRequestReviewer>.Instance);
             _queue = new ReviewQueue(reviewer, NullLogger<ReviewQueue>.Instance);
             _webhook = new WebhookHandler(client, _queue, reviewer, indexer, options, NullLogger<WebhookHandler>.Instance);
         }
