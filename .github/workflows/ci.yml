@@ -14,9 +14,9 @@ on:
 permissions:
   contents: read
 
-# Superseded branch/PR runs are cancelled. Each main run gets its own group so image publication is never cut off.
+# A newer run for the same PR or branch, main included, cancels the older one; the image is tagged per SHA, so the newest main publishes its own.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'merge_group' && github.run_id || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
