@@ -635,16 +635,15 @@ public sealed class ReviewProviderTests
         await using var provider = new ReviewProvider(Options, NullLogger.Instance, "review", BillingFixture.Opus, new HttpClient(transport),
             async (_, ct) => { started.TrySetResult(); await release.Task.WaitAsync(ct); }, clock);
         await provider.StartAsync(CancellationToken.None);
-        using var client = new HttpClient();
-        client.DefaultRequestHeaders.Add("x-api-key", provider.Token);
-        var request = client.PostAsJsonAsync(provider.Url + "/v1/messages", Request());
+        // Await the provider's finally so watchdog rearming completes before advancing time.
+        var request = provider.SendAsync(Request(), CancellationToken.None);
         await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
         clock.Advance(ReviewProvider.StepTimeout);
         await Assert.That(provider.Lifetime.IsCancellationRequested).IsFalse();
         await Assert.That(request.IsCompleted).IsFalse();
         release.TrySetResult();
-        using var response = await request.WaitAsync(TimeSpan.FromSeconds(5));
-        await Assert.That(response.StatusCode).IsEqualTo(HttpStatusCode.OK);
+        using var response = JsonDocument.Parse(await request.WaitAsync(TimeSpan.FromSeconds(5)));
+        await Assert.That(response.RootElement.GetProperty("model").GetString()).IsEqualTo(ReviewProvider.PrimaryModel);
         await Assert.That(transport.Models.Count).IsEqualTo(backoff ? 2 : 1);
         clock.Advance(ReviewProvider.InactivityTimeout - TimeSpan.FromTicks(1));
         await Assert.That(provider.Lifetime.IsCancellationRequested).IsFalse();
