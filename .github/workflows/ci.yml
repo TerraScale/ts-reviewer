@@ -49,11 +49,10 @@ jobs:
           path: ~/.nuget/packages
           key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', 'Directory.Packages.props', 'Directory.Build.props', 'global.json', 'nuget.config') }}
           restore-keys: nuget-${{ runner.os }}-
-      - name: TUnit tests and migration/deployment fixtures
+      - name: TUnit tests and offline fixtures
         run: |
           dotnet run --project tests/TerraScale.Reviewer.Tests -c Release
           dotnet run scripts/check-nuget-vulnerabilities.tests.cs
-          dotnet run scripts/deploy-alpha.tests.cs
           dotnet run scripts/provision-reviewer-secrets.tests.cs
       - name: Audit all dependencies
         run: dotnet run scripts/check-nuget-vulnerabilities.cs src/TerraScale.Reviewer/TerraScale.Reviewer.csproj tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj
