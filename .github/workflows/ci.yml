@@ -54,6 +54,7 @@ jobs:
           dotnet run --project tests/TerraScale.Reviewer.Tests -c Release
           dotnet run scripts/check-nuget-vulnerabilities.tests.cs
           dotnet run scripts/provision-reviewer-secrets.tests.cs
+          python3 scripts/store-reviewer-secrets.tests.py
       - name: Audit all dependencies
         run: dotnet run scripts/check-nuget-vulnerabilities.cs src/TerraScale.Reviewer/TerraScale.Reviewer.csproj tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj
       - name: Publish the checked application
