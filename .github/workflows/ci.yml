@@ -14,8 +14,7 @@ on:
 permissions:
   contents: read
 
-# Superseded branch/PR runs are cancelled. Each main run gets its own group, so a publish is never cut off and a deploy
-# waiting for Alpha approval does not hold back later main checks; the deploy job serializes itself below.
+# Superseded branch/PR runs are cancelled. Each main run gets its own group so image publication is never cut off.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
   cancel-in-progress: true
@@ -23,12 +22,11 @@ concurrency:
 env:
   CI: true # Standard .NET/Actions CI detection, required by the local-priority rule.
 
-# Repo variable CI_RUNNER=alpha selects the self-hosted alpha runners (persistent local
-# caches, so GitHub cache steps are skipped there); unset = GitHub-hosted.
+# Alpha was deleted; replacement hosting is tracked in docs/runtime-status-2026-10-22.md.
 jobs:
   checks:
     name: Check and build ts-reviewer
-    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Verify the requested trusted commit before running CI
@@ -60,12 +58,8 @@ jobs:
           dotnet run scripts/prepare-alpha-ssh.tests.cs
       - name: Audit all dependencies
         run: dotnet run scripts/check-nuget-vulnerabilities.cs src/TerraScale.Reviewer/TerraScale.Reviewer.csproj tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj
-      - name: Publish the checked application and Alpha utilities
-        run: |
-          dotnet publish src/TerraScale.Reviewer -c Release -r linux-x64 --self-contained true -o artifacts/ci/reviewer -p:SourceRevisionId="$GITHUB_SHA"
-          dotnet publish scripts/deploy-alpha.cs -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o artifacts/ci/deploy
-          dotnet publish scripts/provision-reviewer-secrets.cs -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o artifacts/ci/setup
-          dotnet publish scripts/prepare-alpha-ssh.cs -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o artifacts/ci/ssh
+      - name: Publish the checked application
+        run: dotnet publish src/TerraScale.Reviewer -c Release -r linux-x64 --self-contained true -o artifacts/ci/reviewer -p:SourceRevisionId="$GITHUB_SHA"
       - name: Save NuGet packages cache
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.nuget-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
@@ -89,23 +83,17 @@ jobs:
         with:
           name: checked-${{ github.sha }}
           if-no-files-found: error
-          path: |
-            artifacts/ci/reviewer/
-            artifacts/ci/deploy/
-            artifacts/ci/setup/
-            artifacts/ci/ssh/
+          path: artifacts/ci/reviewer/
 
   image:
     name: Publish the exact checked image
     needs: checks
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
       packages: write
-    outputs:
-      digest: ${{ steps.archive.outputs.digest }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -116,7 +104,7 @@ jobs:
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: checked-${{ github.sha }}
-          path: artifacts/ci
+          path: artifacts/ci/reviewer
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
@@ -124,9 +112,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         with:
-          # On alpha, build on the shared persistent BuildKit daemon (layer + cache-mount reuse).
-          driver: ${{ vars.CI_RUNNER && 'remote' || 'docker-container' }}
-          endpoint: ${{ vars.CI_RUNNER && 'unix:///run/buildkit/buildkitd.sock' || '' }}
+          driver: docker-container
       - name: Publish native tooling base
         id: tooling
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
@@ -137,8 +123,8 @@ jobs:
           provenance: false # SDK base-image reader expects one image manifest, not an attestation index.
           push: true
           tags: ghcr.io/terrascale/ts-reviewer:tooling-${{ github.sha }}
-          cache-from: ${{ !vars.CI_RUNNER && 'type=gha,scope=tooling' || '' }}
-          cache-to: ${{ !vars.CI_RUNNER && 'type=gha,mode=max,scope=tooling' || '' }}
+          cache-from: type=gha,scope=tooling
+          cache-to: type=gha,mode=max,scope=tooling
       - name: PublishContainer directly from the checked publish directory
         env:
           TOOLING_DIGEST: ${{ steps.tooling.outputs.digest }}
@@ -151,101 +137,3 @@ jobs:
             -p:ContainerBaseImage="ghcr.io/terrascale/ts-reviewer@$TOOLING_DIGEST" \
             -p:ContainerRegistry=ghcr.io -p:ContainerRepository=terrascale/ts-reviewer \
             -p:ContainerImageTag="$GITHUB_SHA" -p:SourceRevisionId="$GITHUB_SHA"
-      - name: Export immutable OCI artifact using the existing runner registry session
-        id: archive
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends skopeo
-          mkdir -p artifacts/ci/alpha
-          digest=$(skopeo inspect --authfile "$HOME/.docker/config.json" --format '{{.Digest}}' "docker://ghcr.io/terrascale/ts-reviewer:$GITHUB_SHA")
-          skopeo copy --quiet --preserve-digests --src-authfile "$HOME/.docker/config.json" \
-            "docker://ghcr.io/terrascale/ts-reviewer@$digest" oci-archive:artifacts/ci/alpha/image.oci.tar
-          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: alpha-image-${{ github.sha }}
-          if-no-files-found: error
-          path: artifacts/ci/alpha/image.oci.tar
-
-  deployment-gate:
-    name: Verify Alpha environment setup
-    needs: image
-    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - name: Require an existing main-only Alpha deployment environment
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api "repos/$GITHUB_REPOSITORY/environments/alpha" \
-            --jq '.deployment_branch_policy.custom_branch_policies == true' | awk '$1 == "true" { valid = 1 } END { exit !valid }'
-          gh api "repos/$GITHUB_REPOSITORY/environments/alpha/deployment-branch-policies" \
-            --jq '(.branch_policies | length) == 1 and .branch_policies[0].name == "main" and .branch_policies[0].type == "branch"' \
-            | awk '$1 == "true" { valid = 1 } END { exit !valid }'
-
-  deploy:
-    name: Deploy Alpha with health check and rollback
-    needs: [checks, image, deployment-gate]
-    # Stays GitHub-hosted: it reaches alpha over Tailscale, and alpha CI runners have no homelab access.
-    runs-on: ubuntu-latest
-    environment: alpha
-    timeout-minutes: 20
-    permissions:
-      contents: read
-      id-token: write # Short-lived GitHub identity for OpenBao SSH signing and Tailscale federation.
-    concurrency:
-      group: ts-reviewer-alpha
-      cancel-in-progress: false
-    steps:
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          name: checked-${{ github.sha }}
-          path: artifacts/ci
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          name: alpha-image-${{ github.sha }}
-          path: artifacts/ci/alpha
-      - name: Sign an ephemeral deployment key using scoped OpenBao OIDC trust
-        env:
-          ALPHA_HOST_ED25519_PUBLIC_KEY: ${{ vars.ALPHA_HOST_ED25519_PUBLIC_KEY }} # Unavoidable third-party public host identity; verified by an operator, never discovered with ssh-keyscan.
-        run: |
-          chmod 700 artifacts/ci/ssh/prepare-alpha-ssh
-          artifacts/ci/ssh/prepare-alpha-ssh
-      - name: Join Alpha's network using ephemeral workload identity
-        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4
-        with:
-          oauth-client-id: ${{ vars.TAILSCALE_ALPHA_CLIENT_ID }} # Unavoidable vendor-issued public federated identity; no OAuth secret.
-          audience: https://github.com/TerraScale/ts-reviewer/alpha
-          tags: tag:ts-reviewer-deploy
-          version: 1.94.2
-          ping: alpha.tail057f.ts.net
-          log-mode: quiet
-      - name: Deploy only current main through the existing Alpha SSH capability
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
-        run: |
-          current=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
-          if [ "$current" != "$GITHUB_SHA" ]; then
-            printf 'A newer main commit supersedes this image; Alpha remains unchanged.\n'
-            exit 0
-          fi
-          ssh_config="$RUNNER_TEMP/ts-reviewer-alpha-ssh/config"
-          ssh -F "$ssh_config" -o ConnectTimeout=10 alpha true
-          stage="/tmp/ts-reviewer-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          ssh -F "$ssh_config" alpha "umask 077; mkdir '$stage'"
-          scp -F "$ssh_config" artifacts/ci/alpha/image.oci.tar alpha:"$stage/image.oci.tar"
-          scp -F "$ssh_config" -r artifacts/ci/reviewer alpha:"$stage/reviewer"
-          ssh -F "$ssh_config" alpha \
-            "chmod 711 '$stage'; chmod -R a+rX '$stage/reviewer'; sudo -n /usr/local/libexec/ts-reviewer-deploy '$GITHUB_SHA' '$IMAGE_DIGEST' '$stage'"
-      - name: Remove the temporary SSH identity
-        if: always()
-        run: |
-          directory="$RUNNER_TEMP/ts-reviewer-alpha-ssh"
-          if [ -d "$directory" ]; then
-            rm -f -- "$directory/identity" "$directory/identity.pub" "$directory/identity-cert.pub" "$directory/config" "$directory/known_hosts"
-            rmdir -- "$directory"
-          fi
