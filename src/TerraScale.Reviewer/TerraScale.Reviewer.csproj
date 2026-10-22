@@ -11,7 +11,7 @@
     <ContainerBaseImage>mcr.microsoft.com/dotnet/aspnet:11.0.0-rc.1</ContainerBaseImage>
     <ContainerRepository>terrascale/ts-reviewer</ContainerRepository>
     <ContainerPort>8080</ContainerPort>
-    <ContainerUser>1654</ContainerUser>
+    <ContainerUser>65532:65532</ContainerUser>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="FastBertTokenizer" />

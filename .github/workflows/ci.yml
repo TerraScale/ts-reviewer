@@ -22,11 +22,11 @@ concurrency:
 env:
   CI: true # Standard .NET/Actions CI detection, required by the local-priority rule.
 
-# Alpha was deleted; replacement hosting is tracked in docs/runtime-status-2026-10-22.md.
+# Runtime deployment is owned by ts-orch on OCI.
 jobs:
   checks:
     name: Check and build ts-reviewer
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
     steps:
       - name: Verify the requested trusted commit before running CI
@@ -55,11 +55,10 @@ jobs:
           dotnet run scripts/check-nuget-vulnerabilities.tests.cs
           dotnet run scripts/deploy-alpha.tests.cs
           dotnet run scripts/provision-reviewer-secrets.tests.cs
-          dotnet run scripts/prepare-alpha-ssh.tests.cs
       - name: Audit all dependencies
         run: dotnet run scripts/check-nuget-vulnerabilities.cs src/TerraScale.Reviewer/TerraScale.Reviewer.csproj tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj
       - name: Publish the checked application
-        run: dotnet publish src/TerraScale.Reviewer -c Release -r linux-x64 --self-contained true -o artifacts/ci/reviewer -p:SourceRevisionId="$GITHUB_SHA"
+        run: dotnet publish src/TerraScale.Reviewer -c Release -r linux-arm64 --self-contained true -o artifacts/ci/reviewer -p:SourceRevisionId="$GITHUB_SHA"
       - name: Save NuGet packages cache
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.nuget-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
@@ -74,7 +73,7 @@ jobs:
         with:
           context: .
           file: Containerfile
-          platforms: linux/amd64
+          platforms: linux/arm64
           push: false
           tags: ts-reviewer-tooling-check
           # Read-only here; the main-only image job below writes this scope.
@@ -89,7 +88,7 @@ jobs:
     name: Publish the exact checked image
     needs: checks
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
     permissions:
       contents: read
@@ -119,7 +118,7 @@ jobs:
         with:
           context: .
           file: Containerfile
-          platforms: linux/amd64
+          platforms: linux/arm64
           provenance: false # SDK base-image reader expects one image manifest, not an attestation index.
           push: true
           tags: ghcr.io/terrascale/ts-reviewer:tooling-${{ github.sha }}
@@ -131,7 +130,7 @@ jobs:
         run: |
           # PublishRepositoryUrl is required by the SDK to emit the exact OCI commit label.
           dotnet msbuild src/TerraScale.Reviewer/TerraScale.Reviewer.csproj /t:PublishContainer \
-            -p:Configuration=Release -p:RuntimeIdentifier=linux-x64 -p:SelfContained=true \
+            -p:Configuration=Release -p:RuntimeIdentifier=linux-arm64 -p:SelfContained=true \
             -p:PublishDir="$GITHUB_WORKSPACE/artifacts/ci/reviewer/" \
             -p:PublishRepositoryUrl=true -p:RepositoryUrl=https://github.com/TerraScale/ts-reviewer \
             -p:ContainerBaseImage="ghcr.io/terrascale/ts-reviewer@$TOOLING_DIGEST" \
