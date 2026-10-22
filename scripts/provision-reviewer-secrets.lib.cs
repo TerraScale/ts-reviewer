@@ -80,7 +80,7 @@ public static class ReviewerSecrets
                     Base64Url(JsonSerializer.SerializeToUtf8Bytes(new { iss = "5279339", iat = now - 60, exp = now + 540 }));
                 var jwt = unsigned + "." + Base64Url(rsa.SignData(Encoding.ASCII.GetBytes(unsigned), HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1));
                 await (updateWebhook ?? ((token, secret) => UpdateWebhook(token, secret)))(jwt, values.GetProperty("TS_REVIEWER_WEBHOOK_SECRET").GetString()!);
-                await output.WriteLineAsync("GitHub App webhook configured directly from OpenBao; no values printed or Alpha files changed.");
+                await output.WriteLineAsync("GitHub App webhook configured directly from OpenBao; no values printed or runtime files changed.");
                 return 0;
             }
             if (args[0] == "plan")
@@ -98,7 +98,7 @@ public static class ReviewerSecrets
                 if (additions.ContainsKey(key)) additions[key] = Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(32));
             await execute(["kv", "patch", "-address=https://bao.mariogk.com", "-disable-redirects", "-format=json",
                 "-mount=secret/homelab", "-method=patch", "-cas=" + version, "ci/ts-reviewer", "-"], JsonSerializer.Serialize(additions));
-            await output.WriteLineAsync("OpenBao reviewer setup saved; vendor credentials preserved. Alpha materialization remains pending.");
+            await output.WriteLineAsync("OpenBao reviewer setup saved; vendor credentials preserved. Runtime materialization remains separate.");
             return 0;
         }
         catch
