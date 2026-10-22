@@ -55,7 +55,13 @@ jobs:
           dotnet run scripts/check-nuget-vulnerabilities.tests.cs
           dotnet run scripts/provision-reviewer-secrets.tests.cs
       - name: Audit all dependencies
-        run: dotnet run scripts/check-nuget-vulnerabilities.cs src/TerraScale.Reviewer/TerraScale.Reviewer.csproj tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj
+        run: |
+          dotnet run scripts/check-nuget-vulnerabilities.cs \
+            src/TerraScale.Reviewer/TerraScale.Reviewer.csproj \
+            tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj \
+            tests/TerraScale.Reviewer.LeaseCrashChild/TerraScale.Reviewer.LeaseCrashChild.csproj \
+            scripts/check-nuget-vulnerabilities.tests.cs \
+            scripts/provision-reviewer-secrets.tests.cs
       - name: Publish the checked application
         run: dotnet publish src/TerraScale.Reviewer -c Release -r linux-arm64 --self-contained true -o artifacts/ci/reviewer -p:SourceRevisionId="$GITHUB_SHA"
       - name: Save NuGet packages cache
