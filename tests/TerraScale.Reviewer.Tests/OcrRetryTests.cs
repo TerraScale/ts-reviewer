@@ -26,8 +26,8 @@ public sealed class OcrRetryTests
     [Test]
     public async Task PinnedOcrCompletesReviewThroughLocalProvider()
     {
-        if (!OperatingSystem.IsLinux() || RuntimeInformation.ProcessArchitecture != Architecture.X64)
-            throw new TUnit.Core.Exceptions.SkipTestException("requires the production Linux x64 OCR binary");
+        if (!OperatingSystem.IsLinux() || RuntimeInformation.ProcessArchitecture != Architecture.Arm64)
+            throw new TUnit.Core.Exceptions.SkipTestException("requires the production Linux ARM64 OCR binary");
         await using var fixture = await Fixture.CreateAsync(servePartialClones: true, untrustedRules: true);
         string binary;
         using (var preparation = new CancellationTokenSource(TimeSpan.FromMinutes(5)))
@@ -116,7 +116,7 @@ public sealed class OcrRetryTests
         try
         {
             archive = await VerifiedArchiveAsync(Path.Combine(assets, $"ocr-{version}-{digest}.tgz"), digest,
-                token => http.GetByteArrayAsync($"https://registry.npmjs.org/@alibaba-group/ocr-linux-x64/-/ocr-linux-x64-{version}.tgz", token), ct);
+                token => http.GetByteArrayAsync($"https://registry.npmjs.org/@alibaba-group/ocr-linux-arm64/-/ocr-linux-arm64-{version}.tgz", token), ct);
         }
         catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException)
         {
