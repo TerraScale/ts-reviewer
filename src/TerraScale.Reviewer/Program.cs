@@ -72,4 +72,5 @@ app.MapPost("/admin/context/dead-letter/replay", ContextEndpoints.ReplayDeadLett
 app.Lifetime.ApplicationStarted.Register(() =>
     app.Logger.LogInformation("ts-reviewer listening on {Address}; initial_model {Model}; workspace tiers $100 Sonnet/$150 Haiku/$200 stop; max_concurrent {MaxConcurrent}; file_groups 1; max_attempts {MaxAttempts}",
         options.ListenUrl, ReviewProvider.PrimaryModel, ReviewQueue.WorkerCount, ReviewProvider.MaxAttempts));
+await app.Services.GetRequiredService<GitHubClient>().ConfigureWebhookAsync(app.Lifetime.ApplicationStopping);
 await app.RunAsync();

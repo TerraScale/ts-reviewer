@@ -32,6 +32,27 @@ public sealed class GitHubClient
         _http.DefaultRequestHeaders.Add("X-GitHub-Api-Version", "2022-11-28");
     }
 
+    public async Task ConfigureWebhookAsync(CancellationToken ct)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(TimeSpan.FromSeconds(30));
+        using var request = new HttpRequestMessage(HttpMethod.Patch, "app/hook/config")
+        {
+            // GitHub requires "0" to enforce TLS certificate validation.
+            Content = JsonContent.Create(new { url = "https://ts-reviewer.mariogk.com/webhook", content_type = "json", secret = _options.WebhookSecret, insecure_ssl = "0" })
+        };
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", await CreateAppJwtAsync(timeout.Token));
+        try
+        {
+            using var response = await _http.SendAsync(request, timeout.Token);
+            EnsureSuccess(response);
+        }
+        catch (HttpRequestException ex)
+        {
+            throw new HttpRequestException(ex.StatusCode is { } status ? $"GitHub API returned HTTP {(int)status}" : "GitHub webhook configuration request failed", null, ex.StatusCode);
+        }
+    }
+
     public async Task<bool> IsAllowedAsync(string owner, string name, CancellationToken ct)
     {
         if (!ValidRepository(owner, name)) return false;
