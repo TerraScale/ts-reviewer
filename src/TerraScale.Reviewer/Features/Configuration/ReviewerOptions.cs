@@ -29,6 +29,9 @@ public sealed record ReviewerOptions(
             ["context-database"] = "data/reviewer-context.db",
             ["operator-token"] = string.Empty
         };
+        string[] secretKeys = ["webhook-secret", "context-api-token", "operator-token"];
+        foreach (var key in secretKeys) values[key + "-file"] = null;
+        var supplied = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var overrides = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
         foreach (var arg in args)
         {
@@ -49,6 +52,7 @@ public sealed record ReviewerOptions(
                 foreach (var property in config.RootElement.EnumerateObject())
                 {
                     if (!values.ContainsKey(property.Name)) throw new InvalidOperationException($"unknown config option: {property.Name}");
+                    supplied.Add(property.Name);
                     values[property.Name] = property.Value.ValueKind switch
                     {
                         JsonValueKind.String => property.Value.GetString(),
@@ -65,13 +69,25 @@ public sealed record ReviewerOptions(
         foreach (var key in values.Keys.ToArray())
         {
             var environmentValue = Environment.GetEnvironmentVariable("TS_REVIEWER_" + key.Replace('-', '_').ToUpperInvariant());
-            if (environmentValue is not null) values[key] = environmentValue;
+            if (environmentValue is not null)
+            {
+                supplied.Add(key);
+                values[key] = environmentValue;
+            }
         }
         foreach (var (key, value) in overrides)
         {
             if (string.Equals(key, "config", StringComparison.OrdinalIgnoreCase)) continue;
             if (!values.ContainsKey(key)) throw new InvalidOperationException($"unknown option: {key}");
+            supplied.Add(key);
             values[key] = value;
+        }
+        // CLI > environment > JSON for each key; plain/file presence conflicts across every source.
+        foreach (var key in secretKeys)
+        {
+            if (!supplied.Contains(key + "-file")) continue;
+            if (supplied.Contains(key)) throw new InvalidOperationException($"{key} and {key}-file cannot both be supplied");
+            values[key] = ReadSecretFile(values[key + "-file"], key);
         }
         var appId = Required(values, "github-app-id", "TS_REVIEWER_GITHUB_APP_ID");
         var installationId = Required(values, "github-installation-id", "TS_REVIEWER_GITHUB_INSTALLATION_ID");
@@ -93,6 +109,19 @@ public sealed record ReviewerOptions(
             "https://api.anthropic.com", anthropicKey, "TerraScale", botLogin,
             webhookSecret, contextApiToken, values["context-database"]!, 20_000,
             5, TimeSpan.FromSeconds(1), operatorToken, installationId, privateKeyPath, adminKey, workspaceId);
+    }
+    private static string ReadSecretFile(string? path, string key)
+    {
+        var error = $"{key}-file must name a readable file containing a nonblank secret";
+        if (string.IsNullOrWhiteSpace(path)) throw new InvalidOperationException(error);
+        string value;
+        try { value = File.ReadAllText(path).TrimEnd('\r', '\n'); }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            // File exception messages include mount paths; do not propagate them.
+            throw new InvalidOperationException(error);
+        }
+        return string.IsNullOrWhiteSpace(value) ? throw new InvalidOperationException(error) : value;
     }
     private static string Required(IReadOnlyDictionary<string, string?> values, string key, string environmentName) =>
         string.IsNullOrWhiteSpace(values[key]) ? throw new InvalidOperationException($"{environmentName} is required") : values[key]!;
