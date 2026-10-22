@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # Security updates arrive as one grouped PR per ecosystem; a limit of 0 turns off version-update PRs.
+  - package-ecosystem: nuget
+    directories: ["/"]
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    groups:
+      nuget-security:
+        applies-to: security-updates
+        patterns: ["*"]

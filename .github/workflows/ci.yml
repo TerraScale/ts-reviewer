@@ -7,7 +7,9 @@ on:
         description: Exact trusted main commit requested by the maintainer command
         required: true
         type: string
+  # Docs-only PRs run nothing; every main push still publishes its per-SHA image.
   pull_request:
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE', '.github/workflows/codeql.yml', '.github/dependabot.yml']
   push:
     branches: [main]
 
@@ -23,11 +25,15 @@ env:
   CI: true # Standard .NET/Actions CI detection, required by the local-priority rule.
 
 # Runtime deployment is owned by ts-orch on OCI.
+# One job: main pushes publish the image from the same checked publish directory, with no artifact hop or second runner.
 jobs:
   checks:
     name: Check and build ts-reviewer
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 15
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write # Used only by the main-push login below; no step hands the token to PR code.
     steps:
       - name: Verify the requested trusted commit before running CI
         if: github.event_name == 'workflow_dispatch'
@@ -74,6 +80,7 @@ jobs:
         with:
           driver: docker-container
       - name: Verify pinned OCR tooling without model calls
+        if: github.event_name != 'push'
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
@@ -81,43 +88,16 @@ jobs:
           platforms: linux/arm64
           push: false
           tags: ts-reviewer-tooling-check
-          # Read-only here; the main-only image job below writes this scope.
+          # Read-only here; main pushes write this scope.
           cache-from: type=gha,scope=tooling
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: checked-${{ github.sha }}
-          if-no-files-found: error
-          path: artifacts/ci/reviewer/
-
-  image:
-    name: Publish the exact checked image
-    needs: checks
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
-        with:
-          global-json-file: global.json
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          name: checked-${{ github.sha }}
-          path: artifacts/ci/reviewer
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        if: github.event_name == 'push'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-        with:
-          driver: docker-container
       - name: Publish native tooling base
+        if: github.event_name == 'push'
         id: tooling
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -130,6 +110,7 @@ jobs:
           cache-from: type=gha,scope=tooling
           cache-to: type=gha,mode=max,scope=tooling
       - name: PublishContainer directly from the checked publish directory
+        if: github.event_name == 'push'
         env:
           TOOLING_DIGEST: ${{ steps.tooling.outputs.digest }}
         run: |
