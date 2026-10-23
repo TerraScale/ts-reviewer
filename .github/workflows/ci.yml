@@ -7,16 +7,13 @@ on:
         description: Exact trusted main commit requested by the maintainer command
         required: true
         type: string
-  # Docs-only PRs run nothing; every main push runs CI.
   pull_request:
-    paths-ignore: ['**.md', 'docs/**', 'LICENSE', '.github/workflows/codeql.yml', '.github/dependabot.yml']
-  push:
-    branches: [main]
+  merge_group:
 
 permissions:
   contents: read
 
-# A newer run for the same PR or branch, main included, cancels the older one.
+# A newer PR or manual run cancels the older one; queue entries stay independent.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'merge_group' && github.run_id || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -29,7 +26,7 @@ jobs:
   checks:
     name: Check and build ts-reviewer
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 20
+    timeout-minutes: 5
     permissions:
       contents: read
     steps:
@@ -41,52 +38,59 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+          fetch-depth: 0
+      - name: Select application changes
+        id: changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          if [ -n "$BASE_SHA" ] && git diff --quiet "$BASE_SHA" "$GITHUB_SHA" -- . \
+            ':(exclude)**/*.md' ':(exclude)*.md' ':(exclude)docs/**' \
+            ':(exclude)LICENSE' ':(exclude).github/workflows/codeql.yml' \
+            ':(exclude).github/dependabot.yml'; then
+            echo "application=false" >> "$GITHUB_OUTPUT"
+            echo 'Documentation/security configuration only; application checks skipped.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "application=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.changes.outputs.application == 'true'
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
         with:
           global-json-file: global.json
-      # No packages.lock.json, so setup-dotnet's built-in cache can't be used; key on the project files instead.
-      # Every run restores; only main saves, so PRs never spend the repo cache budget on PR-scoped copies.
-      - name: Restore NuGet packages cache
+      # PRs restore caches; only a trusted main dispatch can save them.
+      - name: Restore NuGet packages and pinned OCR cache
+        if: steps.changes.outputs.application == 'true'
         id: nuget-cache
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
-          path: ~/.nuget/packages
-          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', 'Directory.Packages.props', 'Directory.Build.props', 'global.json', 'nuget.config') }}
-          restore-keys: nuget-${{ runner.os }}-
-      - name: TUnit tests and offline fixtures
+          path: |
+            ~/.nuget/packages
+            artifacts/ci/ocr
+          key: nuget-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('global.json') }}-${{ hashFiles('**/packages.lock.json', 'scripts/*.packages.lock.json', '**/*.csproj', 'Directory.Packages.props', 'Directory.Build.props', 'nuget.config', 'Containerfile', 'scripts/*.cs') }}
+          restore-keys: nuget-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('global.json') }}-
+      - name: Restore locked dependencies
+        if: steps.changes.outputs.application == 'true'
         run: |
-          dotnet run --project tests/TerraScale.Reviewer.Tests -c Release
-          dotnet run scripts/check-nuget-vulnerabilities.tests.cs
+          dotnet restore tests/TerraScale.Reviewer.Tests --locked-mode
+          dotnet restore scripts/check-nuget-vulnerabilities.tests.cs --locked-mode --lock-file-path check-nuget-vulnerabilities.tests.packages.lock.json
+      - name: Compile with analyzers and run TUnit tests and offline fixtures
+        if: steps.changes.outputs.application == 'true'
+        run: |
+          dotnet run --project tests/TerraScale.Reviewer.Tests -c Release --no-restore
+          dotnet run --no-restore scripts/check-nuget-vulnerabilities.tests.cs
       - name: Audit all dependencies
+        if: steps.changes.outputs.application == 'true'
         run: |
           dotnet run scripts/check-nuget-vulnerabilities.cs \
             src/TerraScale.Reviewer/TerraScale.Reviewer.csproj \
             tests/TerraScale.Reviewer.Tests/TerraScale.Reviewer.Tests.csproj \
             tests/TerraScale.Reviewer.LeaseCrashChild/TerraScale.Reviewer.LeaseCrashChild.csproj \
             scripts/check-nuget-vulnerabilities.tests.cs
-      - name: Publish the checked application
-        run: dotnet publish src/TerraScale.Reviewer -c Release -r linux-arm64 --self-contained true -o artifacts/ci/reviewer -p:SourceRevisionId="$GITHUB_SHA"
-      - name: Save NuGet packages cache
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.nuget-cache.outputs.cache-hit != 'true'
+      - name: Save NuGet packages and pinned OCR cache
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && steps.nuget-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
-          path: ~/.nuget/packages
+          path: |
+            ~/.nuget/packages
+            artifacts/ci/ocr
           key: ${{ steps.nuget-cache.outputs.cache-primary-key }}
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-        with:
-          driver: docker-container
-      - name: Verify pinned OCR tooling without model calls
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          file: Containerfile
-          platforms: linux/arm64
-          push: false
-          tags: ts-reviewer-tooling-check
-          # Reuse the existing tooling cache without publishing new images.
-          cache-from: type=gha,scope=tooling
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: checked-${{ github.sha }}
-          if-no-files-found: error
-          path: artifacts/ci/reviewer/

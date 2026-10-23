@@ -1,0 +1,77 @@
+{
+  "version": 2,
+  "dependencies": {
+    "net11.0": {
+      "FastBertTokenizer": {
+        "type": "Direct",
+        "requested": "[0.4.67, )",
+        "resolved": "0.4.67",
+        "contentHash": "yJ15ysiLrA+GWsX6dN5O3mIPJciew1pwYCc7XZn7YyptymjCc2sLTBmlJWRLEFjcL6e3WT82rkzn8K37AN3PXw=="
+      },
+      "LiteDB": {
+        "type": "Direct",
+        "requested": "[6.0.0-prerelease.289, )",
+        "resolved": "6.0.0-prerelease.289",
+        "contentHash": "473Ft+9uyr+k0OdRnTfBYfKOy2eJDGGKgoBKczClXxvuL2oN9ZGZb2r8WKi3CX/IcQKC4isD+kaef2fw4Dul+Q=="
+      },
+      "Microsoft.ML.OnnxRuntime": {
+        "type": "Direct",
+        "requested": "[1.17.0, )",
+        "resolved": "1.17.0",
+        "contentHash": "voFOYGFWcE1YFHnrBECofPC+uHDelBealnTOE4Kx1byqfOJWsUOI9WGJzu8YkLvOVTRIH39WHtrt22UhHkkWOg==",
+        "dependencies": {
+          "Microsoft.ML.OnnxRuntime.Managed": "1.17.0"
+        }
+      },
+      "SmartComponents.LocalEmbeddings": {
+        "type": "Direct",
+        "requested": "[0.1.0-preview10148, )",
+        "resolved": "0.1.0-preview10148",
+        "contentHash": "OpteCT6dmXdKhC1LdGiE/UP8yxb9Oxj6FyphYwbO7o6CHbsION+scJrW7Ox+6S5zvZ9aQPI3GwomP/e0hYM4Yg==",
+        "dependencies": {
+          "FastBertTokenizer": "0.4.67",
+          "Microsoft.ML.OnnxRuntime": "1.17.0",
+          "SmartComponents.Inference": "0.1.0-preview10148",
+          "System.Numerics.Tensors": "8.0.0",
+          "System.Runtime.Caching": "8.0.0"
+        }
+      },
+      "Microsoft.ML.OnnxRuntime.Managed": {
+        "type": "Transitive",
+        "resolved": "1.17.0",
+        "contentHash": "scI9s0xhkyANmc8fz8NLkZHJHS7hS+nTEk3X+X9GcLVpsIqxMx0Wg/ib6flDfv3bIjt6rVtJv6OXtRJvwiRBWA=="
+      },
+      "SmartComponents.Inference": {
+        "type": "Transitive",
+        "resolved": "0.1.0-preview10148",
+        "contentHash": "+EtrgOUS0oMZas1AqC+VDMvEyrk0bpNUGBkj/YYBX6Vu5fyi0R8ncS7G/watYKHnmYcdVMRttVvbVsNcYizU0Q=="
+      },
+      "System.Configuration.ConfigurationManager": {
+        "type": "Transitive",
+        "resolved": "8.0.0",
+        "contentHash": "JlYi9XVvIREURRUlGMr1F6vOFLk7YSY4p1vHo4kX3tQ0AGrjqlRWHDi66ImHhy6qwXBG3BJ6Y1QlYQ+Qz6Xgww==",
+        "dependencies": {
+          "System.Security.Cryptography.ProtectedData": "8.0.0"
+        }
+      },
+      "System.Numerics.Tensors": {
+        "type": "Transitive",
+        "resolved": "8.0.0",
+        "contentHash": "fhODzTe9ON9IzmRfyVeA6L8yXOciMtpq1YufkRVBliggcVKZE+XDxqIn46+yF4PWR6wNPuDpXtPpuY86VcKxUA=="
+      },
+      "System.Runtime.Caching": {
+        "type": "Transitive",
+        "resolved": "8.0.0",
+        "contentHash": "4TmlmvGp4kzZomm7J2HJn6IIx0UUrQyhBDyb5O1XiunZlQImXW+B8b7W/sTPcXhSf9rp5NR5aDtQllwbB5elOQ==",
+        "dependencies": {
+          "System.Configuration.ConfigurationManager": "8.0.0"
+        }
+      },
+      "System.Security.Cryptography.ProtectedData": {
+        "type": "Transitive",
+        "resolved": "8.0.0",
+        "contentHash": "+TUFINV2q2ifyXauQXRwy4CiBhqvDEDZeVJU7qfxya4aRYOKzVBpN+4acx25VcPB9ywUN6C0n8drWl110PhZEg=="
+      }
+    }
+  }
+}
